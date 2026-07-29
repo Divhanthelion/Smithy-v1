@@ -1,0 +1,1151 @@
+//! The agent panel — the surface you actually look at.
+//!
+//! Replaces forge's generic chat panel. The difference in intent: a chat panel
+//! shows a conversation, whereas an agent panel has to show *work happening* —
+//! which tool is running, what it touched, how much budget is left, and whether
+//! the model is thinking or answering. Those are different things to render.
+//!
+//! Design rules this follows:
+//!
+//! - **Tool steps are one line each until you need more.** An agent turn can be
+//!   twenty tool calls; rendering each as a paragraph buries the answer. Each
+//!   step is a single row — glyph, name, one-line argument summary — and its
+//!   output only appears when it failed or when you expand it.
+//! - **Reasoning is visually subordinate to the answer.** It's dimmed and
+//!   italicised, because it is context for the answer rather than the answer.
+//! - **The budget is always visible.** Prefill cost grows superlinearly with
+//!   context, so knowing you are at 40k rather than 4k explains why a turn got
+//!   slow. A thin bar costs almost no space and answers that question.
+
+use floem::peniko::Color;
+use floem::prelude::*;
+use floem::reactive::{RwSignal, SignalGet, SignalUpdate};
+use floem::style::CustomStylable;
+
+use crate::theme::catppuccin;
+
+/// One entry in the transcript.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Entry {
+    User(String),
+    /// A final answer from the model.
+    Answer(String),
+    /// One tool call and how it resolved.
+    Step {
+        /// The `tool_call_id`. Rows are matched on this, never on the tool name.
+        id: String,
+        step: usize,
+        name: String,
+        summary: String,
+        status: StepStatus,
+        detail: String,
+    },
+    /// A budget warning or a retry notice.
+    Notice(String),
+    /// The turn ended early.
+    Stopped(String),
+    Error(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepStatus {
+    Running,
+    Ok,
+    Failed,
+}
+
+impl StepStatus {
+    fn glyph(self) -> &'static str {
+        match self {
+            StepStatus::Running => "○",
+            StepStatus::Ok => "●",
+            StepStatus::Failed => "✕",
+        }
+    }
+
+    fn color(self) -> Color {
+        match self {
+            StepStatus::Running => catppuccin::YELLOW,
+            StepStatus::Ok => catppuccin::GREEN,
+            StepStatus::Failed => catppuccin::RED,
+        }
+    }
+}
+
+/// Everything the panel renders from.
+#[derive(Clone, Copy)]
+pub struct AgentPanelState {
+    pub entries: RwSignal<Vec<Entry>>,
+    pub input: RwSignal<String>,
+    /// What the microphone is doing. Owned here because the button that shows
+    /// it and the box the words land in are the same panel.
+    pub voice: RwSignal<smithy_voice::Voice>,
+    pub busy: RwSignal<bool>,
+    /// Answer text accumulating live during a turn.
+    pub streaming_answer: RwSignal<String>,
+    /// Reasoning accumulating live. Never enters history.
+    pub streaming_reasoning: RwSignal<String>,
+    /// Prompt tokens reported by the last completion.
+    pub context_tokens: RwSignal<i64>,
+    /// Hard ceiling, derived from the loaded model's context window.
+    pub context_limit: RwSignal<i64>,
+    pub model_label: RwSignal<String>,
+    /// What the model was told about the project, e.g.
+    /// "layout, dependencies, modules, public API · ~6000 tokens".
+    pub context_label: RwSignal<String>,
+    /// Whether the endpoint preflighted successfully.
+    pub connected: RwSignal<bool>,
+    /// Which step indices are expanded.
+    pub expanded: RwSignal<Vec<usize>>,
+}
+
+impl AgentPanelState {
+    pub fn new() -> Self {
+        Self {
+            entries: RwSignal::new(Vec::new()),
+            input: RwSignal::new(String::new()),
+            voice: RwSignal::new(smithy_voice::Voice::Cold),
+            busy: RwSignal::new(false),
+            streaming_answer: RwSignal::new(String::new()),
+            streaming_reasoning: RwSignal::new(String::new()),
+            context_tokens: RwSignal::new(0),
+            context_limit: RwSignal::new(110_000),
+            model_label: RwSignal::new("connecting…".to_string()),
+            context_label: RwSignal::new(String::new()),
+            connected: RwSignal::new(false),
+            expanded: RwSignal::new(Vec::new()),
+        }
+    }
+
+    pub fn push(&self, entry: Entry) {
+        self.entries.update(|e| e.push(entry));
+    }
+
+    /// Mark a step resolved, matched by its `tool_call_id`.
+    ///
+    /// Matching by tool *name* was wrong: two parallel calls to the same tool
+    /// produce two rows with the same name, and results arrive in completion
+    /// order rather than call order. Searching for "the last running `read`"
+    /// therefore attached the first result to the second row, silently swapping
+    /// the two outputs on screen. The id is unique per call, so it cannot.
+    pub fn resolve_step(&self, id: &str, detail: String, is_error: bool) {
+        self.entries.update(|entries| {
+            for entry in entries.iter_mut() {
+                if let Entry::Step {
+                    id: entry_id,
+                    status,
+                    detail: d,
+                    ..
+                } = entry
+                {
+                    if entry_id == id {
+                        *status = if is_error {
+                            StepStatus::Failed
+                        } else {
+                            StepStatus::Ok
+                        };
+                        *d = detail;
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
+    pub fn clear(&self) {
+        self.entries.update(|e| e.clear());
+        self.streaming_answer.set(String::new());
+        self.streaming_reasoning.set(String::new());
+        self.context_tokens.set(0);
+    }
+}
+
+impl Default for AgentPanelState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Shorten a JSON argument blob to something that fits one line.
+///
+/// Prefers the value of the argument that identifies the target — a `read` of
+/// `src/main.rs` should read as `src/main.rs`, not `{"path":"src/main.rs"}`.
+pub fn summarize_arguments(arguments: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments) else {
+        return one_line(arguments, 60);
+    };
+    let Some(obj) = value.as_object() else {
+        return one_line(arguments, 60);
+    };
+    if obj.is_empty() {
+        return String::new();
+    }
+
+    for key in ["path", "command", "pattern", "url", "file_path"] {
+        if let Some(v) = obj.get(key).and_then(|v| v.as_str()) {
+            return one_line(v, 60);
+        }
+    }
+    let joined = obj
+        .iter()
+        .map(|(k, v)| match v.as_str() {
+            Some(s) => format!("{k}={}", one_line(s, 24)),
+            None => format!("{k}={v}"),
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    one_line(&joined, 60)
+}
+
+fn one_line(s: &str, max: usize) -> String {
+    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        flat
+    } else {
+        flat.chars().take(max.saturating_sub(1)).collect::<String>() + "…"
+    }
+}
+
+/// Format a token count compactly: `1234` → `1.2k`.
+pub fn format_tokens(n: i64) -> String {
+    if n < 1000 {
+        n.to_string()
+    } else if n < 100_000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        format!("{}k", n / 1000)
+    }
+}
+
+/// Fraction of the context budget consumed, clamped to 0.0–1.0.
+pub fn context_fraction(used: i64, limit: i64) -> f64 {
+    if limit <= 0 {
+        return 0.0;
+    }
+    (used as f64 / limit as f64).clamp(0.0, 1.0)
+}
+
+/// Colour for the budget bar: green until it matters, then amber, then red.
+pub fn budget_color(fraction: f64) -> Color {
+    if fraction < 0.5 {
+        catppuccin::GREEN
+    } else if fraction < 0.8 {
+        catppuccin::YELLOW
+    } else {
+        catppuccin::RED
+    }
+}
+
+// ============================================================================
+// Views
+// ============================================================================
+
+pub fn agent_panel(
+    state: AgentPanelState,
+    on_send: std::rc::Rc<dyn Fn(String)>,
+    on_stop: std::rc::Rc<dyn Fn()>,
+    on_close: impl Fn() + 'static,
+    on_voice: impl Fn() + 'static,
+    // Try the endpoint again. Shown only while disconnected — see `header`.
+    on_reconnect: impl Fn() + 'static,
+    // How the microphone's shortcut is written, for the hint beside it.
+    hotkey: String,
+) -> impl IntoView {
+    Stack::vertical((
+        header(state, on_close, on_reconnect),
+        floem::views::scroll::Scroll::new(transcript(state))
+            .custom_style(|s: floem::views::scroll::ScrollCustomStyle| {
+                s.hide_bars(false)
+                    .handle_background(catppuccin::SURFACE1)
+                    .handle_border_radius(4.0)
+            })
+            .style(|s| {
+                s.flex_grow(1.0)
+                    .flex_basis(0.0)
+                    .width_full()
+                    .min_height(0.0)
+                    // Without this the transcript is as wide as its widest line
+                    // and the panel stretches to match — see the note in
+                    // `main_layout`'s chat container.
+                    .min_width(0.0)
+            }),
+        live_activity(state),
+        budget_bar(state),
+        composer(state, on_send, on_stop, on_voice, hotkey),
+    ))
+    .style(|s| {
+        s.width_full()
+            .height_full()
+            .min_width(0.0)
+            // **This** is what stops the transcript running off the right edge.
+            // floem's `text_overflow` defaults to `NoWrap(Clip)`: text does not
+            // wrap, it is cut off at the boundary. No amount of width or
+            // `min_width` on the containers changes that — the earlier attempt to
+            // fix this by adding `min_width(0.0)` alone did nothing, because the
+            // label was never going to wrap in the first place.
+            //
+            // The property is `inherited`, so setting it once here covers every
+            // label in the panel: answers, tool summaries, notices and the
+            // reasoning trace.
+            //
+            // `BreakWord` rather than `Normal`: model output is full of URLs and
+            // absolute paths with no spaces in them, and `Normal` leaves those
+            // overflowing exactly as before. Rather than `Anywhere` because that
+            // also drags the minimum content width down, which changes how the
+            // panel negotiates its size with the editor beside it.
+            .text_overflow(floem::style::TextOverflow::Wrap {
+                overflow_wrap: floem::text::OverflowWrap::BreakWord,
+                word_break: Default::default(),
+            })
+            .background(catppuccin::MANTLE)
+            .border_left(1.0)
+            .border_color(catppuccin::SURFACE0)
+    })
+}
+
+/// The panel's title row: what it is, whether it is connected, and to what.
+///
+/// **Reconnect is offered here, and only while disconnected.** Starting Smithy
+/// before the model server is up used to leave the agent permanently dead: the
+/// connection is attempted once at launch and once per project switch, so the
+/// only way to pick up a model you started afterwards was to restart the editor
+/// or open a different project and come back.
+///
+/// Hidden once connected rather than merely disabled, because reconnecting a
+/// live session is not a no-op — it rebuilds the session from the store and
+/// replays the transcript, which is the right thing after a failure and a
+/// baffling thing to have happen mid-conversation.
+fn header(
+    state: AgentPanelState,
+    on_close: impl Fn() + 'static,
+    on_reconnect: impl Fn() + 'static,
+) -> impl IntoView {
+    Stack::horizontal((
+        Label::derived(|| "Agent".to_string()).style(|s| {
+            s.color(catppuccin::TEXT)
+                .font_size(13.0)
+                .font_bold()
+                .margin_right(8.0)
+        }),
+        // Connection dot: green when the endpoint preflighted, red when not.
+        Label::derived(|| "●".to_string()).style(move |s| {
+            s.font_size(9.0)
+                .font_family(crate::design::SYMBOL.to_string())
+                .color(if state.connected.get() {
+                    catppuccin::GREEN
+                } else {
+                    catppuccin::RED
+                })
+                .margin_right(5.0)
+        }),
+        Label::derived(move || state.model_label.get())
+            .style(|s| s.color(catppuccin::OVERLAY1).font_size(11.0)),
+        // Plain text, not a glyph: this appears exactly when something is
+        // already wrong, which is the worst moment to discover a missing-glyph
+        // box. See `design::glyph` on why that is a live hazard here.
+        Label::derived(|| "Reconnect".to_string())
+            .on_event_stop(floem::event::listener::Click, move |_, _| on_reconnect())
+            .style(move |s| {
+                s.color(catppuccin::BLUE)
+                    .font_size(11.0)
+                    .margin_left(8.0)
+                    .padding_horiz(6.0)
+                    .padding_vert(1.0)
+                    .border_radius(3.0)
+                    .background(catppuccin::SURFACE0)
+                    .cursor(floem::style::CursorStyle::Pointer)
+                    .apply_if(state.connected.get(), |s| {
+                        s.display(floem::taffy::Display::None)
+                    })
+            }),
+        Container::new(Empty::new()).style(|s| s.flex_grow(1.0)),
+        // What the model knows about the project before you say anything.
+        // Worth showing: a silently-degraded context (say, layout only because
+        // `cargo metadata` failed) explains otherwise baffling answers.
+        Label::derived(move || state.context_label.get()).style(move |s| {
+            s.color(catppuccin::SURFACE2)
+                .font_size(10.0)
+                .margin_right(8.0)
+                .apply_if(state.context_label.get().is_empty(), |s| {
+                    s.display(floem::taffy::Display::None)
+                })
+        }),
+        icon_button(
+            crate::design::glyph::CLEAR,
+            "Clear the transcript",
+            move || state.clear(),
+        ),
+        icon_button(crate::design::glyph::CLOSE, "Hide the panel", on_close),
+    ))
+    .style(|s| {
+        s.width_full()
+            .items_center()
+            .padding_horiz(12.0)
+            .padding_vert(9.0)
+            .background(catppuccin::CRUST)
+            .border_bottom(1.0)
+            .border_color(catppuccin::SURFACE0)
+    })
+}
+
+fn icon_button(
+    glyph: &'static str,
+    tip: &'static str,
+    on_click: impl Fn() + 'static,
+) -> impl IntoView {
+    Label::derived(move || glyph.to_string())
+        .on_event_stop(floem::event::listener::Click, move |_, _| on_click())
+        .style(|s| {
+            s.color(catppuccin::OVERLAY1)
+                .font_family(crate::design::SYMBOL.to_string())
+                .font_size(12.0)
+                .padding_horiz(6.0)
+                .padding_vert(2.0)
+                .border_radius(4.0)
+                .hover(|s| s.background(catppuccin::SURFACE0).color(catppuccin::TEXT))
+        })
+        .style(|s| s.keyboard_navigable())
+        .style(move |s| s.apply_if(tip.is_empty(), |s| s))
+}
+
+fn transcript(state: AgentPanelState) -> impl IntoView {
+    dyn_stack(
+        move || state.entries.get().into_iter().enumerate(),
+        |(i, _)| *i,
+        move |(index, entry)| entry_view(state, index, entry),
+    )
+    .style(|s| s.flex_col().width_full().padding(10.0).gap(2.0))
+}
+
+fn entry_view(state: AgentPanelState, index: usize, entry: Entry) -> impl IntoView {
+    match entry {
+        Entry::User(text) => user_bubble(text).into_any(),
+        Entry::Answer(text) => answer_block(text).into_any(),
+        Entry::Step {
+            step,
+            name,
+            summary,
+            status,
+            detail,
+            ..
+        } => step_row(state, index, step, name, summary, status, detail).into_any(),
+        Entry::Notice(text) => banner(text, catppuccin::YELLOW, "⚠").into_any(),
+        Entry::Stopped(text) => banner(
+            format!("Turn stopped: {text}"),
+            catppuccin::PEACH,
+            crate::design::glyph::STOP,
+        )
+        .into_any(),
+        Entry::Error(text) => banner(text, catppuccin::RED, crate::design::glyph::CLOSE).into_any(),
+    }
+}
+
+fn user_bubble(text: String) -> impl IntoView {
+    Container::new(Label::derived(move || text.clone()).style(|s| {
+        s.color(catppuccin::TEXT)
+            .font_size(13.0)
+            .line_height(1.45)
+            .padding_horiz(11.0)
+            .padding_vert(8.0)
+            .background(catppuccin::SURFACE0)
+            .border_radius(8.0)
+            .border_left(2.0)
+            .border_color(catppuccin::LAVENDER)
+    }))
+    .style(|s| s.width_full().margin_vert(5.0))
+}
+
+fn answer_block(text: String) -> impl IntoView {
+    Label::derived(move || text.clone()).style(|s| {
+        s.color(catppuccin::TEXT)
+            .font_size(13.0)
+            .line_height(1.5)
+            .width_full()
+            .padding_horiz(2.0)
+            .padding_vert(6.0)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn step_row(
+    state: AgentPanelState,
+    index: usize,
+    step: usize,
+    name: String,
+    summary: String,
+    status: StepStatus,
+    detail: String,
+) -> impl IntoView {
+    let has_detail = !detail.is_empty();
+    let expandable = has_detail;
+    // Failures open by default — an error you have to click to see is an error
+    // you will miss.
+    let starts_open = status == StepStatus::Failed;
+
+    let is_open = move || {
+        let manually = state.expanded.get().contains(&index);
+        if starts_open {
+            !manually // clicking a failed row collapses it
+        } else {
+            manually
+        }
+    };
+
+    let toggle = move || {
+        if !expandable {
+            return;
+        }
+        state.expanded.update(|open| {
+            if let Some(pos) = open.iter().position(|i| *i == index) {
+                open.remove(pos);
+            } else {
+                open.push(index);
+            }
+        });
+    };
+
+    let name_for_row = name.clone();
+    let summary_for_row = summary.clone();
+    let detail_for_row = detail.clone();
+
+    Stack::vertical((
+        Stack::horizontal((
+            Label::derived(move || status.glyph().to_string()).style(move |s| {
+                s.color(status.color())
+                    .font_family(crate::design::SYMBOL.to_string())
+                    .font_size(9.0)
+                    .width(14.0)
+            }),
+            Label::derived(move || format!("{step}"))
+                .style(|s| s.color(catppuccin::SURFACE2).font_size(10.0).width(18.0)),
+            Label::derived(move || name_for_row.clone()).style(|s| {
+                s.color(catppuccin::SAPPHIRE)
+                    .font_size(12.0)
+                    .font_family(crate::design::MONO.to_string())
+                    .margin_right(7.0)
+            }),
+            Label::derived(move || summary_for_row.clone()).style(|s| {
+                s.color(catppuccin::OVERLAY1)
+                    .font_size(11.0)
+                    .font_family(crate::design::MONO.to_string())
+                    .flex_grow(1.0)
+                    .min_width(0.0)
+            }),
+            Label::derived(move || {
+                if !expandable {
+                    String::new()
+                } else if is_open() {
+                    "▾".to_string()
+                } else {
+                    "▸".to_string()
+                }
+            })
+            .style(|s| {
+                s.color(catppuccin::SURFACE2)
+                    .font_family(crate::design::SYMBOL.to_string())
+                    .font_size(9.0)
+                    .width(12.0)
+            }),
+        ))
+        .on_event_stop(floem::event::listener::Click, move |_, _| toggle())
+        .style(move |s| {
+            s.width_full()
+                .items_center()
+                .padding_horiz(4.0)
+                .padding_vert(3.0)
+                .border_radius(4.0)
+                .apply_if(expandable, |s| {
+                    s.hover(|s| s.background(catppuccin::SURFACE0))
+                })
+        }),
+        // Detail, only when open.
+        dyn_container(
+            move || is_open() && has_detail,
+            move |open| {
+                if open {
+                    let detail = detail_for_row.clone();
+                    Box::new(Label::derived(move || detail.clone()).style(move |s| {
+                        s.color(if status == StepStatus::Failed {
+                            catppuccin::RED
+                        } else {
+                            catppuccin::SUBTEXT0
+                        })
+                        .font_size(11.0)
+                        .font_family(crate::design::MONO.to_string())
+                        .line_height(1.4)
+                        .width_full()
+                        .padding(8.0)
+                        .margin_left(32.0)
+                        .margin_bottom(4.0)
+                        .background(catppuccin::CRUST)
+                        .border_radius(5.0)
+                    })) as Box<dyn View>
+                } else {
+                    Box::new(Empty::new().style(|s| s.display(floem::taffy::Display::None)))
+                        as Box<dyn View>
+                }
+            },
+        ),
+    ))
+    .style(|s| s.width_full())
+}
+
+fn banner(text: String, color: Color, glyph: &'static str) -> impl IntoView {
+    Stack::horizontal((
+        Label::derived(move || glyph.to_string()).style(move |s| {
+            s.color(color)
+                .font_family(crate::design::SYMBOL.to_string())
+                .font_size(11.0)
+                .margin_right(7.0)
+        }),
+        Label::derived(move || text.clone()).style(move |s| {
+            s.color(color)
+                .font_size(11.5)
+                .line_height(1.4)
+                .flex_grow(1.0)
+        }),
+    ))
+    .style(move |s| {
+        s.width_full()
+            .items_start()
+            .padding_horiz(9.0)
+            .padding_vert(6.0)
+            .margin_vert(4.0)
+            .background(catppuccin::SURFACE0)
+            .border_left(2.0)
+            .border_color(color)
+            .border_radius(4.0)
+    })
+}
+
+/// Live reasoning and answer text while a turn runs.
+fn live_activity(state: AgentPanelState) -> impl IntoView {
+    let has_activity = move || {
+        !state.streaming_reasoning.get().is_empty() || !state.streaming_answer.get().is_empty()
+    };
+
+    dyn_container(has_activity, move |active| {
+        if !active {
+            return Box::new(Empty::new().style(|s| s.display(floem::taffy::Display::None)))
+                as Box<dyn View>;
+        }
+        Box::new(
+            Stack::vertical((
+                // Reasoning: dimmed and italic, and only the tail — the whole
+                // chain can run to thousands of tokens and the recent part is
+                // the part that tells you what it is doing now.
+                dyn_container(
+                    move || !state.streaming_reasoning.get().is_empty(),
+                    move |show| {
+                        if !show {
+                            return Box::new(
+                                Empty::new().style(|s| s.display(floem::taffy::Display::None)),
+                            ) as Box<dyn View>;
+                        }
+                        Box::new(
+                            Label::derived(move || {
+                                format!("💭 {}", tail(&state.streaming_reasoning.get(), 240))
+                            })
+                            .style(|s| {
+                                s.color(catppuccin::OVERLAY0)
+                                    .font_size(11.0)
+                                    .font_style(floem::text::FontStyle::Italic)
+                                    .line_height(1.4)
+                                    .width_full()
+                            }),
+                        ) as Box<dyn View>
+                    },
+                ),
+                dyn_container(
+                    move || !state.streaming_answer.get().is_empty(),
+                    move |show| {
+                        if !show {
+                            return Box::new(
+                                Empty::new().style(|s| s.display(floem::taffy::Display::None)),
+                            ) as Box<dyn View>;
+                        }
+                        Box::new(
+                            Label::derived(move || state.streaming_answer.get()).style(|s| {
+                                s.color(catppuccin::TEXT)
+                                    .font_size(13.0)
+                                    .line_height(1.5)
+                                    .width_full()
+                                    .margin_top(4.0)
+                            }),
+                        ) as Box<dyn View>
+                    },
+                ),
+            ))
+            .style(|s| {
+                s.width_full()
+                    .padding_horiz(12.0)
+                    .padding_vert(8.0)
+                    .background(catppuccin::BASE)
+                    .border_top(1.0)
+                    .border_color(catppuccin::SURFACE0)
+            }),
+        ) as Box<dyn View>
+    })
+}
+
+fn tail(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        s.split_whitespace().collect::<Vec<_>>().join(" ")
+    } else {
+        let t: String = s.chars().skip(count - max).collect();
+        format!("…{}", t.split_whitespace().collect::<Vec<_>>().join(" "))
+    }
+}
+
+/// A thin context-usage bar. Prefill cost grows superlinearly with context, so
+/// this is the readout that explains a slow turn.
+fn budget_bar(state: AgentPanelState) -> impl IntoView {
+    let fraction = move || context_fraction(state.context_tokens.get(), state.context_limit.get());
+
+    Stack::vertical((
+        Stack::horizontal((
+            Label::derived(move || {
+                let used = state.context_tokens.get();
+                if used == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        "{} / {} context",
+                        format_tokens(used),
+                        format_tokens(state.context_limit.get())
+                    )
+                }
+            })
+            .style(|s| s.color(catppuccin::SURFACE2).font_size(10.0)),
+            Container::new(Empty::new()).style(|s| s.flex_grow(1.0)),
+        ))
+        .style(|s| s.width_full().padding_horiz(12.0).padding_bottom(3.0)),
+        // The bar itself: a filled track whose width tracks the fraction.
+        Container::new(Empty::new().style(move |s| {
+            s.height_full()
+                .width_pct(fraction() * 100.0)
+                .background(budget_color(fraction()))
+                .border_radius(1.0)
+        }))
+        .style(|s| {
+            s.width_full()
+                .height(2.0)
+                .margin_horiz(12.0)
+                .background(catppuccin::SURFACE0)
+        }),
+    ))
+    .style(move |s| {
+        s.width_full()
+            .padding_top(5.0)
+            .padding_bottom(4.0)
+            .apply_if(state.context_tokens.get() == 0, |s| {
+                s.display(floem::taffy::Display::None)
+            })
+    })
+}
+
+/// The microphone.
+///
+/// One button with five meanings, which is why what it *does* lives in
+/// `smithy_voice::press` as a pure function and not in this closure. Here it
+/// only has to look like whatever it currently is.
+///
+/// A filled red dot for a live microphone rather than a mic pictogram: it is
+/// the one state with a privacy cost, "recording" is universally a red circle,
+/// and the panel header already speaks in dots. Yellow means busy — loading the
+/// model the first time takes tens of seconds, and a button that looked idle
+/// through that would be pressed again and again.
+fn microphone(
+    state: AgentPanelState,
+    hotkey: String,
+    on_voice: impl Fn() + 'static,
+) -> impl IntoView {
+    use smithy_voice::Voice;
+
+    Stack::horizontal((
+        Label::derived(move || {
+            match state.voice.get() {
+                // Hollow until there is a model behind it.
+                Voice::Cold | Voice::Failed(_) => crate::design::glyph::RING,
+                _ => crate::design::glyph::DOT,
+            }
+            .to_string()
+        })
+        .on_event_stop(floem::event::listener::Click, move |_, _| on_voice())
+        .style(move |s| {
+            let voice = state.voice.get();
+            s.font_family(crate::design::SYMBOL.to_string())
+                .font_size(14.0)
+                .padding_horiz(9.0)
+                .padding_vert(4.0)
+                .margin_right(6.0)
+                .border_radius(6.0)
+                .color(match &voice {
+                    Voice::Listening => catppuccin::RED,
+                    Voice::Loading | Voice::Transcribing => catppuccin::YELLOW,
+                    Voice::Failed(_) => catppuccin::MAROON,
+                    _ => catppuccin::SURFACE2,
+                })
+                .apply_if(voice.is_recording(), |s| s.background(catppuccin::SURFACE0))
+                .apply_if(voice.accepts_press(), |s| {
+                    s.cursor(floem::style::CursorStyle::Pointer)
+                        .hover(|s| s.background(catppuccin::SURFACE0))
+                })
+        }),
+        // The shortcut, and — while anything is happening — what is happening.
+        // Loading takes tens of seconds the first time and a silent button would
+        // be pressed again and again.
+        Label::derived(move || match state.voice.get() {
+            Voice::Cold => hotkey.clone(),
+            Voice::Loading => "loading model…".to_string(),
+            Voice::Ready => hotkey.clone(),
+            Voice::Listening => "listening…".to_string(),
+            Voice::Transcribing => "transcribing…".to_string(),
+            Voice::Failed(why) => why,
+        })
+        .style(move |s| {
+            // **The family matters even on a label that is mostly words.** This
+            // hint carries `⌘` and `⇧`, and floem's default family is sans,
+            // which resolves to Helvetica here — neither glyph exists in it, so
+            // the shortcut rendered as two boxes and a V. The glyph guard
+            // cannot catch this: the characters were right, the font was never
+            // asked for.
+            s.font_family(crate::design::SYMBOL.to_string())
+                .font_size(9.0)
+                .margin_right(8.0)
+                .color(match state.voice.get() {
+                    Voice::Listening => catppuccin::RED,
+                    Voice::Loading | Voice::Transcribing => catppuccin::YELLOW,
+                    Voice::Failed(_) => catppuccin::MAROON,
+                    _ => catppuccin::SURFACE2,
+                })
+        }),
+    ))
+    .style(|s| s.items_center())
+}
+
+fn composer(
+    state: AgentPanelState,
+    on_send: std::rc::Rc<dyn Fn(String)>,
+    on_stop: std::rc::Rc<dyn Fn()>,
+    on_voice: impl Fn() + 'static,
+    hotkey: String,
+) -> impl IntoView {
+    let send = {
+        let on_send = on_send.clone();
+        move || {
+            if state.busy.get_untracked() {
+                return;
+            }
+            let text = state.input.get_untracked().trim().to_string();
+            if text.is_empty() {
+                return;
+            }
+            state.input.set(String::new());
+            on_send(text);
+        }
+    };
+    let send_on_enter = send.clone();
+
+    Stack::vertical((
+        TextInput::new(state.input)
+            .placeholder("Ask the agent to do something…")
+            .on_event_stop(floem::event::listener::KeyDown, move |_, ev| {
+                if ev.key == floem::prelude::Key::Named(floem::prelude::NamedKey::Enter)
+                    && !ev.modifiers.contains(floem::prelude::Modifiers::SHIFT)
+                {
+                    send_on_enter();
+                }
+            })
+            .style(|s| {
+                s.width_full()
+                    .padding_horiz(10.0)
+                    .padding_vert(8.0)
+                    .font_size(13.0)
+                    .color(catppuccin::TEXT)
+                    .background(catppuccin::BASE)
+                    .border(1.0)
+                    .border_color(catppuccin::SURFACE0)
+                    .border_radius(7.0)
+                    .focus(|s| s.border_color(catppuccin::LAVENDER))
+            }),
+        Stack::horizontal((
+            Label::derived(move || {
+                if state.busy.get() {
+                    "working…".to_string()
+                } else {
+                    "Enter to send · Shift+Enter for a newline".to_string()
+                }
+            })
+            .style(move |s| {
+                s.font_size(10.0).color(if state.busy.get() {
+                    catppuccin::YELLOW
+                } else {
+                    catppuccin::SURFACE2
+                })
+            }),
+            Container::new(Empty::new()).style(|s| s.flex_grow(1.0)),
+            microphone(state, hotkey, on_voice),
+            // Send and Stop occupy the same slot — only one is ever meaningful.
+            dyn_container(
+                move || state.busy.get(),
+                move |busy| {
+                    if busy {
+                        let on_stop = on_stop.clone();
+                        Box::new(
+                            Button::new("Stop")
+                                .on_event_stop(floem::event::listener::Click, move |_, _| on_stop())
+                                .style(|s| {
+                                    s.background(catppuccin::SURFACE0)
+                                        .color(catppuccin::RED)
+                                        .font_size(12.0)
+                                        .padding_horiz(14.0)
+                                        .padding_vert(5.0)
+                                        .border_radius(6.0)
+                                        .hover(|s| s.background(catppuccin::SURFACE1))
+                                }),
+                        ) as Box<dyn View>
+                    } else {
+                        let send = send.clone();
+                        Box::new(
+                            Button::new("Send")
+                                .on_event_stop(floem::event::listener::Click, move |_, _| send())
+                                .style(|s| {
+                                    s.background(catppuccin::LAVENDER)
+                                        .color(catppuccin::CRUST)
+                                        .font_size(12.0)
+                                        .font_bold()
+                                        .padding_horiz(16.0)
+                                        .padding_vert(5.0)
+                                        .border_radius(6.0)
+                                        .hover(|s| s.background(catppuccin::MAUVE))
+                                }),
+                        ) as Box<dyn View>
+                    }
+                },
+            ),
+        ))
+        .style(|s| s.width_full().items_center().margin_top(7.0)),
+    ))
+    .style(|s| {
+        s.width_full()
+            .padding(11.0)
+            .background(catppuccin::MANTLE)
+            .border_top(1.0)
+            .border_color(catppuccin::SURFACE0)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summarizes_a_path_argument_as_just_the_path() {
+        assert_eq!(
+            summarize_arguments(r#"{"path":"src/main.rs"}"#),
+            "src/main.rs"
+        );
+    }
+
+    #[test]
+    fn prefers_the_identifying_argument_over_the_others() {
+        let s = summarize_arguments(r#"{"offset":1,"path":"src/lib.rs","limit":50}"#);
+        assert_eq!(s, "src/lib.rs");
+    }
+
+    #[test]
+    fn summarizes_a_shell_command() {
+        assert_eq!(
+            summarize_arguments(r#"{"command":"cargo test"}"#),
+            "cargo test"
+        );
+    }
+
+    #[test]
+    fn empty_arguments_summarize_to_nothing() {
+        assert_eq!(summarize_arguments("{}"), "");
+    }
+
+    #[test]
+    fn falls_back_to_key_value_pairs() {
+        let s = summarize_arguments(r#"{"a":"one","b":2}"#);
+        assert!(s.contains("a=one"));
+        assert!(s.contains("b=2"));
+    }
+
+    #[test]
+    fn malformed_arguments_still_render_something() {
+        assert_eq!(summarize_arguments("{broken"), "{broken");
+    }
+
+    #[test]
+    fn long_summaries_are_truncated() {
+        let long = format!(r#"{{"command":"{}"}}"#, "x".repeat(200));
+        let s = summarize_arguments(&long);
+        assert!(s.chars().count() <= 60, "got {} chars", s.chars().count());
+        assert!(s.ends_with('…'));
+    }
+
+    #[test]
+    fn multiline_arguments_collapse_to_one_line() {
+        let s = summarize_arguments(r#"{"command":"line one\n   line two"}"#);
+        assert!(!s.contains('\n'));
+        assert_eq!(s, "line one line two");
+    }
+
+    #[test]
+    fn formats_token_counts_compactly() {
+        assert_eq!(format_tokens(0), "0");
+        assert_eq!(format_tokens(999), "999");
+        assert_eq!(format_tokens(1234), "1.2k");
+        assert_eq!(format_tokens(32_768), "32.8k");
+        assert_eq!(format_tokens(131_072), "131k");
+    }
+
+    #[test]
+    fn context_fraction_is_clamped() {
+        assert_eq!(context_fraction(0, 100), 0.0);
+        assert_eq!(context_fraction(50, 100), 0.5);
+        assert_eq!(
+            context_fraction(500, 100),
+            1.0,
+            "overflow must not exceed the track"
+        );
+        assert_eq!(
+            context_fraction(10, 0),
+            0.0,
+            "a zero limit must not divide by zero"
+        );
+    }
+
+    #[test]
+    fn the_budget_bar_escalates_in_colour() {
+        assert_eq!(budget_color(0.1), catppuccin::GREEN);
+        assert_eq!(budget_color(0.6), catppuccin::YELLOW);
+        assert_eq!(budget_color(0.95), catppuccin::RED);
+    }
+
+    #[test]
+    fn resolving_a_step_marks_the_last_running_one() {
+        let state = AgentPanelState::new();
+        state.push(Entry::Step {
+            id: "c1".into(),
+            step: 1,
+            name: "read".into(),
+            summary: "a.rs".into(),
+            status: StepStatus::Running,
+            detail: String::new(),
+        });
+        state.resolve_step("c1", "contents".into(), false);
+
+        let entries = state.entries.get_untracked();
+        match &entries[0] {
+            Entry::Step { status, detail, .. } => {
+                assert_eq!(*status, StepStatus::Ok);
+                assert_eq!(detail, "contents");
+            }
+            other => panic!("expected a step, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolving_marks_failures_distinctly() {
+        let state = AgentPanelState::new();
+        state.push(Entry::Step {
+            id: "c1".into(),
+            step: 1,
+            name: "bash".into(),
+            summary: "false".into(),
+            status: StepStatus::Running,
+            detail: String::new(),
+        });
+        state.resolve_step("c1", "exit 1".into(), true);
+        match &state.entries.get_untracked()[0] {
+            Entry::Step { status, .. } => assert_eq!(*status, StepStatus::Failed),
+            other => panic!("expected a step, got {other:?}"),
+        }
+    }
+
+    /// The regression this fixes. Two parallel `read` calls produce two rows
+    /// with the same tool name; results arrive in completion order, not call
+    /// order. Matching by name attached the first result to the second row and
+    /// silently swapped the two outputs.
+    #[test]
+    fn parallel_calls_to_the_same_tool_keep_their_own_output() {
+        let state = AgentPanelState::new();
+        for (id, summary) in [("call_a", "a.rs"), ("call_b", "b.rs")] {
+            state.push(Entry::Step {
+                id: id.into(),
+                step: 1,
+                name: "read".into(),
+                summary: summary.into(),
+                status: StepStatus::Running,
+                detail: String::new(),
+            });
+        }
+        // Second call finishes first — the ordering that broke the old code.
+        state.resolve_step("call_b", "contents of b".into(), false);
+        state.resolve_step("call_a", "contents of a".into(), false);
+
+        let entries = state.entries.get_untracked();
+        for entry in &entries {
+            if let Entry::Step {
+                id,
+                summary,
+                detail,
+                status,
+                ..
+            } = entry
+            {
+                assert_eq!(*status, StepStatus::Ok, "no row may be left running");
+                match id.as_str() {
+                    "call_a" => {
+                        assert_eq!(summary, "a.rs");
+                        assert_eq!(detail, "contents of a", "output landed on the wrong row");
+                    }
+                    "call_b" => {
+                        assert_eq!(summary, "b.rs");
+                        assert_eq!(detail, "contents of b", "output landed on the wrong row");
+                    }
+                    other => panic!("unexpected id {other}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resolving_an_unknown_id_is_a_no_op() {
+        let state = AgentPanelState::new();
+        state.push(Entry::User("hi".into()));
+        state.resolve_step("nonexistent", "x".into(), false);
+        assert_eq!(state.entries.get_untracked().len(), 1);
+    }
+
+    #[test]
+    fn clearing_resets_the_live_state_too() {
+        let state = AgentPanelState::new();
+        state.push(Entry::User("hi".into()));
+        state.streaming_answer.set("partial".into());
+        state.context_tokens.set(5000);
+        state.clear();
+        assert!(state.entries.get_untracked().is_empty());
+        assert!(state.streaming_answer.get_untracked().is_empty());
+        assert_eq!(state.context_tokens.get_untracked(), 0);
+    }
+
+    #[test]
+    fn reasoning_tail_keeps_the_most_recent_text() {
+        let long = "start ".to_string() + &"middle ".repeat(100) + "end";
+        let t = tail(&long, 40);
+        assert!(t.starts_with('…'));
+        assert!(t.ends_with("end"));
+        assert!(!t.contains("start"));
+    }
+
+    #[test]
+    fn short_reasoning_is_not_truncated() {
+        assert_eq!(tail("thinking about it", 240), "thinking about it");
+    }
+}

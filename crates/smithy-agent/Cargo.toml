@@ -1,0 +1,38 @@
+[package]
+name = "smithy-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The Smithy agent loop: append-only history, resource budgets, and provider-agnostic tool calling"
+
+[dependencies]
+smithy-tools.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+reqwest.workspace = true
+futures-util.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+# A dev-dependency on ourselves, with `testing` on. This is how `tests/` gets at
+# `provider::test_support` without making the feature a default: `cargo test`
+# enables no non-default features on its own, and the alternative — shipping the
+# scripted provider in release builds — is the thing the gate exists to prevent.
+smithy-agent = { path = ".", features = ["testing"] }
+smithy-project.workspace = true
+
+
+[[example]]
+name = "smoke"
+path = "examples/smoke.rs"
+
+[features]
+# Exposes `provider::test_support` — the scripted provider and its helpers — so
+# integration tests in `tests/` can drive the loop without an endpoint. Not a
+# default: a release build must not be able to construct a fake provider.
+testing = []

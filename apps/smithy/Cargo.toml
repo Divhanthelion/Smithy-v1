@@ -1,0 +1,28 @@
+[package]
+name = "smithy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Smithy - a native Rust IDE with a local-first coding agent"
+
+[[bin]]
+name = "smithy"
+path = "src/main.rs"
+
+[dependencies]
+smithy-editor.workspace = true
+smithy-agent.workspace = true
+smithy-tools.workspace = true
+smithy-project.workspace = true
+smithy-voice.workspace = true
+floem.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+crossbeam-channel.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true

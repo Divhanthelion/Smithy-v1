@@ -1,0 +1,31 @@
+[package]
+name = "smithy-voice"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# **No floem**, like `smithy-agent`, `smithy-tools` and `smithy-sky`. This crate
+# turns a microphone into a string and knows nothing about buttons.
+#
+# Ported from `app-ottex`, which solved this already: Whisper on a dedicated OS
+# thread behind a command channel, so a two-second transcription cannot stall a
+# UI frame. The parts that did not come across are the ones ottex needed as a
+# standalone tray app — global hotkeys, keystroke injection, the cloud API
+# fallback and the notification surface. Smithy has its own answers to all four.
+[dependencies]
+anyhow = { workspace = true }
+# Audio capture and resampling to the 16 kHz mono Whisper expects.
+cpal = "0.15"
+rubato = "0.14"
+# Embedded inference: the model runs in this process, not behind an API.
+candle-core = { version = "0.9", features = ["accelerate"] }
+candle-nn = "0.9"
+candle-transformers = "0.9"
+hf-hub = "0.4"
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+byteorder = "1.5"
+serde_json = { workspace = true }
+crossbeam-channel = "0.5"
+rand = "0.8"
+serde = { workspace = true }

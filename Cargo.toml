@@ -1,0 +1,134 @@
+[workspace]
+resolver = "2"
+members = [
+    "apps/smithy",
+    "crates/smithy-editor",
+    "crates/smithy-tools",
+    "crates/smithy-agent",
+    "crates/smithy-project",
+    "crates/smithy-sky",
+    "crates/smithy-voice",
+]
+# Scratch repositories to test the agent against live here, and they are
+# emphatically *not* part of this workspace: `cargo new` inside the tree adds
+# itself as a member unless told otherwise, which would put a throwaway crate
+# into `cargo test --workspace` and couple the thing under test to the thing
+# testing it. `projects/` is gitignored for the same reason.
+exclude = ["projects"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+# 1.91 because the pinned floem revision declares it. Our own sources are
+# still edition 2021 and would build on far less; this reflects the dependency
+# tree, which is what actually determines whether a checkout compiles.
+rust-version = "1.91"
+
+[workspace.dependencies]
+# --- Internal crates ---
+smithy-editor = { path = "crates/smithy-editor" }
+smithy-tools = { path = "crates/smithy-tools" }
+smithy-agent = { path = "crates/smithy-agent" }
+smithy-project = { path = "crates/smithy-project" }
+smithy-sky = { path = "crates/smithy-sky" }
+smithy-voice = { path = "crates/smithy-voice" }
+
+# --- UI ---
+# Pinned to a git revision rather than 0.2.0: the interesting APIs (canvas,
+# the headless test harness, the four selectable renderers) exist only on
+# master, which is ~20 months ahead of the sole crates.io release. Lapce
+# consumes floem the same way. Bump this rev deliberately, never casually.
+#
+# `crossbeam` is not a default feature. Without it floem's channel bridge
+# expects `std::sync::mpsc::Receiver`, which would mean rewriting the
+# agent→UI boundary; with it our existing crossbeam channels drain straight
+# into floem's main thread exactly as before.
+floem = { git = "https://github.com/lapce/floem", rev = "778bb5f2aa08429e579ee2e6ac97e84fbf18b618", features = ["crossbeam"] }
+
+# --- Text engine ---
+# `ropey` backs `Buffer` (file loading) and the LSP position conversions. It is
+# deliberately NOT in the syntax-highlight path any more — see `lapce-xi-rope`.
+ropey = "1.6"
+
+# floem's document is backed by this, and the highlighter now reads from it
+# directly rather than copying the file into a second rope on every keystroke.
+# Version must match floem's own, or cargo builds two incompatible `Rope` types
+# and the document cannot be passed to the parser at all.
+lapce-xi-rope = "0.4.0"
+
+# --- Syntax highlighting ---
+tree-sitter = "0.26"
+tree-sitter-rust = "0.24"
+tree-sitter-javascript = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-python = "0.25"
+tree-sitter-go = "0.25"
+tree-sitter-c = "0.24"
+tree-sitter-cpp = "0.23"
+tree-sitter-json = "0.24"
+tree-sitter-html = "0.23"
+tree-sitter-css = "0.25"
+streaming-iterator = "0.1"
+
+# --- Async ---
+tokio = { version = "1.41", features = ["full"] }
+tokio-util = "0.7"
+futures-util = "0.3"
+async-trait = "0.1"
+
+# --- Errors ---
+thiserror = "2.0"
+anyhow = "1.0"
+
+# --- Serialization ---
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "1.1"
+
+# --- HTTP ---
+reqwest = { version = "0.13", features = ["json", "stream"] }
+
+rayon = "1.10"
+
+# --- Filesystem / search ---
+ignore = "0.4"
+regex = "1.10"
+notify = "8.0"
+notify-debouncer-full = "0.7"
+dirs = "6.0"
+which = "8.0"
+rfd = "0.17"
+
+# --- Capability sandbox (from divcli) ---
+cap-std = "4.0"
+
+# --- Fuzzy edit matching (from rustcoder) ---
+similar = "3"
+
+# --- Terminal emulation ---
+portable-pty = "0.9"
+vte = "0.15"
+
+# Direct, for exactly one call: `killpg` in the `bash` tool's timeout path.
+# `Child::kill` signals only the shell it spawned, so a command that
+# backgrounds anything leaves the grandchild holding the output pipe open and
+# the reader thread blocked on it — a tool call that never returns. Already in
+# the tree transitively; direct because we depend on it deliberately.
+libc = "0.2"
+
+# --- LSP ---
+lsp-types = "0.97"
+async-lsp = { version = "0.2", features = ["tokio"] }
+
+# --- URIs ---
+# Already in the tree transitively (reqwest). Direct because LSP file URIs must
+# be percent-encoded and a hand-rolled encoder is the wrong thing to own.
+percent-encoding = "2.3"
+
+# --- Channels ---
+crossbeam-channel = "0.5"
+
+# --- Testing ---
+proptest = "1.5"
+tempfile = "3.10"

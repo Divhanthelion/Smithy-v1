@@ -1,0 +1,13 @@
+[package]
+name = "smithy-sky"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# No dependencies, deliberately. This crate answers "where is everything in the
+# sky" and nothing else: no floem, the same separation `smithy-agent` has, and
+# no astronomy crate either. The formulas are a few dozen lines each out of
+# Meeus, and writing them means they can be tested against published values
+# rather than trusted — which is the whole reason this feature was chosen.
+[dependencies]
