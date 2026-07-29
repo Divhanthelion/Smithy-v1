@@ -39,20 +39,55 @@ tells you which if it isn't.
 If the server wasn't running when Smithy started, the agent panel shows a red
 dot and a **Reconnect** button. Start the server, click it.
 
-**One LM Studio setting is worth changing:** set context overflow to
-**"stop at limit"** rather than truncate-middle or rolling-window. Smithy manages
-its own context budget and stops cleanly before the ceiling; the other modes
-rewrite the start of the conversation behind its back, which makes every turn
-slower. You'll probably never hit it either way.
-
-To use a different endpoint or model:
+To use OpenRouter instead of LM Studio:
 
 ```bash
-LMSTUDIO_URL=http://localhost:1234/v1 LMSTUDIO_MODEL=qwen3.6-27b cargo run -p smithy
+SMITHY_PROVIDER=openrouter OPENROUTER_API_KEY=sk-or-v1-... OPENROUTER_MODEL=anthropic/claude-3.5-sonnet cargo run -p smithy
+```
+
+To use a different LM Studio endpoint or model:
+
+```bash
+SMITHY_PROVIDER=lmstudio LMSTUDIO_URL=http://localhost:1234/v1 LMSTUDIO_MODEL=qwen3.6-27b cargo run -p smithy
 ```
 
 The model name is matched against what the server actually has loaded, so a
 quantisation suffix like `@8bit` doesn't need configuring.
+
+### Reference setup
+
+This is what Smithy is developed against, if you want a known-good starting
+point:
+
+| | |
+|---|---|
+| Model | **Qwen 3.6 27B** (`qwen3.6-27b`) — the default |
+| Context Overflow | **Stop at Limit** |
+| Limit Response Length | off |
+
+**Context Overflow is the one that matters**, and it is the only LM Studio
+setting Smithy cannot control from its side. Set it to *Stop at Limit* rather
+than truncate-middle or rolling-window: the other two rewrite the beginning of
+the conversation behind Smithy's back, which throws away the model's cache and
+makes every subsequent turn slower. Smithy tracks its own context budget and
+stops cleanly before the ceiling, so this should never actually fire.
+
+Everything under **Sampling** in LM Studio is overridden — Smithy sends these
+with every request, so the sliders in the UI don't affect agent turns:
+
+| | |
+|---|---|
+| Temperature | 0.6 |
+| Top P | 0.95 |
+| Top K | 20 |
+| Min P | 0.03 |
+| Repeat penalty | 1.0 |
+| Max tokens | 16384 |
+
+Generous `max_tokens` is deliberate: a reasoning block cut off mid-thought never
+emits its closing tag, and running out of output budget costs more than spending
+it. If you want different values, they live in `Sampling::default()` in
+`crates/smithy-agent/src/provider.rs`.
 
 ---
 
@@ -152,8 +187,12 @@ All environment variables; there's no settings file.
 
 | variable | default | what it does |
 |---|---|---|
-| `LMSTUDIO_URL` | `http://localhost:1234/v1` | the endpoint |
-| `LMSTUDIO_MODEL` | `qwen3.6-27b` | which model to ask for |
+| `SMITHY_PROVIDER` | `openrouter` (if key set) else `lmstudio` | backend provider to use (`openrouter` or `lmstudio`) |
+| `OPENROUTER_API_KEY` | *(none)* | API key for OpenRouter authentication |
+| `OPENROUTER_MODEL` | `anthropic/claude-3.5-sonnet` | model ID to use on OpenRouter |
+| `OPENROUTER_URL` | `https://openrouter.ai/api/v1` | OpenRouter API base URL |
+| `LMSTUDIO_URL` | `http://localhost:1234/v1` | LM Studio endpoint |
+| `LMSTUDIO_MODEL` | `qwen3.6-27b` | LM Studio model name to ask for |
 | `SMITHY_WORKER_THREADS` | core count | background threads; kept modest, since the machine is also serving a model |
 | `SMITHY_LSP_LIGHT=1` | off | trades real compiler diagnostics for rust-analyzer's largest memory saving |
 

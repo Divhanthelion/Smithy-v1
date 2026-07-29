@@ -52,5 +52,5 @@ pub use message::{History, Message, Role};
 pub use parse::{parse, Action};
 pub use persist::{transcript, SessionStore, TranscriptEntry};
 pub use provider::{Completion, CompletionRequest, Delta, Provider, ProviderError, Sampling};
-pub use providers::{LmStudio, ModelInfo};
+pub use providers::{create_provider_from_env, LmStudio, ModelInfo, OpenRouter};
 pub use session::{Outcome, Session, SessionConfig, Stopper, TurnEvent, CANCELLED};

@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use smithy_agent::{
-    session::default_system_prompt, LmStudio, Outcome, Provider, Session, SessionConfig, TurnEvent,
+    create_provider_from_env, session::default_system_prompt, Outcome, Session, SessionConfig, TurnEvent,
 };
 use smithy_tools::{Registry, ToolCtx, Workspace};
 
@@ -24,7 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::write(dir.path().join("notes.txt"), "the secret word is FJORD\n")?;
     std::fs::write(dir.path().join("decoy.txt"), "nothing interesting here\n")?;
 
-    let provider = LmStudio::from_env()?;
+    let provider = create_provider_from_env()?;
     println!(
         "provider: {} · model: {}",
         provider.name(),
@@ -57,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = Arc::new(ToolCtx::new(ws));
 
     let mut session = Session::new(
-        Arc::new(provider),
+        provider.clone(),
         registry,
         ctx,
         SessionConfig::new(prompt),

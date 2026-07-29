@@ -133,6 +133,11 @@ pub trait Provider: Send + Sync {
         Ok(())
     }
 
+    /// Probe the model endpoint for details (context length, loaded status, formatting).
+    async fn probe_model(&self) -> Result<Option<crate::providers::ModelInfo>, ProviderError> {
+        Ok(None)
+    }
+
     /// Get one completion. `on_delta`, when present, is called as fragments
     /// arrive; the assembled completion is returned either way.
     async fn complete(

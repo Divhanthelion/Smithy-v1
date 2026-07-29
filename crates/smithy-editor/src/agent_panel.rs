@@ -19,7 +19,7 @@
 
 use floem::peniko::Color;
 use floem::prelude::*;
-use floem::reactive::{RwSignal, SignalGet, SignalUpdate};
+use floem::reactive::{Memo, RwSignal, SignalGet, SignalUpdate};
 use floem::style::CustomStylable;
 
 use crate::theme::catppuccin;
@@ -619,73 +619,105 @@ fn banner(text: String, color: Color, glyph: &'static str) -> impl IntoView {
 }
 
 /// Live reasoning and answer text while a turn runs.
+///
+/// **The triggers below are `Memo`s and not plain closures, and that is what
+/// keeps the panel on screen.**
+///
+/// `dyn_container` tears down and rebuilds its entire child whenever a signal
+/// read in its trigger changes — there is no equality check. These triggers read
+/// the streaming text, which changes on *every token the model emits*. So a long
+/// answer rebuilt this whole region dozens of times a second for as long as it
+/// took to arrive, and the visible result was the right-hand panel going blank
+/// until the turn finished and the streaming signals were cleared.
+///
+/// A `Memo` propagates only when its value actually changes, so the rebuild
+/// happens on the two transitions that matter — activity starting, activity
+/// stopping — instead of on every delta. The text still updates live without
+/// any of this: `Label::derived` re-reads its own signal, and a label changing
+/// its string is not a view being rebuilt.
+///
+/// This is the third time this exact trap has been paid for here. It cost the
+/// terminal its keyboard focus once — every keystroke rebuilt the subtree and
+/// destroyed the focused view — which is why `apps/smithy/src/terminal.rs`
+/// carries two version signals rather than one. Anything handed to
+/// `dyn_container` wants asking: *does this change more often than the shape of
+/// what it builds?*
 fn live_activity(state: AgentPanelState) -> impl IntoView {
-    let has_activity = move || {
-        !state.streaming_reasoning.get().is_empty() || !state.streaming_answer.get().is_empty()
-    };
+    let showing_reasoning = Memo::new(move |_| !state.streaming_reasoning.get().is_empty());
+    let showing_answer = Memo::new(move |_| !state.streaming_answer.get().is_empty());
+    let has_activity = Memo::new(move |_| showing_reasoning.get() || showing_answer.get());
 
-    dyn_container(has_activity, move |active| {
-        if !active {
-            return Box::new(Empty::new().style(|s| s.display(floem::taffy::Display::None)))
-                as Box<dyn View>;
-        }
-        Box::new(
-            Stack::vertical((
-                // Reasoning: dimmed and italic, and only the tail — the whole
-                // chain can run to thousands of tokens and the recent part is
-                // the part that tells you what it is doing now.
-                dyn_container(
-                    move || !state.streaming_reasoning.get().is_empty(),
-                    move |show| {
-                        if !show {
-                            return Box::new(
-                                Empty::new().style(|s| s.display(floem::taffy::Display::None)),
-                            ) as Box<dyn View>;
-                        }
-                        Box::new(
-                            Label::derived(move || {
-                                format!("💭 {}", tail(&state.streaming_reasoning.get(), 240))
-                            })
-                            .style(|s| {
-                                s.color(catppuccin::OVERLAY0)
-                                    .font_size(11.0)
-                                    .font_style(floem::text::FontStyle::Italic)
-                                    .line_height(1.4)
-                                    .width_full()
-                            }),
-                        ) as Box<dyn View>
-                    },
-                ),
-                dyn_container(
-                    move || !state.streaming_answer.get().is_empty(),
-                    move |show| {
-                        if !show {
-                            return Box::new(
-                                Empty::new().style(|s| s.display(floem::taffy::Display::None)),
-                            ) as Box<dyn View>;
-                        }
-                        Box::new(
-                            Label::derived(move || state.streaming_answer.get()).style(|s| {
-                                s.color(catppuccin::TEXT)
-                                    .font_size(13.0)
-                                    .line_height(1.5)
-                                    .width_full()
-                                    .margin_top(4.0)
-                            }),
-                        ) as Box<dyn View>
-                    },
-                ),
-            ))
-            .style(|s| {
-                s.width_full()
-                    .padding_horiz(12.0)
-                    .padding_vert(8.0)
-                    .background(catppuccin::BASE)
-                    .border_top(1.0)
-                    .border_color(catppuccin::SURFACE0)
-            }),
-        ) as Box<dyn View>
-    })
+    dyn_container(
+        move || has_activity.get(),
+        move |active| {
+            if !active {
+                return Box::new(Empty::new().style(|s| s.display(floem::taffy::Display::None)))
+                    as Box<dyn View>;
+            }
+            Box::new(
+                Stack::vertical((
+                    // Reasoning: dimmed and italic, and only the tail — the whole
+                    // chain can run to thousands of tokens and the recent part is
+                    // the part that tells you what it is doing now.
+                    dyn_container(
+                        move || showing_reasoning.get(),
+                        move |show| {
+                            if !show {
+                                return Box::new(
+                                    Empty::new().style(|s| s.display(floem::taffy::Display::None)),
+                                ) as Box<dyn View>;
+                            }
+                            Box::new(
+                                Label::derived(move || {
+                                    format!("💭 {}", tail(&state.streaming_reasoning.get(), 240))
+                                })
+                                .style(|s| {
+                                    s.color(catppuccin::OVERLAY0)
+                                        .font_size(11.0)
+                                        .font_style(floem::text::FontStyle::Italic)
+                                        .line_height(1.4)
+                                        .width_full()
+                                }),
+                            ) as Box<dyn View>
+                        },
+                    ),
+                    dyn_container(
+                        move || showing_answer.get(),
+                        move |show| {
+                            if !show {
+                                return Box::new(
+                                    Empty::new().style(|s| s.display(floem::taffy::Display::None)),
+                                ) as Box<dyn View>;
+                            }
+                            Box::new(Label::derived(move || state.streaming_answer.get()).style(
+                                |s| {
+                                    s.color(catppuccin::TEXT)
+                                        .font_size(13.0)
+                                        .line_height(1.5)
+                                        .width_full()
+                                        .margin_top(4.0)
+                                },
+                            )) as Box<dyn View>
+                        },
+                    ),
+                ))
+                .style(|s| {
+                    s.width_full()
+                        // For the same reason the transcript's scroll container has
+                        // it: `min-width: auto` is the flexbox default and refuses
+                        // to shrink below the content's intrinsic width, so one long
+                        // unbroken token in a streaming answer would otherwise widen
+                        // this region and the panel with it.
+                        .min_width(0.0)
+                        .padding_horiz(12.0)
+                        .padding_vert(8.0)
+                        .background(catppuccin::BASE)
+                        .border_top(1.0)
+                        .border_color(catppuccin::SURFACE0)
+                }),
+            ) as Box<dyn View>
+        },
+    )
 }
 
 fn tail(s: &str, max: usize) -> String {

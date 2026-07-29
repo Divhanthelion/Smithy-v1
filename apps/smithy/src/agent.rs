@@ -18,7 +18,7 @@ use crossbeam_channel::Sender;
 use serde_json::Value;
 
 use smithy_agent::{
-    session::default_system_prompt, LmStudio, Outcome, Provider, Session, SessionConfig, TurnEvent,
+    create_provider_from_env, session::default_system_prompt, Outcome, Session, SessionConfig, TurnEvent,
 };
 use smithy_editor::{PendingChangeManager, PendingFileChange};
 use smithy_tools::{HookDecision, Registry, ToolCall, ToolCtx, ToolHook, Workspace};
@@ -191,7 +191,7 @@ pub async fn build_session(
     pending: Arc<Mutex<PendingChangeManager>>,
     resume_from: Option<smithy_agent::persist::StoredSession>,
 ) -> Result<AgentHandle, String> {
-    let provider = LmStudio::from_env().map_err(|e| e.to_string())?;
+    let provider = create_provider_from_env().map_err(|e| e.to_string())?;
 
     // Read the model's real parameters rather than assuming them: whether it is
     // loaded, and the context window it was loaded with.
@@ -286,7 +286,7 @@ pub async fn build_session(
             let entries = smithy_agent::transcript(&history);
             (
                 Session::resume(
-                    Arc::new(provider),
+                    provider.clone(),
                     Arc::new(registry),
                     ctx,
                     history,
@@ -298,7 +298,7 @@ pub async fn build_session(
             )
         }
         None => (
-            Session::new(Arc::new(provider), Arc::new(registry), ctx, config),
+            Session::new(provider.clone(), Arc::new(registry), ctx, config),
             Vec::new(),
             None,
         ),
