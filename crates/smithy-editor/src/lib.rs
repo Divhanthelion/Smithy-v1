@@ -38,7 +38,7 @@ pub(crate) mod main_layout;
 pub(crate) mod menu_bar;
 pub(crate) mod problems_panel;
 pub(crate) mod review;
-pub(crate) mod routine;
+pub mod routine;
 pub(crate) mod squiggle;
 pub(crate) mod syntax_styling;
 pub(crate) mod terminal;

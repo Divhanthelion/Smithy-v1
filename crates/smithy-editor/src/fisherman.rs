@@ -91,6 +91,15 @@ pub fn door_openness(doing: Doing, place: Place, previous: Place, progress: f64)
     0.0
 }
 
+/// How much lamplight spills through the doorway, 0 to ~0.6.
+///
+/// A function of both the lamp and the door rather than a constant, so a shut
+/// door never glows and a dark room never spills — the two cues can't
+/// contradict each other.
+pub fn door_glow(lit: f64, door_open: f64) -> f64 {
+    0.6 * lit.clamp(0.0, 1.0) * ease(door_open)
+}
+
 /// A cheap deterministic mixer, so "random" is a pure function of its inputs.
 ///
 /// splitmix64's finaliser. No dependency, and the same seed gives the same day
@@ -221,14 +230,20 @@ const STANDING: Pose = Pose {
     head: Point::new(0.30, 0.11),
     head_radius: 0.086,
     shoulder: Point::new(0.31, 0.27),
-    elbow: Point::new(0.37, 0.42),
+    // The arm bends up to grip the rod where it rests on the shoulder — a
+    // shouldered carry reads as a saunter; a rod floating across the chest
+    // with the arm hanging reads as a spear levelled at nobody.
+    elbow: Point::new(0.40, 0.36),
     hip: Point::new(0.30, 0.56),
     knee: Point::new(0.31, 0.76),
     foot: Point::new(0.33, 0.95),
-    hand: Point::new(0.43, 0.52),
-    // Shouldered, pointing back and up — the saunter silhouette.
+    hand: Point::new(0.46, 0.32),
+    // Shouldered, pointing back and up — the saunter silhouette. The butt is
+    // placed so the shaft passes *through* the shoulder point: it rests on
+    // him, rather than crossing his neck (its first home) or floating in
+    // front of his chest.
     rod_tip: Point::new(-0.62, 0.06),
-    rod_butt: Point::new(0.52, 0.44),
+    rod_butt: Point::new(0.58, 0.33),
     hat_tilt: -0.05,
 };
 
@@ -306,10 +321,16 @@ const READING_POSE: Pose = Pose {
 };
 
 /// Standing, arms up, back arched.
+///
+/// The reach has to **clear the head's silhouette** or it is invisible: the
+/// first version put the elbow at (0.28, 0.10) — inside the head circle — and
+/// the hand a hair above the crown, so the arm rose straight up *behind* the
+/// head and the stretch read as a man simply standing there. Elbow out and
+/// back, hand well above the crown, and the yawn-stretch reads.
 const STRETCHED: Pose = Pose {
     head: Point::new(0.29, 0.13),
-    elbow: Point::new(0.28, 0.10),
-    hand: Point::new(0.33, -0.02),
+    elbow: Point::new(0.19, 0.07),
+    hand: Point::new(0.24, -0.13),
     rod_tip: Point::new(1.30, 0.97),
     rod_butt: Point::new(0.10, 0.97),
     hat_tilt: -0.16,
@@ -789,7 +810,7 @@ pub fn fisherman_view(aesthetic: RwSignal<Aesthetic>, tick: RwSignal<u64>) -> im
             draw_figure(cx, &pose, &at, scale);
             draw_plank(cx, &pose, &at, scale, completion);
         } else {
-            draw_fire(cx, &block, progress, &at, scale);
+            draw_fire(cx, &block, progress, &at, scale, frame);
             draw_line_and_rod(cx, &block, &pose, &at, scale, h, frame);
             draw_figure(cx, &pose, &at, scale);
             draw_props(cx, &block, progress, &pose, &at, scale, frame);
@@ -844,9 +865,14 @@ fn draw_line_and_rod(
     panel_height: f64,
     frame: u64,
 ) {
-    // The rod is only in his hands at the water. Everywhere else it is leaning
-    // somewhere and is not worth drawing at this size.
-    if !matches!(block.doing, Doing::Fishing | Doing::Smoking) || block.place != Place::Perch {
+    // The rod is in his hands at the water, and shouldered on every walk —
+    // that shouldered diagonal is the saunter silhouette the standing pose was
+    // measured for, and gating it to the perch left him walking with a bent
+    // arm around nothing. Everywhere else it is leaning somewhere and is not
+    // worth drawing at this size.
+    let at_the_water =
+        matches!(block.doing, Doing::Fishing | Doing::Smoking) && block.place == Place::Perch;
+    if !at_the_water && block.doing != Doing::Walking {
         return;
     }
     let tip = at(pose.rod_tip);
@@ -860,6 +886,10 @@ fn draw_line_and_rod(
         RIM.with_alpha(0.9),
         &Stroke::new((scale * 0.025).max(0.6)),
     );
+
+    if !at_the_water {
+        return;
+    }
 
     // The line has its own period, prime against the breath, and it *lags* —
     // that lag is most of what makes him read as alive rather than articulated.
@@ -876,6 +906,7 @@ fn draw_fire(
     progress: f64,
     at: &impl Fn(Point) -> Point,
     scale: f64,
+    frame: u64,
 ) {
     let strength = match block.doing {
         // Catches, burns, dies back — never simply switched on.
@@ -890,7 +921,15 @@ fn draw_fire(
     }
 
     let base = at(Point::new(0.80, 0.92));
-    let height = scale * 0.32 * strength;
+    let height = scale * 0.38 * strength;
+
+    // The hearth glow first, under everything: bare flames on cold metal read
+    // as a decal, and it is the light on the ground that says *fire*.
+    cx.fill(
+        &Ellipse::new(base, (scale * 0.30, scale * 0.09), 0.0),
+        FIRE_BODY.with_alpha(0.22 * strength as f32),
+        0.0,
+    );
 
     for (index, colour, spread) in [
         (0usize, FIRE_DEEP, 1.0),
@@ -911,6 +950,21 @@ fn draw_fire(
         );
         flame.close_path();
         cx.fill(&flame, colour.with_alpha(0.92), 0.0);
+    }
+
+    // Sparks, rising off the top of the flame and winking out — a fire that
+    // only ever burns downward reads as a lampshade.
+    for spark in 0..3 {
+        let p = ((frame as f64 / 18.0) + f64::from(spark) * 0.37).fract();
+        let wander = (f64::from(spark) - 1.0) * scale * 0.05 + p * scale * 0.03;
+        cx.fill(
+            &Circle::new(
+                Point::new(base.x + wander, base.y - height * (0.5 + p * 0.9)),
+                (scale * 0.018).max(0.4),
+            ),
+            FIRE_CORE.with_alpha((1.0 - p) as f32 * 0.8 * strength as f32),
+            0.0,
+        );
     }
 }
 
@@ -955,7 +1009,7 @@ fn draw_props(
                         Point::new(mug.x + p * scale * 0.05, mug.y - p * scale * 0.30),
                         (scale * 0.022).max(0.5),
                     ),
-                    SMOKE.with_alpha((1.0 - p) as f32 * 0.35),
+                    SMOKE.with_alpha((1.0 - p) as f32 * 0.48),
                     0.0,
                 );
             }
@@ -974,7 +1028,7 @@ fn draw_props(
                         Point::new(ember.x + p * scale * 0.12, ember.y - p * scale * 0.45),
                         (scale * 0.03).max(0.6) * (1.0 + p * 1.6),
                     ),
-                    SMOKE.with_alpha((1.0 - p) as f32 * 0.30),
+                    SMOKE.with_alpha((1.0 - p) as f32 * 0.44),
                     0.0,
                 );
             }
@@ -1214,6 +1268,7 @@ fn draw_hut(
     let (left, base, w, h) = (hut.left, hut.base, hut.width, hut.height);
     let (planks, roofed, chimney, doored, lamp) = build_stage(completion);
     let edge = (h * 0.04).max(0.5);
+    let lit = window_light(block.doing, block.place, progress);
 
     // The walls, plank by plank from the ground up.
     for plank in 0..planks {
@@ -1256,6 +1311,17 @@ fn draw_hut(
         let (x0, x1) = (left + w * 0.30, left + w * 0.46);
         let top = base - h * 0.52;
         cx.fill(&Rect::new(x0, top, x1, base), DOORWAY, 0.0);
+        // Lamplight spills through the open door. The window gets all the
+        // attention, but the door opening onto a lit room is the warmer cue —
+        // it is what "he just got home" looks like from across the room.
+        let spill = door_glow(lit, door_open);
+        if spill > 0.01 {
+            cx.fill(
+                &Rect::new(x0, top, x1, base),
+                LAMP.with_alpha(spill as f32),
+                0.0,
+            );
+        }
         let panel = x1 - (x1 - x0) * door_open;
         if panel > x0 {
             cx.fill(&Rect::new(x0, top, panel, base), HUT_ROOF, 0.0);
@@ -1273,7 +1339,6 @@ fn draw_hut(
         return;
     }
 
-    let lit = window_light(block.doing, block.place, progress);
     draw_window(cx, hut, block, lit, h);
     draw_chimney_smoke(cx, hut, chimney_smoke(block.doing, block.place), frame, h);
 }
@@ -1319,7 +1384,11 @@ fn draw_window(
 
     // Him, inside — a shape on the glass, occupying its lower half so he reads
     // as sitting at a table rather than floating.
-    if block.place == Place::Hut && block.doing != Doing::Sleeping {
+    //
+    // Not while he is walking home: the block's *destination* is the hut for
+    // the whole of that walk, so without the exclusion the window shows him
+    // sitting at his table while he is visibly still crossing the rail.
+    if block.place == Place::Hut && !matches!(block.doing, Doing::Sleeping | Doing::Walking) {
         let cx0 = pane.x0 + pane.width() * 0.55;
         let head = pane.y0 + pane.height() * 0.34;
         cx.fill(
@@ -1388,7 +1457,7 @@ fn draw_chimney_smoke(
                 Point::new(mouth.x + drift, mouth.y - rise),
                 (h * 0.05).max(0.7) * (0.6 + phase * 1.9),
             ),
-            SMOKE.with_alpha((1.0 - phase) as f32 * 0.26 * strength as f32),
+            SMOKE.with_alpha((1.0 - phase) as f32 * 0.36 * strength as f32),
             0.0,
         );
     }
@@ -1643,6 +1712,72 @@ mod tests {
             "{per_minute:.1} steps a minute is outside anything a person does \
              — documented walking is 80 to 120"
         );
+    }
+
+    /// Perpendicular distance from `p` to the line through `a` and `b`.
+    fn off_line(a: Point, b: Point, p: Point) -> f64 {
+        let ab = b - a;
+        let ap = p - a;
+        (ab.x * ap.y - ab.y * ap.x).abs() / ab.hypot().max(1e-9)
+    }
+
+    /// **The stretch must clear the head.** The arm is drawn *before* the head,
+    /// so a reach that goes straight up inside the head circle is overpainted
+    /// and the stretch reads as a man simply standing there — which is exactly
+    /// what the first version did, every morning, at his own doorstep.
+    #[test]
+    fn the_stretch_reaches_clear_of_the_head() {
+        let head_top = STRETCHED.head.y - STRETCHED.head_radius;
+        assert!(
+            STRETCHED.hand.y < head_top - STRETCHED.head_radius,
+            "his hand is at {:.2} and the crown at {head_top:.2} — the reach \
+             does not clear his hat",
+            STRETCHED.hand.y
+        );
+        // And the arm is not swallowed by the head on the way up: the elbow
+        // has to sit outside the head circle.
+        let d = ((STRETCHED.elbow.x - STRETCHED.head.x).powi(2)
+            + (STRETCHED.elbow.y - STRETCHED.head.y).powi(2))
+        .sqrt();
+        assert!(
+            d > STRETCHED.head_radius,
+            "the elbow is inside the head — the arm is overpainted"
+        );
+    }
+
+    /// **The shouldered rod rests on the shoulder.** A shaft that crosses the
+    /// head reads as a spear; one that floats a hand's width off the shoulder
+    /// reads as a diagram. And his hand has to be *on* it, or he is carrying
+    /// an invisible something else.
+    #[test]
+    fn the_shouldered_rod_rests_on_him_not_through_him() {
+        let shaft_off_shoulder = off_line(STANDING.rod_butt, STANDING.rod_tip, STANDING.shoulder);
+        assert!(
+            shaft_off_shoulder < 0.05,
+            "the shaft passes {shaft_off_shoulder:.3} off the shoulder — it floats"
+        );
+        let head_bottom = STANDING.head.y + STANDING.head_radius;
+        assert!(
+            STANDING.rod_tip.y < head_bottom && STANDING.rod_butt.y > head_bottom,
+            "the shaft should dip below his chin only ahead of him, never through the head"
+        );
+        let shaft_off_hand = off_line(STANDING.rod_butt, STANDING.rod_tip, STANDING.hand);
+        assert!(
+            shaft_off_hand < 0.05,
+            "his hand is {shaft_off_hand:.3} off the shaft — he is gripping air"
+        );
+    }
+
+    /// **A shut door never glows, and a dark room never spills.** The doorway
+    /// light is the product of the two, so the cues cannot contradict.
+    #[test]
+    fn the_doorway_only_glows_when_there_is_light_to_spill() {
+        assert_eq!(door_glow(0.8, 0.0), 0.0, "a shut door spills nothing");
+        assert_eq!(door_glow(0.0, 1.0), 0.0, "a dark room spills nothing");
+        let ajar = door_glow(0.5, 0.3);
+        let open = door_glow(0.5, 1.0);
+        assert!(open > ajar, "wider spills more");
+        assert!(open <= 0.6, "it is a spill, not a second lamp");
     }
 }
 

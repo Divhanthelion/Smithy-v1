@@ -57,6 +57,10 @@ percent-encoding.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 tempfile.workspace = true
+# Headless rasteriser for the fisherman preview harness (examples/), so his
+# silhouette can be rendered to PNG and actually looked at, rather than tuned
+# blind. Not linked into the editor itself.
+tiny-skia = "0.11"
 
 
 
