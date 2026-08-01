@@ -167,6 +167,14 @@ impl Provider for OpenRouter {
         "openrouter"
     }
 
+    /// Without this override the trait's default answers `Ok(None)` and the
+    /// caller falls back to the conservative default ceilings — the exact
+    /// failure this probe exists to prevent. (Inherent methods do not
+    /// dispatch through `dyn Provider`.)
+    async fn probe_model(&self) -> Result<Option<ModelInfo>, ProviderError> {
+        OpenRouter::probe_model(self).await
+    }
+
     fn model(&self) -> &str {
         &self.model
     }

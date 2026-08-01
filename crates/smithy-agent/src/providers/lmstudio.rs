@@ -232,6 +232,14 @@ impl Provider for LmStudio {
         "lmstudio"
     }
 
+    /// Override the trait default (`Ok(None)`): inherent methods do not
+    /// dispatch through `dyn Provider`, so without this the app sized its
+    /// context budget from the fallback defaults instead of the loaded
+    /// model's real window.
+    async fn probe_model(&self) -> Result<Option<ModelInfo>, ProviderError> {
+        LmStudio::probe_model(self).await
+    }
+
     fn model(&self) -> &str {
         &self.model
     }

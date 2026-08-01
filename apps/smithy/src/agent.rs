@@ -208,7 +208,6 @@ pub async fn build_session(
             smithy_agent::Limits::default(),
         ),
     };
-    let context_limit = limits.context_hard;
 
     // Extract the project description before opening the session: it goes into
     // the system prompt, which is frozen once the session starts.
@@ -277,13 +276,24 @@ pub async fn build_session(
     // A stored session is replayed verbatim rather than re-rendered — that is
     // the whole reason it round-trips byte-identically, and it means resuming
     // hits a warm prefix instead of paying a full cold prefill.
-    let (session, restored, session_id) = match resume_from {
+    //
+    // The limits are the exception: they are re-derived from the live endpoint
+    // whenever the probe answered, because the stored pair may predate probing
+    // (everything saved while the trait's `probe_model` default swallowed the
+    // real window carries the conservative 32k/110k fallback) or describe a
+    // different model entirely. History must round-trip; a stale ceiling must
+    // not. Only a silent probe keeps the stored values.
+    let (session, restored, session_id, limits) = match resume_from {
         Some(stored) => {
             let id = stored.id.clone();
             let sampling = stored.sampling.clone();
             let stored_limits = stored.limits.clone();
             let history = stored.into_history();
             let entries = smithy_agent::transcript(&history);
+            let effective_limits = match &info {
+                Some(info) if info.context_length.is_some() => limits.clone(),
+                _ => stored_limits,
+            };
             (
                 Session::resume(
                     provider.clone(),
@@ -291,18 +301,21 @@ pub async fn build_session(
                     ctx,
                     history,
                     sampling,
-                    stored_limits,
+                    effective_limits.clone(),
                 ),
                 entries,
                 Some(id),
+                effective_limits,
             )
         }
         None => (
             Session::new(provider.clone(), Arc::new(registry), ctx, config),
             Vec::new(),
             None,
+            limits,
         ),
     };
+    let context_limit = limits.context_hard;
 
     Ok(AgentHandle {
         session,
