@@ -87,7 +87,26 @@ serde_json = "1.0"
 toml = "1.1"
 
 # --- HTTP ---
-reqwest = { version = "0.13", features = ["json", "stream"] }
+# `query` is optional in 0.13 and is what percent-encodes a search query into a
+# URL. Without it the `web_search` tool would have to build that string by hand,
+# which is a correctness problem the moment somebody searches for `C++ &&`.
+reqwest = { version = "0.13", features = ["json", "stream", "query"] }
+
+# --- Secrets ---
+# API keys live in the OS credential store, never in the settings file. The
+# default features are exactly the `v1` all-in-one surface, which picks Keychain
+# Services on macOS, Credential Manager on Windows and Secret Service on *nix
+# with no per-platform code of ours. `Entry::new` initializes the store lazily
+# and reports `NoDefaultStore` rather than panicking when it cannot, which is
+# what lets a headless or locked machine still open the editor.
+keyring = "4.1"
+
+# Turns a documentation page into something worth spending tokens on. The
+# alternative — a hand-rolled tag stripper — gets `<script>`, entity decoding
+# and `<pre>` wrong in that order, and a docs page rendered wrong is worse than
+# not fetched: the model cannot tell mangled prose from prose that says
+# something surprising.
+html2text = "0.17"
 
 rayon = "1.10"
 

@@ -97,6 +97,22 @@ pub struct AgentPanelState {
     pub connected: RwSignal<bool>,
     /// Which step indices are expanded.
     pub expanded: RwSignal<Vec<usize>>,
+    /// Files the user dropped, waiting to go out with the next message.
+    ///
+    /// Cleared on send rather than accumulating: an attachment is part of one
+    /// message, and a list that persisted would quietly re-send every file on
+    /// every turn — which at four kilobytes a token is the most expensive
+    /// possible way to be surprised.
+    pub attachments: RwSignal<Vec<crate::attachment::Attachment>>,
+    /// Whether a drag is currently over the panel. Drives the drop outline.
+    pub drop_active: RwSignal<bool>,
+    /// The project root, for naming attachments relative to it.
+    ///
+    /// Lives here because the panel is the only thing that needs it and it
+    /// changes when the project does — a signal rather than a constructor
+    /// argument so switching project re-labels the chips without rebuilding the
+    /// panel.
+    pub project_root: RwSignal<std::path::PathBuf>,
 }
 
 impl AgentPanelState {
@@ -114,7 +130,37 @@ impl AgentPanelState {
             context_label: RwSignal::new(String::new()),
             connected: RwSignal::new(false),
             expanded: RwSignal::new(Vec::new()),
+            attachments: RwSignal::new(Vec::new()),
+            drop_active: RwSignal::new(false),
+            project_root: RwSignal::new(std::path::PathBuf::new()),
         }
+    }
+
+    /// Attach dropped paths, skipping anything already listed.
+    pub fn attach(&self, paths: &[std::path::PathBuf]) {
+        let root = self.project_root.get_untracked();
+        let existing = self.attachments.get_untracked();
+        let added = crate::attachment::collect(paths, &root, &existing);
+        if added.is_empty() {
+            return;
+        }
+        self.attachments.update(|list| list.extend(added));
+    }
+
+    pub fn remove_attachment(&self, path: &std::path::Path) {
+        self.attachments.update(|list| list.retain(|a| a.path != path));
+    }
+
+    pub fn toggle_attachment(&self, path: &std::path::Path) {
+        self.attachments.update(|list| {
+            if let Some(a) = list.iter_mut().find(|a| a.path == path) {
+                a.included = !a.included;
+            }
+        });
+    }
+
+    pub fn clear_attachments(&self) {
+        self.attachments.update(|list| list.clear());
     }
 
     pub fn push(&self, entry: Entry) {
@@ -248,11 +294,18 @@ pub fn agent_panel(
     on_voice: impl Fn() + 'static,
     // Try the endpoint again. Shown only while disconnected — see `header`.
     on_reconnect: impl Fn() + 'static,
+    // Open the backend settings dialog.
+    on_settings: impl Fn() + 'static,
+    // Forget the conversation — the model's history, not just this view of it.
+    on_clear_context: impl Fn() + 'static,
     // How the microphone's shortcut is written, for the hint beside it.
     hotkey: String,
 ) -> impl IntoView {
-    Stack::vertical((
-        header(state, on_close, on_reconnect),
+    // The whole panel is the drop target, not just the composer. Aiming at a
+    // text field while holding a drag is fiddly, and there is nothing else you
+    // could mean by dropping a file on the agent.
+    let panel = Stack::vertical((
+        header(state, on_close, on_reconnect, on_settings, on_clear_context),
         floem::views::scroll::Scroll::new(transcript(state))
             .custom_style(|s: floem::views::scroll::ScrollCustomStyle| {
                 s.hide_bars(false)
@@ -271,6 +324,7 @@ pub fn agent_panel(
             }),
         live_activity(state),
         budget_bar(state),
+        attachment_row(state),
         composer(state, on_send, on_stop, on_voice, hotkey),
     ))
     .style(|s| {
@@ -300,7 +354,28 @@ pub fn agent_panel(
             .background(catppuccin::MANTLE)
             .border_left(1.0)
             .border_color(catppuccin::SURFACE0)
+    });
+
+    // Enter/Leave only toggle the outline; Drop is what reads the paths. Leave
+    // has to clear the flag on *both* a real exit and a completed drop, because
+    // the platform does not always send a Leave after a Drop — an outline that
+    // stayed lit over a panel with nothing being dragged would be worse than no
+    // outline at all.
+    Stack::new((
+        panel.style(|s| s.width_full().height_full().min_width(0.0)),
+        drop_overlay(state),
+    ))
+    .on_event_stop(floem::event::listener::FileDragEnter, move |_, _| {
+        state.drop_active.set(true)
     })
+    .on_event_stop(floem::event::listener::FileDragLeave, move |_, _| {
+        state.drop_active.set(false)
+    })
+    .on_event_stop(floem::event::listener::FileDragDrop, move |_, event| {
+        state.drop_active.set(false);
+        state.attach(&event.paths);
+    })
+    .style(|s| s.width_full().height_full().min_width(0.0))
 }
 
 /// The panel's title row: what it is, whether it is connected, and to what.
@@ -319,6 +394,8 @@ fn header(
     state: AgentPanelState,
     on_close: impl Fn() + 'static,
     on_reconnect: impl Fn() + 'static,
+    on_settings: impl Fn() + 'static,
+    on_clear_context: impl Fn() + 'static,
 ) -> impl IntoView {
     Stack::horizontal((
         Label::derived(|| "Agent".to_string()).style(|s| {
@@ -370,6 +447,33 @@ fn header(
                     s.display(floem::taffy::Display::None)
                 })
         }),
+        // Words, not a glyph, and next to the context readout rather than in
+        // the icon row. Two reasons. The icon row carries no tooltips — see
+        // `icon_button` — so a third pictogram beside "clear the transcript"
+        // would be indistinguishable from it at exactly the moment the
+        // difference matters. And the difference *is* the point: one empties
+        // what you can see, this one empties what the model remembers.
+        //
+        // Always available, never hidden behind a full context bar. A session
+        // restored at launch reports zero tokens until its first turn while
+        // remembering everything, which is precisely when you want this.
+        Label::derived(|| "New session".to_string())
+            .on_event_stop(floem::event::listener::Click, move |_, _| on_clear_context())
+            .style(move |s| {
+                s.color(catppuccin::OVERLAY1)
+                    .font_size(11.0)
+                    .margin_right(4.0)
+                    .padding_horiz(6.0)
+                    .padding_vert(1.0)
+                    .border_radius(3.0)
+                    .cursor(floem::style::CursorStyle::Pointer)
+                    .hover(|s| s.background(catppuccin::SURFACE0).color(catppuccin::TEXT))
+            }),
+        icon_button(
+            crate::design::glyph::CONFIG,
+            "Choose the model and endpoint",
+            on_settings,
+        ),
         icon_button(
             crate::design::glyph::CLEAR,
             "Clear the transcript",
@@ -718,6 +822,202 @@ fn live_activity(state: AgentPanelState) -> impl IntoView {
             ) as Box<dyn View>
         },
     )
+}
+
+/// The attached-files row, and the whole of the context-management surface.
+///
+/// Each chip is one file: a toggle, its name, its cost, and a way to drop it.
+/// The row totals what you are about to spend and turns red past the ceiling,
+/// which is the point — the failure mode this replaces is discovering that a
+/// message was enormous only after the endpoint has spent a minute prefilling it.
+///
+/// Toggling rather than only removing is deliberate. Trimming a context usually
+/// means "not this one, this time", and a chip you unchecked is one you can
+/// check again without going back to the file browser.
+fn attachment_row(state: AgentPanelState) -> impl IntoView {
+    let over = move || crate::attachment::over_budget(&state.attachments.get());
+
+    Stack::vertical((
+        Stack::horizontal((
+            Label::derived(move || {
+                let list = state.attachments.get();
+                let count = list.iter().filter(|a| a.included).count();
+                let tokens = crate::attachment::total_tokens(&list);
+                match count {
+                    0 => "no files included".to_string(),
+                    1 => format!("1 file · ~{} tokens", format_tokens(tokens as i64)),
+                    n => format!("{n} files · ~{} tokens", format_tokens(tokens as i64)),
+                }
+            })
+            .style(move |s| {
+                s.font_size(10.0).color(if over() {
+                    catppuccin::RED
+                } else {
+                    catppuccin::SURFACE2
+                })
+            }),
+            Label::derived(|| " — over the size limit; uncheck some".to_string()).style(move |s| {
+                s.font_size(10.0)
+                    .color(catppuccin::RED)
+                    .apply_if(!over(), |s| s.display(floem::taffy::Display::None))
+            }),
+            Container::new(Empty::new()).style(|s| s.flex_grow(1.0)),
+            Label::derived(|| "Remove all".to_string())
+                .on_event_stop(floem::event::listener::Click, move |_, _| {
+                    state.clear_attachments()
+                })
+                .style(|s| {
+                    s.font_size(10.0)
+                        .color(catppuccin::OVERLAY1)
+                        .padding_horiz(5.0)
+                        .border_radius(3.0)
+                        .cursor(floem::style::CursorStyle::Pointer)
+                        .hover(|s| s.color(catppuccin::RED))
+                }),
+        ))
+        .style(|s| s.width_full().items_center().margin_bottom(5.0)),
+        dyn_stack(
+            move || state.attachments.get(),
+            |a| a.path.clone(),
+            move |a| attachment_chip(state, a),
+        )
+        .style(|s| {
+            s.width_full()
+                .flex_row()
+                .flex_wrap(floem::taffy::FlexWrap::Wrap)
+                .gap(5.0)
+        }),
+    ))
+    .style(move |s| {
+        s.width_full()
+            .padding_horiz(11.0)
+            .padding_top(9.0)
+            .background(catppuccin::MANTLE)
+            .apply_if(state.attachments.get().is_empty(), |s| {
+                s.display(floem::taffy::Display::None)
+            })
+    })
+}
+
+fn attachment_chip(
+    state: AgentPanelState,
+    attachment: crate::attachment::Attachment,
+) -> impl IntoView {
+    let included = attachment.included;
+    let name = attachment.short_name().to_string();
+    let full = attachment.display.clone();
+    let note = attachment.kind.note();
+    let size = crate::attachment::human_size(attachment.bytes);
+    let toggle_path = attachment.path.clone();
+    let remove_path = attachment.path.clone();
+
+    Stack::horizontal((
+        Label::derived(move || {
+            if included {
+                crate::design::glyph::DOT
+            } else {
+                crate::design::glyph::RING
+            }
+            .to_string()
+        })
+        .style(move |s| {
+            s.font_family(crate::design::SYMBOL.to_string())
+                .font_size(8.0)
+                .margin_right(5.0)
+                .color(if included {
+                    catppuccin::GREEN
+                } else {
+                    catppuccin::SURFACE2
+                })
+        }),
+        // The file name, with the rest of its path as the quiet half — a chip
+        // showing only `mod.rs` is not a chip that tells you which one.
+        Label::derived(move || name.clone()).style(move |s| {
+            s.font_size(11.0)
+                .font_family(crate::design::MONO.to_string())
+                .color(if included {
+                    catppuccin::TEXT
+                } else {
+                    catppuccin::SURFACE2
+                })
+        }),
+        Label::derived(move || match note {
+            Some(note) => format!(" {note}"),
+            None => format!(" {size}"),
+        })
+        .style(move |s| {
+            s.font_size(9.0).color(if note.is_some() {
+                catppuccin::PEACH
+            } else {
+                catppuccin::SURFACE2
+            })
+        }),
+        Label::derived(|| crate::design::glyph::CLOSE.to_string())
+            .on_event_stop(floem::event::listener::Click, move |_, _| {
+                state.remove_attachment(&remove_path)
+            })
+            .style(|s| {
+                s.font_family(crate::design::SYMBOL.to_string())
+                    .font_size(9.0)
+                    .margin_left(6.0)
+                    .color(catppuccin::SURFACE2)
+                    .cursor(floem::style::CursorStyle::Pointer)
+                    .hover(|s| s.color(catppuccin::RED))
+            }),
+    ))
+    .on_event_stop(floem::event::listener::Click, move |_, _| {
+        state.toggle_attachment(&toggle_path)
+    })
+    // The full path, for the chip that says `mod.rs`.
+    .style(move |s| {
+        let _ = &full;
+        s.items_center()
+            .padding_horiz(7.0)
+            .padding_vert(3.0)
+            .border_radius(5.0)
+            .background(catppuccin::SURFACE0)
+            .border(1.0)
+            .border_color(if included {
+                catppuccin::SURFACE1
+            } else {
+                catppuccin::SURFACE0
+            })
+            .cursor(floem::style::CursorStyle::Pointer)
+            .hover(|s| s.background(catppuccin::SURFACE1))
+    })
+}
+
+/// The outline shown while files are being dragged over the panel.
+///
+/// An overlay rather than a border on the panel itself: floem lays a border out
+/// as part of the box, so switching one on mid-drag would reflow everything
+/// underneath it — the content would visibly jump as the cursor crossed the edge.
+fn drop_overlay(state: AgentPanelState) -> impl IntoView {
+    Container::new(
+        Label::derived(|| "Drop files to add them to the next message".to_string()).style(|s| {
+            s.color(catppuccin::LAVENDER)
+                .font_size(12.0)
+                .padding_horiz(14.0)
+                .padding_vert(9.0)
+                .background(catppuccin::BASE)
+                .border_radius(7.0)
+        }),
+    )
+    .style(move |s| {
+        if state.drop_active.get() {
+            s.absolute()
+                .inset(0.0)
+                .items_center()
+                .justify_center()
+                .background(Color::from_rgba8(30, 30, 46, 216))
+                .border(2.0)
+                .border_color(catppuccin::LAVENDER)
+                .border_radius(4.0)
+                .z_index(50)
+        } else {
+            s.display(floem::taffy::Display::None)
+        }
+    })
 }
 
 fn tail(s: &str, max: usize) -> String {

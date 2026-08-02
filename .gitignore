@@ -1,8 +1,26 @@
 # Build output.
 /target
 
-# Environment & Keys.
+# Environment & keys.
+#
+# `.env` alone matched only that exact name, which is the rule that lets
+# `.env.local` through — and this repository is public. Widened to the whole
+# family, plus the shapes a key actually arrives in.
 .env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets.json
+credentials.json
+
+# Whole-repo dumps. Generated for tooling, and large enough that nobody reads
+# what went into one before committing it.
+CODEBASE_DUMP.txt
 
 # Finder.
 .DS_Store
+*.png
+script.sh

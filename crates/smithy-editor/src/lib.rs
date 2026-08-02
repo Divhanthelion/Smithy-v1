@@ -15,6 +15,7 @@
 
 pub(crate) mod aesthetic;
 pub mod agent_panel;
+pub mod attachment;
 pub mod buffer;
 pub(crate) mod buffer_manager;
 pub mod celestial;
@@ -39,6 +40,7 @@ pub(crate) mod menu_bar;
 pub(crate) mod problems_panel;
 pub(crate) mod review;
 pub mod routine;
+pub(crate) mod settings;
 pub(crate) mod squiggle;
 pub(crate) mod syntax_styling;
 pub(crate) mod terminal;
@@ -56,6 +58,7 @@ pub mod tick;
 
 pub use aesthetic::Aesthetic;
 pub use agent_panel::{agent_panel, AgentPanelState, Entry as AgentEntry, StepStatus};
+pub use attachment::{Attachment, AttachmentKind};
 pub use buffer_manager::{BufferManager, BufferState};
 pub use code_editor::{
     code_editor, empty_editor, external_change_bar, on_external_change, EditorHandle,
@@ -72,6 +75,7 @@ pub use main_layout::{main_layout_view, LayoutTheme};
 pub use menu_bar::{accel, menu_bar, menu_overlay, Menu, MenuBarState, MenuItem};
 pub use problems_panel::{is_same_file, problems_panel, DiagnosticsState, ProblemRow};
 pub use review::ChangeStatus;
+pub use settings::{settings_modal, SettingsState, PROVIDERS};
 pub use review::{content_with_accepted_hunks, PendingChangeManager, PendingFileChange};
 pub use syntax_styling::{EditSpan, InlineDiagnostic};
 pub use terminal::kill_all_shells;

@@ -39,6 +39,8 @@
 //! history is replayed byte-identically rather than re-rendered, so a resumed
 //! session still hits a warm prefix.
 
+pub mod config;
+pub mod explore;
 pub mod limits;
 pub mod message;
 pub mod parse;
@@ -47,6 +49,8 @@ pub mod provider;
 pub mod providers;
 pub mod session;
 
+pub use config::{AgentConfig, Endpoint, ProviderChoice};
+pub use explore::Explore;
 pub use limits::{Budget, Limits, Stop};
 pub use message::{History, Message, Role};
 pub use parse::{parse, Action};

@@ -17,4 +17,6 @@ pub mod grep;
 pub mod ls;
 pub mod read;
 pub mod todo;
+pub mod web_fetch;
+pub mod web_search;
 pub mod write;

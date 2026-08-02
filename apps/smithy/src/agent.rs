@@ -18,7 +18,7 @@ use crossbeam_channel::Sender;
 use serde_json::Value;
 
 use smithy_agent::{
-    create_provider_from_env, session::default_system_prompt, Outcome, Session, SessionConfig, TurnEvent,
+    session::default_system_prompt, AgentConfig, Outcome, Session, SessionConfig, TurnEvent,
 };
 use smithy_editor::{PendingChangeManager, PendingFileChange};
 use smithy_tools::{HookDecision, Registry, ToolCall, ToolCtx, ToolHook, Workspace};
@@ -184,14 +184,34 @@ pub struct AgentHandle {
 }
 
 /// Build a session grounded in `project`, with both gates installed.
+///
+/// `config` is the backend selection, read from the settings the dialog writes.
+/// It arrives as a value rather than being loaded here because the *caller* is
+/// on the UI thread and can read a small JSON file for free, whereas building
+/// the provider from it can block on the OS credential store — which is why that
+/// step happens here, on a worker, and not next to the file read.
 pub async fn build_session(
     project: Project,
+    config: AgentConfig,
     events: Sender<AgentUiEvent>,
     shell_approval: Sender<ShellApprovalRequest>,
     pending: Arc<Mutex<PendingChangeManager>>,
     resume_from: Option<smithy_agent::persist::StoredSession>,
 ) -> Result<AgentHandle, String> {
-    let provider = create_provider_from_env().map_err(|e| e.to_string())?;
+    // Both of these read the OS credential store, which is synchronous and can
+    // block on an authorization prompt — so they share one hop onto a worker
+    // rather than each stalling the executor.
+    let (provider, brave_key) = tokio::task::spawn_blocking(move || {
+        let provider = config.build_provider();
+        let brave = smithy_agent::config::api_key(
+            smithy_agent::config::BRAVE_KEY,
+            "BRAVE_API_KEY",
+        );
+        (provider, brave)
+    })
+    .await
+    .map_err(|e| format!("provider setup failed: {e}"))?;
+    let provider = provider.map_err(|e| e.to_string())?;
 
     // Read the model's real parameters rather than assuming them: whether it is
     // loaded, and the context window it was loaded with.
@@ -240,6 +260,35 @@ pub async fn build_session(
 
     let workspace = Workspace::open(&project.root)?;
     let mut registry = Registry::core();
+
+    // Reading a URL needs nothing but a network, so it is always available.
+    registry.push(Box::new(smithy_tools::tools::web_fetch::WebFetch::new()));
+
+    // Searching needs a key, and a tool that is present but always fails is
+    // worse than one that is absent: the model spends a call finding out. The
+    // tool block still cannot change *within* a session — see `Registry::core`
+    // on prefix caching — because this is decided once, here, at construction.
+    if let Some(key) = &brave_key {
+        registry.push(Box::new(smithy_tools::tools::web_search::WebSearch::new(
+            key.clone(),
+        )));
+    }
+
+    // The research sub-agent, on the same provider as the main loop. It gets its
+    // own copy of `web_search` rather than sharing one, because a `Tool` is
+    // owned by the registry it is pushed into and the sub-agent's registry is a
+    // deliberately different, read-only set.
+    registry.push(Box::new(smithy_agent::Explore::new(
+        provider.clone(),
+        &project.root,
+        match &brave_key {
+            Some(key) => vec![Box::new(smithy_tools::tools::web_search::WebSearch::new(
+                key.clone(),
+            )) as Box<dyn smithy_tools::Tool>],
+            None => Vec::new(),
+        },
+    )));
+
     registry.add_hook(Box::new(WriteReviewHook {
         pending,
         notify: events.clone(),

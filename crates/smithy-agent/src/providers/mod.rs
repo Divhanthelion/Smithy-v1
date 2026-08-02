@@ -1,9 +1,14 @@
 //! Backend implementations of [`crate::Provider`].
 //!
 //! Supports local endpoints (LM Studio) and cloud endpoints (OpenRouter).
+//!
+//! **Selection does not live here.** It lives in [`crate::config`], which reads
+//! a settings file the UI writes and falls back to the environment when there is
+//! none. This module is only the transports.
 
 use std::sync::Arc;
 
+use crate::config::AgentConfig;
 use crate::provider::{Provider, ProviderError};
 
 pub mod lmstudio;
@@ -13,55 +18,21 @@ pub mod sse;
 pub use lmstudio::{LmStudio, ModelInfo};
 pub use openrouter::OpenRouter;
 
-/// Create a provider based on environment configuration.
+/// Create a provider from the stored settings, falling back to the environment.
 ///
-/// Selection precedence:
-/// 1. `SMITHY_PROVIDER` or `PROVIDER` env var (`"openrouter"` or `"lmstudio"`).
-/// 2. If unset, checks if `OPENROUTER_API_KEY` is present. If present, defaults to `"openrouter"`.
-/// 3. Otherwise defaults to `"lmstudio"`.
+/// Kept as a free function with the old name because it is what the app calls
+/// and what a caller without a data directory needs. Everything it used to do
+/// inline — provider precedence, the `.env` parser — now lives in
+/// [`crate::config`]; this is the no-data-directory entry point into it.
 pub fn create_provider_from_env() -> Result<Arc<dyn Provider>, ProviderError> {
-    load_dotenv_if_present();
-    let provider_choice = std::env::var("SMITHY_PROVIDER")
-        .or_else(|_| std::env::var("PROVIDER"))
-        .ok();
-
-    let choice = match provider_choice.as_deref() {
-        Some(c) => c.to_lowercase(),
-        None => {
-            if std::env::var("OPENROUTER_API_KEY")
-                .map(|k| !k.trim().is_empty())
-                .unwrap_or(false)
-            {
-                "openrouter".to_string()
-            } else {
-                "lmstudio".to_string()
-            }
-        }
-    };
-
-    match choice.as_str() {
-        "openrouter" => Ok(Arc::new(OpenRouter::from_env()?)),
-        "lmstudio" => Ok(Arc::new(LmStudio::from_env()?)),
-        other => Err(ProviderError::Other(format!(
-            "Unknown provider `{other}` configured in SMITHY_PROVIDER. Supported providers are `openrouter` and `lmstudio`."
-        ))),
-    }
+    AgentConfig::from_env().build_provider()
 }
 
-fn load_dotenv_if_present() {
-    if let Ok(content) = std::fs::read_to_string(".env") {
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if let Some((key, val)) = line.split_once('=') {
-                let key = key.trim();
-                let val = val.trim().trim_matches('"').trim_matches('\'');
-                if std::env::var(key).is_err() {
-                    std::env::set_var(key, val);
-                }
-            }
-        }
-    }
+/// Create a provider from the settings stored under `data_dir`.
+///
+/// The path the app takes. Falls back to the environment when nothing has been
+/// saved yet, so an installation that has never opened the settings dialog is
+/// indistinguishable from one running the previous version.
+pub fn create_provider(data_dir: &std::path::Path) -> Result<Arc<dyn Provider>, ProviderError> {
+    AgentConfig::load(data_dir).build_provider()
 }

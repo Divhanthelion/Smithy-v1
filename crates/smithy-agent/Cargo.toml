@@ -16,6 +16,7 @@ tokio-util.workspace = true
 reqwest.workspace = true
 futures-util.workspace = true
 thiserror.workspace = true
+keyring.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

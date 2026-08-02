@@ -39,20 +39,58 @@ tells you which if it isn't.
 If the server wasn't running when Smithy started, the agent panel shows a red
 dot and a **Reconnect** button. Start the server, click it.
 
-To use OpenRouter instead of LM Studio:
+To switch backend or model, open **Agent → Backend Settings…** (or the gear in
+the agent panel header). Pick LM Studio or OpenRouter, set the URL and model, and
+press **Save & reconnect** — the session rebuilds against the new endpoint. No
+restart, no dotfile.
+
+API keys go to your OS credential store — Keychain on macOS — not to the settings
+file. The settings file holds the endpoint and model name only, and the dialog
+never displays a stored key back to you.
+
+Environment variables still work and are still read; they're just no longer the
+only way. Precedence is: the settings file wins if you've ever saved one, and the
+environment fills in when you haven't — so an existing `.env` keeps working
+untouched until the first time you press Save.
 
 ```bash
 SMITHY_PROVIDER=openrouter OPENROUTER_API_KEY=sk-or-v1-... OPENROUTER_MODEL=anthropic/claude-3.5-sonnet cargo run -p smithy
 ```
 
-To use a different LM Studio endpoint or model:
-
-```bash
-SMITHY_PROVIDER=lmstudio LMSTUDIO_URL=http://localhost:1234/v1 LMSTUDIO_MODEL=qwen3.6-27b cargo run -p smithy
-```
-
 The model name is matched against what the server actually has loaded, so a
 quantisation suffix like `@8bit` doesn't need configuring.
+
+### Giving it context
+
+Drag files or folders onto the agent panel. They appear as chips above the
+composer with their size and token cost; click one to include or exclude it, and
+the row totals what the next message will spend. Attachments go out with that one
+message and are then cleared — they're already in the conversation's history, so
+re-sending them would just cost twice.
+
+A dropped folder is walked gitignore-aware and skips dotfiles, so dropping a
+project doesn't paste `target/` or `.env` into a prompt. Binaries and anything
+over 256 kB are named rather than inlined, so the agent knows they exist and can
+`read` a slice.
+
+**New session** in the panel header (or **Agent → New Session**) is the one that
+forgets. The `↺` icon beside it only clears the transcript you're looking at —
+the model still remembered everything. New Session throws away the history, the
+pending review bookkeeping, and rebuilds with a freshly extracted project
+context. The previous conversation stays on disk rather than being deleted.
+
+### Searching and research
+
+With a Brave Search API key set under Backend Settings, the agent gets
+`web_search`. Without one it still gets `web_fetch`, so it can read any URL you
+or it names — it just can't discover URLs. `web_fetch` refuses non-http schemes
+and private/loopback addresses, including after a redirect.
+
+It also gets `explore`: a read-only sub-agent that answers one bounded question
+by searching on its own and returning a short written answer with `path:line`
+citations. Its intermediate reads stay in its own context instead of filling
+yours. It can't write, edit, run commands, or call itself, and it stops after
+about a dozen tool calls and reports partially rather than grinding.
 
 ### Reference setup
 
@@ -183,16 +221,23 @@ your project root.
 
 ## Configuration
 
-All environment variables; there's no settings file.
+Backend selection lives in **Agent → Backend Settings…**, stored as
+`~/.local/share/smithy/provider.json`. API keys are held in the OS credential
+store under the service name `smithy`, never in that file.
+
+The variables below are the fallback, used when no settings file has been saved.
+The four marked ✱ are superseded by the dialog the moment you press Save; the
+rest have no UI and are read every time.
 
 | variable | default | what it does |
 |---|---|---|
-| `SMITHY_PROVIDER` | `openrouter` (if key set) else `lmstudio` | backend provider to use (`openrouter` or `lmstudio`) |
-| `OPENROUTER_API_KEY` | *(none)* | API key for OpenRouter authentication |
-| `OPENROUTER_MODEL` | `anthropic/claude-3.5-sonnet` | model ID to use on OpenRouter |
-| `OPENROUTER_URL` | `https://openrouter.ai/api/v1` | OpenRouter API base URL |
-| `LMSTUDIO_URL` | `http://localhost:1234/v1` | LM Studio endpoint |
-| `LMSTUDIO_MODEL` | `qwen3.6-27b` | LM Studio model name to ask for |
+| `SMITHY_PROVIDER` ✱ | `openrouter` (if key set) else `lmstudio` | backend provider to use (`openrouter` or `lmstudio`) |
+| `OPENROUTER_API_KEY` | *(none)* | OpenRouter key, if it isn't in the credential store |
+| `OPENROUTER_MODEL` ✱ | `anthropic/claude-3.5-sonnet` | model ID to use on OpenRouter |
+| `OPENROUTER_URL` ✱ | `https://openrouter.ai/api/v1` | OpenRouter API base URL |
+| `LMSTUDIO_URL` ✱ | `http://localhost:1234/v1` | LM Studio endpoint |
+| `LMSTUDIO_MODEL` ✱ | `qwen3.6-27b` | LM Studio model name to ask for |
+| `BRAVE_API_KEY` | *(none)* | Brave Search key, if it isn't in the credential store. Absent means no `web_search` tool |
 | `SMITHY_WORKER_THREADS` | core count | background threads; kept modest, since the machine is also serving a model |
 | `SMITHY_LSP_LIGHT=1` | off | trades real compiler diagnostics for rust-analyzer's largest memory saving |
 
@@ -260,7 +305,7 @@ Seven crates. `apps/smithy` is the binary; the rest are libraries:
 | crate | what it is |
 |---|---|
 | `smithy-editor` | the UI: panels, menus, syntax styling, LSP client, terminal, file browser |
-| `smithy-agent` | the agent loop, budgets, session persistence, LM Studio provider |
+| `smithy-agent` | the agent loop, budgets, session persistence, backend selection, the `explore` sub-agent |
 | `smithy-tools` | the agent's tools and the capability sandbox |
 | `smithy-project` | project detection and context extraction |
 | `smithy-sky` | astronomy for the backdrop. No dependencies at all |

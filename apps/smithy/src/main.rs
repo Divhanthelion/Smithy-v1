@@ -15,6 +15,7 @@ mod agent;
 mod app_state;
 mod editor;
 mod runtime;
+mod settings;
 mod terminal;
 mod voice;
 
@@ -104,6 +105,12 @@ fn main() {
 fn app_view() -> impl IntoView {
     // Initialize all application state
     let (app_state, signals, agent_state) = init_state();
+
+    // The backend settings dialog. Its signals are declared here rather than in
+    // `init_state` because they are pure view state: the settings themselves
+    // live on disk, and this is only what the form is currently showing.
+    let settings_state = smithy_editor::SettingsState::new();
+    let settings_dir = agent_state.registry.data_dir().to_path_buf();
 
     // The open editor, declared before the file watcher because the watcher's
     // effect needs it: an external change is only interesting for the file
@@ -384,6 +391,10 @@ fn app_view() -> impl IntoView {
             for_reconnect.panel.model_label.set("connecting…".into());
             connect_agent(&for_reconnect);
         };
+        let settings_dir_for_open = settings_dir.clone();
+        let on_settings = move || settings::open(settings_state, &settings_dir_for_open);
+        let for_clear = agent_state.clone();
+        let on_clear_context = move || app_state::clear_context(&for_clear);
         smithy_editor::agent_panel(
             agent_state.panel,
             on_send,
@@ -395,6 +406,8 @@ fn app_view() -> impl IntoView {
                 }
             },
             on_reconnect,
+            on_settings,
+            on_clear_context,
             voice_hotkey.describe(),
         )
     };
@@ -704,6 +717,32 @@ fn app_view() -> impl IntoView {
                 smithy_editor::MenuItem::action_with("Go to Definition", "F12", {
                     let ask = ask_definition_menu.clone();
                     move || ask()
+                }),
+            ],
+        ),
+        // The agent's own menu. Both items also exist in the panel header, which
+        // is where you reach for them; they are here because the header is
+        // hidden whenever the panel is, and "how do I change the model" should
+        // be answerable from the menu bar without knowing that first.
+        smithy_editor::Menu::new(
+            "Agent",
+            vec![
+                smithy_editor::MenuItem::action("Backend Settings…", {
+                    let dir = settings_dir.clone();
+                    move || settings::open(settings_state, &dir)
+                }),
+                smithy_editor::MenuItem::Separator,
+                smithy_editor::MenuItem::action("New Session", {
+                    let agent_state = agent_state.clone();
+                    move || app_state::clear_context(&agent_state)
+                }),
+                smithy_editor::MenuItem::action("Reconnect", {
+                    let agent_state = agent_state.clone();
+                    move || {
+                        agent_state.panel.connected.set(false);
+                        agent_state.panel.model_label.set("connecting…".into());
+                        connect_agent(&agent_state);
+                    }
                 }),
             ],
         ),
@@ -1099,6 +1138,30 @@ fn app_view() -> impl IntoView {
         menu_overlay,
         diff_modal(current_diff, on_diff_accept, on_diff_reject, on_diff_close),
         shell_approval_modal(agent_state.shell_approval, agent_state.shell_inbox.clone()),
+        smithy_editor::settings_modal(
+            settings_state,
+            {
+                // Saving reconnects, because a backend you selected and did not
+                // connect to is not a setting that has taken effect. The session
+                // is rebuilt from the store the same way the header's Reconnect
+                // rebuilds it — there is no second path for this.
+                let agent_state = agent_state.clone();
+                let dir = settings_dir.clone();
+                move || match settings::save(settings_state, &dir) {
+                    Ok(warnings) => {
+                        settings_state.close();
+                        agent_state.panel.connected.set(false);
+                        agent_state.panel.model_label.set("connecting…".into());
+                        for warning in &warnings {
+                            eprintln!("[settings] {warning}");
+                        }
+                        connect_agent(&agent_state);
+                    }
+                    Err(e) => settings_state.report(e, true),
+                }
+            },
+            move |account: &str| settings::clear_key(settings_state, account),
+        ),
     ))
     .style(|s| s.width_full().height_full())
 }
@@ -1288,6 +1351,11 @@ fn switch_project(agent: &app_state::AgentState, root: std::path::PathBuf) {
 
     agent.panel.clear();
     agent.panel.connected.set(false);
+    // Attachments are named relative to the project root, and a chip left over
+    // from the previous one would be labelled against a tree it does not live
+    // in — the same class of mistake `review.abandon` above exists to prevent.
+    agent.panel.clear_attachments();
+    agent.panel.project_root.set(project.root.clone());
     agent
         .panel
         .model_label

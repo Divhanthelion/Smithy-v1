@@ -425,8 +425,13 @@ pub fn init_state() -> (AppState, AppSignals, AgentState) {
 
     let sessions = smithy_agent::SessionStore::new(registry.sessions_dir(&project.root)).ok();
 
+    let panel = AgentPanelState::new();
+    // Attachments are labelled against this; without it every dropped file
+    // inside the project would still be named by its absolute path.
+    panel.project_root.set(project.root.clone());
+
     let agent = AgentState {
-        panel: AgentPanelState::new(),
+        panel,
         tx: agent_tx,
         tick: agent_tick,
         inbox: agent_inbox,
@@ -465,8 +470,6 @@ pub fn init_state() -> (AppState, AppSignals, AgentState) {
 /// Deliberately not blocking startup: a missing or unloaded model should leave
 /// you with a working editor and a red dot, not a window that refuses to open.
 pub fn connect_agent(agent: &AgentState) {
-    let project = agent.project.borrow().clone();
-
     // Resume the project's most recent conversation, if there is one. Storing
     // sessions and then never offering them back would be the same gap as
     // before, just one layer deeper.
@@ -479,6 +482,68 @@ pub fn connect_agent(agent: &AgentState) {
             sessions.retain(|s| s.messages.len() > 1); // skip empty sessions
             sessions.into_iter().next()
         });
+    spawn_session(agent, resume_from);
+}
+
+/// Throw away everything the model remembers and start again.
+///
+/// **Distinct from clearing the transcript, which is what the panel's other
+/// clear does.** That one empties a `Vec` of view models; the conversation
+/// itself — the `History` the session replays on every request, and the copy of
+/// it on disk — was untouched, so the model still remembered a conversation you
+/// could no longer see. This is the one that forgets.
+///
+/// It rebuilds rather than mutates, for the reason the whole crate is built
+/// around: `History` is append-only so the endpoint's prefix cache stays warm,
+/// and a `Session` that could truncate its own history would be a second way to
+/// invalidate that cache. A fresh session is also the only way to get a freshly
+/// *extracted* project context, since the system prompt is frozen at
+/// construction — so a clear after a big refactor gives the model an accurate
+/// map, which a truncation would not.
+///
+/// The old conversation is **not deleted**. Rolling `session_id` forward means
+/// the next save writes a new file and the previous one stays on disk, so a
+/// clear is recoverable and does not destroy work.
+pub fn clear_context(agent: &AgentState) {
+    // Stop first. A turn in flight holds the session lock for its whole
+    // duration, so rebuilding under it would queue the new session behind the
+    // old one finishing — and the answer would land in a transcript that had
+    // already been cleared.
+    if let Ok(stopper) = agent.stopper.lock() {
+        if let Some(stopper) = stopper.as_ref() {
+            stopper.stop();
+        }
+    }
+
+    agent.panel.clear();
+    agent.panel.busy.set(false);
+    agent.panel.model_label.set("connecting…".into());
+    agent.panel.connected.set(false);
+
+    // Review outcomes are messages addressed to a model that is about to stop
+    // existing: `prepend_review_outcomes` would otherwise open the first turn of
+    // a brand-new conversation with "your proposed change to X was accepted",
+    // about a change it never proposed. The pending *diffs* are deliberately
+    // left alone — those are unreviewed work of yours, and dropping them to tidy
+    // up a conversation would be destroying the wrong thing.
+    agent.review.outcomes.borrow_mut().clear();
+
+    *agent.session_id.borrow_mut() = new_session_id();
+    spawn_session(agent, None);
+}
+
+/// Build a session in the background and hand it to the UI.
+///
+/// The single path both connecting and clearing take, so the two cannot drift:
+/// the only difference between them is whether a stored conversation is replayed.
+fn spawn_session(agent: &AgentState, resume_from: Option<smithy_agent::persist::StoredSession>) {
+    let project = agent.project.borrow().clone();
+
+    // Read on the UI thread on purpose: this is a small JSON file, and reading
+    // it *here* is what makes reconnect pick up a setting the dialog just saved
+    // without any signalling between the two.
+    let config = smithy_agent::AgentConfig::load(agent.registry.data_dir());
+
     let tx = agent.tx.clone();
     let shell_tx = agent.shell_approval_tx.clone();
     let pending = agent.review.pending.clone();
@@ -486,7 +551,15 @@ pub fn connect_agent(agent: &AgentState) {
     let stopper_slot = agent.stopper.clone();
 
     tokio_runtime().spawn(async move {
-        match crate::agent::build_session(project, tx.clone(), shell_tx, pending, resume_from).await
+        match crate::agent::build_session(
+            project,
+            config,
+            tx.clone(),
+            shell_tx,
+            pending,
+            resume_from,
+        )
+        .await
         {
             Ok(handle) => {
                 let model_label = handle.model_label.clone();
@@ -524,9 +597,38 @@ pub fn submit_task(agent: &AgentState, task: String) {
     agent
         .panel
         .push(smithy_editor::AgentEntry::User(task.clone()));
+
+    // Attached files go to the model but not into the bubble: a transcript in
+    // which every message is preceded by three hundred lines of source is a
+    // transcript you cannot read. What *is* recorded is that they were sent, as
+    // a Notice — the same way a review decision is recorded — because a turn
+    // whose answer depended on a file nobody can see afterwards is a turn you
+    // cannot make sense of later.
+    let attachments = agent.panel.attachments.get_untracked();
+    let included: Vec<String> = attachments
+        .iter()
+        .filter(|a| a.included)
+        .map(|a| a.display.clone())
+        .collect();
+    if !included.is_empty() {
+        agent.panel.push(smithy_editor::AgentEntry::Notice(format!(
+            "Attached {}: {}",
+            match included.len() {
+                1 => "1 file".to_string(),
+                n => format!("{n} files"),
+            },
+            included.join(", ")
+        )));
+    }
+
     agent.panel.busy.set(true);
     agent.panel.streaming_answer.set(String::new());
     agent.panel.streaming_reasoning.set(String::new());
+
+    // One message, one set of attachments. Carrying them forward would re-send
+    // every file on every turn, which is both expensive and wrong — the model
+    // already has them in history.
+    agent.panel.clear_attachments();
 
     let task = crate::agent::prepend_review_outcomes(&mut agent.review.outcomes.borrow_mut(), task);
 
@@ -534,6 +636,27 @@ pub fn submit_task(agent: &AgentState, task: String) {
     let tx = agent.tx.clone();
 
     tokio_runtime().spawn(async move {
+        // Attachments are read here rather than on the UI thread, and read at
+        // send rather than at drop. Two separate reasons:
+        //
+        // - *Here*, because up to a megabyte of file can be cold on disk, and a
+        //   blocking read on floem's main thread is a visible stall between
+        //   pressing Send and the panel reacting.
+        // - *At send*, so what the model sees is the file as it is now — drop a
+        //   file, edit it, then send, and the edit counts.
+        // The fallback is the message *without* its attachments, not an error
+        // string: if the read worker dies, sending what the user typed is a
+        // degraded turn, whereas replacing their words with a diagnostic throws
+        // the request away and asks the model to answer the diagnostic.
+        let unattached = task.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            smithy_editor::attachment::materialize(&attachments, &task, |path| {
+                std::fs::read_to_string(path).map_err(|e| e.to_string())
+            })
+        })
+        .await
+        .unwrap_or(unattached);
+
         let mut guard = slot.lock().await;
         match guard.as_mut() {
             Some(session) => crate::agent::run_turn(session, task, tx).await,
