@@ -267,19 +267,15 @@ pub fn at(hours: f64, sunrise: f64, sunset: f64, day: i64) -> (Block, f64) {
 /// made from the hour and the day — so he smokes about hourly and never on the
 /// hour, and the same day always plays out the same way.
 fn cigarette_at(hours: f64, day: i64) -> Option<f64> {
-    let this_hour = hours.floor();
-    // Check the previous hour too: a cigarette pushed late by the jitter can
-    // still be burning after the hour has turned.
-    for hour in [this_hour - 1.0, this_hour] {
-        if hour < 0.0 {
-            continue;
-        }
-        let jitter = super::fisherman::unit_from(hour as i64, day) * 2.0 - 1.0;
-        let lit = hour + 0.5 + jitter * (SMOKE_JITTER_MINUTES / 60.0);
-        let out = lit + SMOKE_MINUTES / 60.0;
-        if hours >= lit && hours < out {
-            return Some((hours - lit) / (SMOKE_MINUTES / 60.0));
-        }
+    // The jitter keeps every cigarette inside its own hour — lit at
+    // half-past ± twenty-two minutes and out three minutes later — so only
+    // the current hour can ever be burning.
+    let hour = hours.floor();
+    let jitter = super::fisherman::unit_from(hour as i64, day) * 2.0 - 1.0;
+    let lit = hour + 0.5 + jitter * (SMOKE_JITTER_MINUTES / 60.0);
+    let out = lit + SMOKE_MINUTES / 60.0;
+    if hours >= lit && hours < out {
+        return Some((hours - lit) / (SMOKE_MINUTES / 60.0));
     }
     None
 }

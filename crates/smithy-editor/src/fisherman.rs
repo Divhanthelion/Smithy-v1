@@ -373,13 +373,14 @@ fn pulse(t: f64) -> f64 {
     ease(1.0 - (t * 2.0 - 1.0).abs())
 }
 
-/// How many steps he takes crossing between two places.
+/// How many full gait cycles he makes crossing between two places.
 ///
-/// Derived from the walk's length and a real cadence rather than picked, so the
-/// two can never drift apart — which is exactly how the previous constant came
-/// to imply one step every eighteen seconds.
+/// A cycle is two footfalls — back to forward to back — so the cycles are
+/// half the steps. Derived from the walk's length and a real cadence rather
+/// than picked, so the two can never drift apart — which is exactly how the
+/// previous constant came to imply one step every eighteen seconds.
 fn strides() -> f64 {
-    (crate::routine::WALK_SECONDS / crate::routine::STEP_SECONDS).max(2.0)
+    (crate::routine::WALK_SECONDS / (crate::routine::STEP_SECONDS * 2.0)).max(2.0)
 }
 
 /// Secondary motions, in seconds per cycle.
@@ -647,30 +648,19 @@ fn session_seconds() -> f64 {
         .as_secs_f64()
 }
 
-/// Sunrise and sunset today, as hours since local midnight.
+/// The stage along the rail: his scale, where it starts, and how far it runs.
 ///
-/// The routine's two anchors. Computed from the real sun at the timezone's
-/// longitude, so his day is *your* day: he gets up before your sunrise and
-/// comes in an hour before your sunset, and in December he does less of both.
-pub fn todays_sun(unix_seconds: f64) -> (f64, f64) {
-    let jd = smithy_sky::time::julian_date_from_unix(unix_seconds);
-    let location = smithy_sky::Location {
-        latitude_deg: crate::celestial::DEFAULT_LOCATION.latitude_deg,
-        longitude_deg: crate::localtime::longitude_from_timezone(),
-    };
-
-    match smithy_sky::sun::sunrise_sunset(jd, location) {
-        Some((rise, set)) => {
-            let to_local = |at: f64| {
-                crate::localtime::local_hours((at - smithy_sky::time::UNIX_EPOCH_JD) * 86_400.0)
-            };
-            (to_local(rise), to_local(set))
-        }
-        // Polar day or night. He keeps civil hours rather than having no day at
-        // all: a routine anchored to a sunrise that never comes would leave him
-        // asleep for six months.
-        None => (7.0, 19.0),
-    }
+/// Shared with the preview harness, because a layout that exists in two
+/// places is a layout that drifts — and it already has.
+pub fn stage_layout(w: f64, band: f64) -> (f64, f64, f64) {
+    let scale = band * 0.80;
+    // Clear of the corner ornament: the volutes reach about `band * 1.6`
+    // along the rail (the clearance the vines keep), and the hut stands
+    // `scale * 0.35` to the left of the stage — so anything less than this
+    // and the hut grows out of the corner stone.
+    let left = band * 2.1;
+    let width = (w - left - band * 1.5 - scale * (1.0 + ROD_REACH)).max(1.0);
+    (scale, left, width)
 }
 
 /// The fisherman and his hut, on the frame's bottom rail.
@@ -700,7 +690,7 @@ pub fn fisherman_view(aesthetic: RwSignal<Aesthetic>, tick: RwSignal<u64>) -> im
             .unwrap_or(0.0);
         let hours = crate::localtime::local_hours(seconds);
         let day = crate::localtime::local_day(seconds);
-        let (sunrise, sunset) = todays_sun(seconds);
+        let (sunrise, sunset) = crate::celestial::todays_sun(seconds);
         let (block, progress) = crate::routine::at(hours, sunrise, sunset, day);
 
         if std::env::var("SMITHY_FISHERMAN_DEBUG").is_ok_and(|v| v != "0") {
@@ -718,9 +708,7 @@ pub fn fisherman_view(aesthetic: RwSignal<Aesthetic>, tick: RwSignal<u64>) -> im
         let seconds = frame as f64 / 5.0;
         let phase = seconds / 6.0;
 
-        let scale = band * 0.80;
-        let stage_left = band * 1.5;
-        let stage = (w - stage_left - band * 1.5 - scale * (1.0 + ROD_REACH)).max(1.0);
+        let (scale, stage_left, stage) = stage_layout(w, band);
         let top = h - band + (band - scale) * 0.55;
 
         // The hut is a fixture at the left end, and it is drawn whether he is
@@ -773,8 +761,7 @@ pub fn fisherman_view(aesthetic: RwSignal<Aesthetic>, tick: RwSignal<u64>) -> im
         // disagree with where he is actually going.
         let a_moment_ago = if building && completion < HANDOVER {
             build_position((completion - 0.004).max(0.0))
-        } else if building {
-            let handover = ((completion - HANDOVER - 0.004) / (1.0 - HANDOVER)).clamp(0.0, 1.0);
+        } else if building {            let handover = ((completion - HANDOVER - 0.004) / (1.0 - HANDOVER)).clamp(0.0, 1.0);
             let from = build_position(HANDOVER);
             from + (place_position(block.place) - from) * ease((handover / ARRIVAL).min(1.0))
         } else {
@@ -784,6 +771,15 @@ pub fn fisherman_view(aesthetic: RwSignal<Aesthetic>, tick: RwSignal<u64>) -> im
             position_along(before, was.place, was.doing, was_progress)
         };
         let face = facing(a_moment_ago, along);
+        // During the beat at a walk's end he is standing still, and stillness
+        // reads as facing right — which at the hut is *away* from the door
+        // opening beside him. A stopped walker keeps the walk's own heading.
+        let face = if !building && doing == Doing::Walking && (along - a_moment_ago).abs() < 1e-6
+        {
+            facing(place_position(came_from), place_position(block.place))
+        } else {
+            face
+        };
         let left = stage_left + along * stage;
         // Mirrored about his own centre when he is heading left, so the rod
         // and the plank swap sides with him rather than staying put.
@@ -791,9 +787,14 @@ pub fn fisherman_view(aesthetic: RwSignal<Aesthetic>, tick: RwSignal<u64>) -> im
             let x = if face < 0.0 { 1.0 - p.x } else { p.x };
             Point::new(left + x * scale, top + p.y * scale)
         };
-        // A plank-carrying walk is just a walk with the arms out, and the
-        // stride is driven by the build rather than by the block's progress.
-        let walk_progress = if building { completion * 8.0 } else { progress };
+        // A plank-carrying walk is just a walk with the arms out, at the
+        // walk's own cadence: `pose_for` scales its input by `strides()`, so
+        // the span here is the build's duration measured in walk-lengths.
+        let walk_progress = if building {
+            completion * (BUILD_SECONDS * HANDOVER / crate::routine::WALK_SECONDS)
+        } else {
+            progress
+        };
         let mut pose = breathe(
             pose_for(doing, walk_progress, phase),
             secondary(seconds, doing),
@@ -810,7 +811,14 @@ pub fn fisherman_view(aesthetic: RwSignal<Aesthetic>, tick: RwSignal<u64>) -> im
             draw_figure(cx, &pose, &at, scale);
             draw_plank(cx, &pose, &at, scale, completion);
         } else {
-            draw_fire(cx, &block, progress, &at, scale, frame);
+            // The fire is a fixture at the pit, not a prop that follows him —
+            // a hearth that teleports to the doorstep for dinner reads as a
+            // decal, the same failure as flames without a glow.
+            let fire_base = Point::new(
+                stage_left + place_position(Place::Fire) * stage + scale * 0.80,
+                top + scale * 0.92,
+            );
+            draw_fire(cx, &block, progress, fire_base, scale, frame);
             draw_line_and_rod(cx, &block, &pose, &at, scale, h, frame);
             draw_figure(cx, &pose, &at, scale);
             draw_props(cx, &block, progress, &pose, &at, scale, frame);
@@ -899,28 +907,29 @@ fn draw_line_and_rod(
     cx.stroke(&path, LINE.with_alpha(0.75), &Stroke::new(0.9));
 }
 
-/// The cooking fire, and the hearth it burns in.
+/// The cooking fire, burning at its pit.
 fn draw_fire(
     cx: &mut floem::context::PaintCx,
     block: &crate::routine::Block,
     progress: f64,
-    at: &impl Fn(Point) -> Point,
+    base: Point,
     scale: f64,
     frame: u64,
 ) {
     let strength = match block.doing {
-        // Catches, burns, dies back — never simply switched on.
+        // Catches, burns, then dies back to the embers he eats by — never
+        // simply switched on, and never out between the cooking and the
+        // eating, which is what made it pop in at the doorstep.
         Doing::Cooking => {
-            ease((progress / 0.12).min(1.0)) * (1.0 - ease(((progress - 0.8) / 0.2).max(0.0)))
+            ease((progress / 0.12).min(1.0)) * (1.0 - 0.5 * ease(((progress - 0.8) / 0.2).max(0.0)))
         }
-        Doing::Eating => 1.0 - ease((progress / 0.5).min(1.0)),
+        Doing::Eating => 0.5 * (1.0 - ease((progress / 0.5).min(1.0))),
         _ => 0.0,
     };
     if strength < 0.02 {
         return;
     }
 
-    let base = at(Point::new(0.80, 0.92));
     let height = scale * 0.38 * strength;
 
     // The hearth glow first, under everything: bare flames on cold metal read
@@ -1015,17 +1024,28 @@ fn draw_props(
             }
         }
         Doing::Smoking => {
-            let ember = at(Point::new(pose.hand.x + 0.02, pose.hand.y - 0.02));
+            // A cigarette, not a ball of light: the paper stick first, then
+            // the ember at its tip, which is where the smoke comes from.
+            let butt = at(Point::new(pose.hand.x + 0.015, pose.hand.y - 0.005));
+            let tip = at(Point::new(pose.hand.x - 0.055, pose.hand.y - 0.035));
+            let mut cigarette = BezPath::new();
+            cigarette.move_to(butt);
+            cigarette.line_to(tip);
+            cx.stroke(
+                &cigarette,
+                PAGE.with_alpha(0.9),
+                &Stroke::new((scale * 0.018).max(0.6)),
+            );
             cx.fill(
-                &Circle::new(ember, (scale * 0.05).max(0.9)),
-                FIRE_CORE.with_alpha(0.85),
+                &Circle::new(tip, (scale * 0.028).max(0.7)),
+                FIRE_CORE.with_alpha(0.9),
                 0.0,
             );
             for puff in 0..3 {
                 let p = ((frame as f64 / 22.0) + f64::from(puff) * 0.33).fract();
                 cx.fill(
                     &Circle::new(
-                        Point::new(ember.x + p * scale * 0.12, ember.y - p * scale * 0.45),
+                        Point::new(tip.x + p * scale * 0.12, tip.y - p * scale * 0.45),
                         (scale * 0.03).max(0.6) * (1.0 + p * 1.6),
                     ),
                     SMOKE.with_alpha((1.0 - p) as f32 * 0.44),
@@ -1066,7 +1086,7 @@ fn draw_plank(
     scale: f64,
     completion: f64,
 ) {
-    let trip = (completion * (PLANKS as f64 + 2.0)).fract();
+    let trip = (completion * BUILD_TRIPS).fract();
     if trip > 0.5 {
         return;
     }
@@ -1211,8 +1231,12 @@ pub fn chimney_smoke(doing: Doing, place: Place) -> f64 {
 /// How many planks the walls are made of.
 const PLANKS: usize = 7;
 
+/// How many trips the build takes: one per plank, plus two for the roof and
+/// the chimney.
+pub const BUILD_TRIPS: f64 = PLANKS as f64 + 2.0;
+
 /// How long the hut takes to go up, in seconds.
-const BUILD_SECONDS: f64 = 52.0;
+pub const BUILD_SECONDS: f64 = 52.0;
 
 /// How much of the hut is standing, 0 to 1.
 ///
@@ -1248,7 +1272,7 @@ pub fn build_stage(completion: f64) -> (usize, bool, bool, bool, bool) {
 /// Back and forth between the lumber and the wall, one trip per plank, so the
 /// hut goes up at the pace he carries it.
 pub fn build_position(completion: f64) -> f64 {
-    let trip = (completion * (PLANKS as f64 + 2.0)).fract();
+    let trip = (completion * BUILD_TRIPS).fract();
     // Out and back, eased at both ends: he does not turn on a sixpence.
     let there = ease((trip * 2.0).min(1.0));
     let back = ease(((trip - 0.5) * 2.0).max(0.0));
@@ -1314,7 +1338,13 @@ fn draw_hut(
         // Lamplight spills through the open door. The window gets all the
         // attention, but the door opening onto a lit room is the warmer cue —
         // it is what "he just got home" looks like from across the room.
-        let spill = door_glow(lit, door_open);
+        // Gated on the lamp stage: a door that glows before the lamp is
+        // installed is the two cues contradicting each other.
+        let spill = if lamp {
+            door_glow(lit, door_open)
+        } else {
+            0.0
+        };
         if spill > 0.01 {
             cx.fill(
                 &Rect::new(x0, top, x1, base),
@@ -1387,8 +1417,12 @@ fn draw_window(
     //
     // Not while he is walking home: the block's *destination* is the hut for
     // the whole of that walk, so without the exclusion the window shows him
-    // sitting at his table while he is visibly still crossing the rail.
-    if block.place == Place::Hut && !matches!(block.doing, Doing::Sleeping | Doing::Walking) {
+    // sitting at his table while he is visibly still crossing the rail. Nor
+    // while he is getting up: a man at his table is not a man swinging his
+    // legs out of bed.
+    if block.place == Place::Hut
+        && !matches!(block.doing, Doing::Sleeping | Doing::Walking | Doing::Waking)
+    {
         let cx0 = pane.x0 + pane.width() * 0.55;
         let head = pane.y0 + pane.height() * 0.34;
         cx.fill(
@@ -1448,7 +1482,11 @@ fn draw_chimney_smoke(
     let mouth = hut.chimney();
     for puff in 0..4 {
         let phase = ((frame as f64 / 46.0) + f64::from(puff) * 0.25).fract();
-        let rise = phase * h * 0.9;
+        // Capped so the puff stays on the rail: the shell is stacked after the
+        // fisherman and paints over anything higher — drawn and covered is
+        // indistinguishable from never drawn. The chimney mouth sits about
+        // 0.71 hut-heights below the rail's top.
+        let rise = phase * h * 0.65;
         // Drifting as it climbs, and widening — smoke that went straight up in
         // a column would read as a chimney diagram.
         let drift = phase * phase * h * 0.30;
@@ -1705,7 +1743,10 @@ mod tests {
     /// over a ninety-second walk is one step every eighteen seconds.
     #[test]
     fn his_stride_is_a_pace_a_person_could_walk_at() {
-        let per_step = crate::routine::WALK_SECONDS / strides();
+        // Two footfalls to a gait cycle; it is the footfalls a stopwatch
+        // counts, and counting cycles instead is how he once walked at
+        // double time while this test passed.
+        let per_step = crate::routine::WALK_SECONDS / (strides() * 2.0);
         let per_minute = 60.0 / per_step;
         assert!(
             (80.0..=130.0).contains(&per_minute),
@@ -1813,6 +1854,28 @@ mod hut_tests {
             assert!(hut.window().y0 > rail_top, "the window is off the rail");
             assert!(hut.chimney().y > rail_top, "the chimney is off the rail");
         }
+    }
+
+    /// The hut must also keep clear of the corner ornament: the volutes reach
+    /// about `band * 1.6` along the rail — the clearance the vines keep — and
+    /// the hut, roof overhang included, must not grow out of the corner stone.
+    #[test]
+    fn the_hut_clears_the_corner_ornament() {
+        let band = 44.0;
+        let (scale, stage_left, _) = stage_layout(1280.0, band);
+        let hut = HutGeometry::new(stage_left - scale * 0.35, 600.0, scale * 1.45, band);
+
+        let ornament_reach = band * 1.6;
+        assert!(
+            hut.left >= ornament_reach,
+            "the wall starts at {:.1} but the corner ornament reaches {ornament_reach:.1}",
+            hut.left
+        );
+        let roof_left = hut.left - hut.width * 0.10;
+        assert!(
+            roof_left >= ornament_reach,
+            "the roof overhang starts at {roof_left:.1}, inside the ornament's {ornament_reach:.1}"
+        );
     }
 
     /// It goes up in an order that makes sense, and the lamp is last — the

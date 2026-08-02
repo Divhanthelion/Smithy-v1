@@ -311,15 +311,15 @@ fn draw_scene(
         STEEL_BODY,
     );
 
-    let scale = band * 0.80;
-    let stage_left = band * 1.5;
-    let stage = (w - stage_left - band * 1.5 - scale * (1.0 + f::ROD_REACH)).max(1.0);
+    // The layout is fisherman's own — a layout that exists in two places is
+    // a layout that drifts, and it already has.
+    let (scale, stage_left, stage) = f::stage_layout(w, band);
     let top = h - band + (band - scale) * 0.55;
 
     let hut = f::HutGeometry::new(stage_left - scale * 0.35, h - band * 0.10, scale * 1.45, band);
 
     // --- the hut, plank by plank (mirrors draw_hut) ---
-    let (planks, roofed, chimney, doored, _lamp) = f::build_stage(completion);
+    let (planks, roofed, chimney, doored, lamp) = f::build_stage(completion);
     let (hl, hb, hw, hh) = (hut.left, hut.base, hut.width, hut.height);
     let edge = (hh * 0.04).max(0.5);
     let rect_at = |r: Rect| {
@@ -366,7 +366,11 @@ fn draw_scene(
         let top = hb - hh * 0.52;
         let o = at0(Point::new(x0, top));
         sheet.fill_rect(rect_at(Rect::new(x0, top, x1, hb)), DOORWAY);
-        let spill = f::door_glow(f::window_light(doing, place, progress), door_open);
+        let spill = if lamp {
+            f::door_glow(f::window_light(doing, place, progress), door_open)
+        } else {
+            0.0
+        };
         if spill > 0.01 {
             sheet.fill_rect(
                 rect_at(Rect::new(x0, top, x1, hb)),
@@ -383,7 +387,6 @@ fn draw_scene(
 
     // Window and smoke appear once the lamp stage is reached — draw_hut gates
     // both on the same flag.
-    let (_, _, _, _, lamp) = f::build_stage(completion);
     if lamp {
         // --- window, mirrors draw_window ---
         let lit = f::window_light(doing, place, progress);
@@ -402,7 +405,8 @@ fn draw_scene(
                 LAMP_DEEP.with_alpha(0.16 * lit as f32),
             );
             sheet.fill_rect(pane, LAMP.with_alpha((0.55 + 0.4 * lit) as f32));
-            if place == Place::Hut && !matches!(doing, Doing::Sleeping | Doing::Walking) {
+            if place == Place::Hut && !matches!(doing, Doing::Sleeping | Doing::Walking | Doing::Waking)
+            {
                 let cx0 = pane.x0 + pane.width() * 0.55;
                 let head = pane.y0 + pane.height() * 0.34;
                 sheet.fill_circle(Point::new(cx0, head), pane.height() * 0.15, HUT_ROOF);
@@ -441,7 +445,7 @@ fn draw_scene(
             let mouth = at0(hut.chimney());
             for puff in 0..4 {
                 let ph = ((frame as f64 / 46.0) + f64::from(puff) * 0.25).fract();
-                let rise = ph * hh * 0.9;
+                let rise = ph * hh * 0.65;
                 let drift = ph * ph * hh * 0.30;
                 sheet.fill_circle(
                     Point::new(mouth.x + drift, mouth.y - rise),
@@ -463,7 +467,12 @@ fn draw_scene(
     let at = move |p: Point| at0(Point::new(left + p.x * scale, top + p.y * scale));
 
     let phase = seconds / 6.0;
-    let walk_progress = if building { completion * 8.0 } else { progress };
+    // The same cadence as the app's build walk — see fisherman_view.
+    let walk_progress = if building {
+        completion * (f::BUILD_SECONDS * f::HANDOVER / smithy_editor::routine::WALK_SECONDS)
+    } else {
+        progress
+    };
     let actual_doing = if building { Doing::Walking } else { doing };
     let mut pose = f::breathe(
         f::pose_for(actual_doing, walk_progress, phase),
@@ -478,7 +487,11 @@ fn draw_scene(
         _ => 0.0,
     };
     if strength > 0.02 {
-        let base = at(Point::new(0.80, 0.92));
+        // At the pit, as in the app — a fixture, not a prop that follows him.
+        let base = Point::new(
+            origin.x + stage_left + f::place_position(Place::Fire) * stage + scale * 0.80,
+            origin.y + top + scale * 0.92,
+        );
         let height = scale * 0.38 * strength;
         // Hearth glow first, as in draw_fire.
         let glow = Ellipse::new(base, (scale * 0.30, scale * 0.09), 0.0);
@@ -536,7 +549,7 @@ fn draw_scene(
 
     // The plank, while building.
     if building {
-        let trip = (completion * (PLANKS as f64 + 2.0)).fract();
+        let trip = (completion * f::BUILD_TRIPS).fract();
         if trip <= 0.5 {
             let hand = at(pose.hand);
             sheet.fill_rect(
@@ -558,8 +571,19 @@ fn draw_scene(
             sheet.fill_circle(mug, scale * 0.055, PAGE.with_alpha(0.9));
         }
         Doing::Smoking => {
-            let ember = at(Point::new(pose.hand.x + 0.02, pose.hand.y - 0.02));
-            sheet.fill_circle(ember, (scale * 0.05).max(0.9), FIRE_CORE.with_alpha(0.85));
+            // The cigarette, as in the app: paper stick, ember at its tip.
+            let butt = at(Point::new(pose.hand.x + 0.015, pose.hand.y - 0.005));
+            let tip = at(Point::new(pose.hand.x - 0.055, pose.hand.y - 0.035));
+            let mut cigarette = BezPath::new();
+            cigarette.move_to(butt);
+            cigarette.line_to(tip);
+            sheet.stroke(
+                &cigarette,
+                &|p| p,
+                PAGE.with_alpha(0.9),
+                (scale * 0.018).max(0.6),
+            );
+            sheet.fill_circle(tip, (scale * 0.028).max(0.7), FIRE_CORE.with_alpha(0.9));
         }
         Doing::Gardening => {
             for row in 0..4 {
