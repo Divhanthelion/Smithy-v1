@@ -135,6 +135,91 @@ pub async fn list(
     match provider {
         ProviderChoice::OpenRouter => list_openrouter(&endpoint.base_url, api_key).await,
         ProviderChoice::LmStudio => list_lmstudio(&endpoint.base_url).await,
+        ProviderChoice::DeepSeek => list_deepseek(&endpoint.base_url, api_key).await,
+    }
+}
+
+/// DeepSeek's catalogue.
+///
+/// `/models` needs a key and returns ids and nothing else — no context window,
+/// no pricing, no capability flags. So the ids come from the wire and everything
+/// else from [`crate::providers::deepseek::KNOWN_MODELS`], which is a snapshot
+/// and says so.
+///
+/// A model DeepSeek adds later still appears in the list, just without a context
+/// window or a price. That is the right failure: an unfamiliar id you can select
+/// beats a complete list you cannot see.
+async fn list_deepseek(base_url: &str, api_key: Option<&str>) -> Result<Vec<ModelEntry>, String> {
+    use crate::providers::deepseek;
+
+    let Some(key) = api_key.filter(|k| !k.trim().is_empty()) else {
+        // Worded for both callers: the dialog shows this above the key field,
+        // and the `models` example prints it to a terminal where "below" would
+        // mean nothing.
+        return Err(
+            "DeepSeek needs an API key before it will list models. Add one, then refresh."
+                .to_string(),
+        );
+    };
+
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let response = client(20)?
+        .get(&url)
+        .bearer_auth(key)
+        .send()
+        .await
+        .map_err(|e| format!("could not reach DeepSeek: {e}"))?;
+
+    let status = response.status();
+    if status.as_u16() == 401 || status.as_u16() == 403 {
+        return Err("DeepSeek rejected the API key.".to_string());
+    }
+    if !status.is_success() {
+        return Err(format!(
+            "DeepSeek returned HTTP {} when listing models",
+            status.as_u16()
+        ));
+    }
+
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("could not parse DeepSeek's model list: {e}"))?;
+    let data = body["data"]
+        .as_array()
+        .ok_or("DeepSeek's model list had no `data` array")?;
+
+    let mut entries: Vec<ModelEntry> = data
+        .iter()
+        .filter_map(|m| m["id"].as_str())
+        .map(|id| ModelEntry {
+            id: id.to_string(),
+            label: deepseek_label(id),
+            context_length: deepseek::context_for(id),
+            // Both current models do tool calls, and an unknown one is assumed
+            // to as well — hiding a new model behind the tool filter would be a
+            // worse error than listing one that turns out not to work.
+            tool_capable: true,
+            tier: match deepseek::pricing_for(id) {
+                Some((prompt, completion)) => ModelTier::Paid {
+                    prompt_per_mtok: prompt,
+                    completion_per_mtok: completion,
+                },
+                None => ModelTier::Variable,
+            },
+        })
+        .collect();
+
+    entries.sort_by(|a, b| b.context_length.cmp(&a.context_length).then(a.id.cmp(&b.id)));
+    Ok(entries)
+}
+
+/// A readable name for a DeepSeek id, since `/models` supplies none.
+fn deepseek_label(id: &str) -> String {
+    match id {
+        "deepseek-v4-flash" => "DeepSeek V4 Flash — cheaper, faster".to_string(),
+        "deepseek-v4-pro" => "DeepSeek V4 Pro — stronger, dearer".to_string(),
+        other => other.to_string(),
     }
 }
 

@@ -2,6 +2,7 @@
 //!
 //!     cargo run -p smithy-agent --example models -- lmstudio
 //!     cargo run -p smithy-agent --example models -- openrouter
+//!     cargo run -p smithy-agent --example models -- deepseek
 //!     cargo run -p smithy-agent --example models -- load <model-key>
 //!
 //! The same calls the settings dialog's model picker makes, without the dialog —
@@ -38,14 +39,9 @@ async fn main() {
     };
 
     let config = AgentConfig::from_env();
-    let endpoint = match provider {
-        ProviderChoice::LmStudio => &config.lmstudio,
-        ProviderChoice::OpenRouter => &config.openrouter,
-    };
-    let key = smithy_agent::config::api_key(
-        smithy_agent::config::OPENROUTER_KEY,
-        "OPENROUTER_API_KEY",
-    );
+    let endpoint = config.endpoint(provider);
+    // Whichever key this backend uses, or none for a local server.
+    let key = provider.api_key();
 
     eprintln!("── {} at {} ──", provider.label(), endpoint.base_url);
 

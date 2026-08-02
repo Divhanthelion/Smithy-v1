@@ -53,6 +53,9 @@ pub const OPENROUTER_KEY: &str = "openrouter-api-key";
 /// Credential-store account name for the Brave Search key.
 pub const BRAVE_KEY: &str = "brave-api-key";
 
+/// Credential-store account name for the DeepSeek key.
+pub const DEEPSEEK_KEY: &str = "deepseek-api-key";
+
 /// Which backend the agent talks to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -62,13 +65,26 @@ pub enum ProviderChoice {
     LmStudio,
     /// The hosted aggregator.
     OpenRouter,
+    /// DeepSeek's own API.
+    DeepSeek,
 }
 
 impl ProviderChoice {
+    /// Every backend, in the order the settings dialog offers them.
+    ///
+    /// A single list so that adding one cannot half-land: the dialog, the
+    /// round-trip test and the key lookup all read from here.
+    pub const ALL: &'static [ProviderChoice] = &[
+        ProviderChoice::LmStudio,
+        ProviderChoice::OpenRouter,
+        ProviderChoice::DeepSeek,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             ProviderChoice::LmStudio => "lmstudio",
             ProviderChoice::OpenRouter => "openrouter",
+            ProviderChoice::DeepSeek => "deepseek",
         }
     }
 
@@ -77,6 +93,7 @@ impl ProviderChoice {
         match self {
             ProviderChoice::LmStudio => "LM Studio",
             ProviderChoice::OpenRouter => "OpenRouter",
+            ProviderChoice::DeepSeek => "DeepSeek",
         }
     }
 
@@ -84,6 +101,7 @@ impl ProviderChoice {
         match s.trim().to_lowercase().as_str() {
             "lmstudio" | "lm-studio" | "lm_studio" | "local" => Some(ProviderChoice::LmStudio),
             "openrouter" | "open-router" | "open_router" => Some(ProviderChoice::OpenRouter),
+            "deepseek" | "deep-seek" | "deep_seek" => Some(ProviderChoice::DeepSeek),
             _ => None,
         }
     }
@@ -94,7 +112,23 @@ impl ProviderChoice {
     /// or as normal, which is the difference between a helpful form and a form
     /// that nags you about a field a local server has no use for.
     pub fn needs_api_key(self) -> bool {
-        matches!(self, ProviderChoice::OpenRouter)
+        !matches!(self, ProviderChoice::LmStudio)
+    }
+
+    /// Where this backend's key lives: credential-store account, environment
+    /// variable. `None` for a backend that needs no key.
+    pub fn key_names(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            ProviderChoice::LmStudio => None,
+            ProviderChoice::OpenRouter => Some((OPENROUTER_KEY, "OPENROUTER_API_KEY")),
+            ProviderChoice::DeepSeek => Some((DEEPSEEK_KEY, "DEEPSEEK_API_KEY")),
+        }
+    }
+
+    /// This backend's key, if one is stored or in the environment.
+    pub fn api_key(self) -> Option<String> {
+        let (account, env_var) = self.key_names()?;
+        api_key(account, env_var)
     }
 }
 
@@ -119,6 +153,13 @@ impl Endpoint {
             model: "anthropic/claude-3.5-sonnet".to_string(),
         }
     }
+
+    fn deepseek_default() -> Self {
+        Endpoint {
+            base_url: crate::providers::deepseek::DEFAULT_URL.to_string(),
+            model: crate::providers::deepseek::DEFAULT_MODEL.to_string(),
+        }
+    }
 }
 
 /// The persisted backend selection.
@@ -130,6 +171,10 @@ pub struct AgentConfig {
     pub provider: ProviderChoice,
     pub lmstudio: Endpoint,
     pub openrouter: Endpoint,
+    /// Defaulted rather than required, so a settings file written before
+    /// DeepSeek existed still parses instead of resetting every other setting.
+    #[serde(default = "Endpoint::deepseek_default")]
+    pub deepseek: Endpoint,
 }
 
 impl Default for AgentConfig {
@@ -138,6 +183,7 @@ impl Default for AgentConfig {
             provider: ProviderChoice::default(),
             lmstudio: Endpoint::lmstudio_default(),
             openrouter: Endpoint::openrouter_default(),
+            deepseek: Endpoint::deepseek_default(),
         }
     }
 }
@@ -192,12 +238,19 @@ impl AgentConfig {
             .ok()
             .and_then(|s| ProviderChoice::parse(&s));
 
-        let provider = explicit.unwrap_or_else(|| {
-            let has_key = std::env::var("OPENROUTER_API_KEY")
+        let has_key = |name: &str| {
+            std::env::var(name)
                 .map(|k| !k.trim().is_empty())
-                .unwrap_or(false);
-            if has_key {
+                .unwrap_or(false)
+        };
+        let provider = explicit.unwrap_or_else(|| {
+            // Order matters only in the unusual case of both being set, and
+            // OpenRouter stays first because it was the behaviour before
+            // DeepSeek existed — a checkout that worked must keep working.
+            if has_key("OPENROUTER_API_KEY") {
                 ProviderChoice::OpenRouter
+            } else if has_key("DEEPSEEK_API_KEY") {
+                ProviderChoice::DeepSeek
             } else {
                 ProviderChoice::LmStudio
             }
@@ -217,15 +270,27 @@ impl AgentConfig {
                 model: std::env::var("OPENROUTER_MODEL")
                     .unwrap_or_else(|_| Endpoint::openrouter_default().model),
             },
+            deepseek: Endpoint {
+                base_url: std::env::var("DEEPSEEK_URL")
+                    .unwrap_or_else(|_| Endpoint::deepseek_default().base_url),
+                model: std::env::var("DEEPSEEK_MODEL")
+                    .unwrap_or_else(|_| Endpoint::deepseek_default().model),
+            },
+        }
+    }
+
+    /// The endpoint for a given backend.
+    pub fn endpoint(&self, provider: ProviderChoice) -> &Endpoint {
+        match provider {
+            ProviderChoice::LmStudio => &self.lmstudio,
+            ProviderChoice::OpenRouter => &self.openrouter,
+            ProviderChoice::DeepSeek => &self.deepseek,
         }
     }
 
     /// The endpoint the current selection points at.
     pub fn active(&self) -> &Endpoint {
-        match self.provider {
-            ProviderChoice::LmStudio => &self.lmstudio,
-            ProviderChoice::OpenRouter => &self.openrouter,
-        }
+        self.endpoint(self.provider)
     }
 
     /// The endpoint the current selection points at, mutably.
@@ -233,6 +298,7 @@ impl AgentConfig {
         match self.provider {
             ProviderChoice::LmStudio => &mut self.lmstudio,
             ProviderChoice::OpenRouter => &mut self.openrouter,
+            ProviderChoice::DeepSeek => &mut self.deepseek,
         }
     }
 
@@ -247,20 +313,35 @@ impl AgentConfig {
                 self.lmstudio.model.clone(),
             )?)),
             ProviderChoice::OpenRouter => {
-                let key = api_key(OPENROUTER_KEY, "OPENROUTER_API_KEY").ok_or_else(|| {
-                    ProviderError::Other(
-                        "OpenRouter needs an API key. Add one under Settings → Agent, or set \
-                         OPENROUTER_API_KEY."
-                            .to_string(),
-                    )
-                })?;
+                let key = self.require_key(ProviderChoice::OpenRouter, "OPENROUTER_API_KEY")?;
                 Ok(Arc::new(OpenRouter::new(
                     self.openrouter.base_url.clone(),
                     self.openrouter.model.clone(),
                     key,
                 )?))
             }
+            ProviderChoice::DeepSeek => {
+                let key = self.require_key(ProviderChoice::DeepSeek, "DEEPSEEK_API_KEY")?;
+                Ok(Arc::new(crate::providers::DeepSeek::new(
+                    self.deepseek.base_url.clone(),
+                    self.deepseek.model.clone(),
+                    key,
+                )?))
+            }
         }
+    }
+
+    fn require_key(
+        &self,
+        provider: ProviderChoice,
+        env_var: &str,
+    ) -> Result<String, ProviderError> {
+        provider.api_key().ok_or_else(|| {
+            ProviderError::Other(format!(
+                "{} needs an API key. Add one under Settings → Agent, or set {env_var}.",
+                provider.label()
+            ))
+        })
     }
 }
 
@@ -423,17 +504,78 @@ mod tests {
 
     #[test]
     fn provider_names_round_trip_through_their_serialized_form() {
-        for choice in [ProviderChoice::LmStudio, ProviderChoice::OpenRouter] {
+        for &choice in ProviderChoice::ALL {
             assert_eq!(ProviderChoice::parse(choice.as_str()), Some(choice));
         }
         assert_eq!(ProviderChoice::parse("nonsense"), None);
     }
 
-    /// Only OpenRouter should make the dialog insist on a key; a local server
-    /// has no use for one.
+    /// Only the hosted backends should make the dialog insist on a key; a local
+    /// server has no use for one.
     #[test]
-    fn only_the_hosted_backend_requires_a_key() {
+    fn only_the_hosted_backends_require_a_key() {
         assert!(ProviderChoice::OpenRouter.needs_api_key());
+        assert!(ProviderChoice::DeepSeek.needs_api_key());
         assert!(!ProviderChoice::LmStudio.needs_api_key());
+    }
+
+    /// The whole point of `ALL`: a backend added to the enum but not the list
+    /// would be invisible to the dialog, which iterates it.
+    #[test]
+    fn every_backend_is_listed_in_all() {
+        assert_eq!(ProviderChoice::ALL.len(), 3);
+        for &choice in ProviderChoice::ALL {
+            assert!(!choice.label().is_empty());
+            assert!(!choice.as_str().is_empty());
+        }
+    }
+
+    /// A settings file written before DeepSeek existed must still load. Without
+    /// `#[serde(default)]` the parse fails and `load` silently falls back to the
+    /// environment — quietly discarding every setting the user had saved.
+    #[test]
+    fn a_settings_file_from_before_deepseek_still_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = r#"{
+            "provider": "openrouter",
+            "lmstudio": { "base_url": "http://localhost:1234/v1", "model": "qwen3.6-27b" },
+            "openrouter": { "base_url": "https://openrouter.ai/api/v1", "model": "gpt-oss-20b:free" }
+        }"#;
+        std::fs::write(AgentConfig::file_in(tmp.path()), old).unwrap();
+
+        let config = AgentConfig::load(tmp.path());
+        assert_eq!(config.provider, ProviderChoice::OpenRouter);
+        assert_eq!(config.openrouter.model, "gpt-oss-20b:free", "kept, not reset");
+        assert_eq!(config.lmstudio.model, "qwen3.6-27b", "kept, not reset");
+        assert_eq!(
+            config.deepseek.base_url,
+            crate::providers::deepseek::DEFAULT_URL,
+            "the new section is defaulted in"
+        );
+    }
+
+    #[test]
+    fn all_three_endpoints_survive_a_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = AgentConfig::default();
+        config.provider = ProviderChoice::DeepSeek;
+        config.deepseek.model = "deepseek-v4-pro".to_string();
+        config.openrouter.model = "cloud".to_string();
+        config.lmstudio.model = "local".to_string();
+
+        config.save(tmp.path()).unwrap();
+        let reloaded = AgentConfig::load(tmp.path());
+        assert_eq!(reloaded, config);
+        assert_eq!(reloaded.active().model, "deepseek-v4-pro");
+    }
+
+    /// Each hosted backend must have its own credential slot, or saving one key
+    /// overwrites the other.
+    #[test]
+    fn hosted_backends_do_not_share_a_key_slot() {
+        let a = ProviderChoice::OpenRouter.key_names().unwrap();
+        let b = ProviderChoice::DeepSeek.key_names().unwrap();
+        assert_ne!(a, b);
+        assert!(ProviderChoice::LmStudio.key_names().is_none());
     }
 }

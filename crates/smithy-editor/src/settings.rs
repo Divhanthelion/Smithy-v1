@@ -37,7 +37,7 @@ use crate::theme::catppuccin;
 /// Mirrors `smithy_agent::ProviderChoice` by value rather than by type, for the
 /// reason in the module docs. The tags are that enum's serialized form, so the
 /// app's translation is a string match and not a lookup table.
-pub const PROVIDERS: [(&str, &str, &str); 2] = [
+pub const PROVIDERS: [(&str, &str, &str); 3] = [
     (
         "lmstudio",
         "LM Studio",
@@ -46,7 +46,12 @@ pub const PROVIDERS: [(&str, &str, &str); 2] = [
     (
         "openrouter",
         "OpenRouter",
-        "Hosted models, billed to your OpenRouter account.",
+        "Hundreds of hosted models, including a free tier.",
+    ),
+    (
+        "deepseek",
+        "DeepSeek",
+        "DeepSeek's own API — 1M context, cheap, tool-capable.",
     ),
 ];
 
@@ -82,13 +87,17 @@ pub struct SettingsState {
     pub lmstudio_model: RwSignal<String>,
     pub openrouter_url: RwSignal<String>,
     pub openrouter_model: RwSignal<String>,
+    pub deepseek_url: RwSignal<String>,
+    pub deepseek_model: RwSignal<String>,
     /// A *newly typed* key. Empty means "leave the stored one alone" — see the
     /// module docs on why this is never seeded from storage.
     pub openrouter_key: RwSignal<String>,
+    pub deepseek_key: RwSignal<String>,
     pub brave_key: RwSignal<String>,
     /// Whether a key is already in the credential store. Drives the placeholder
     /// and whether "Remove" is offered, without revealing the value.
     pub openrouter_key_stored: RwSignal<bool>,
+    pub deepseek_key_stored: RwSignal<bool>,
     pub brave_key_stored: RwSignal<bool>,
     /// Whether the OS credential store answered at all. A machine where it did
     /// not must say so *before* you type a key into a field that cannot save it.
@@ -129,9 +138,13 @@ impl SettingsState {
             lmstudio_model: RwSignal::new(String::new()),
             openrouter_url: RwSignal::new(String::new()),
             openrouter_model: RwSignal::new(String::new()),
+            deepseek_url: RwSignal::new(String::new()),
+            deepseek_model: RwSignal::new(String::new()),
             openrouter_key: RwSignal::new(String::new()),
+            deepseek_key: RwSignal::new(String::new()),
             brave_key: RwSignal::new(String::new()),
             openrouter_key_stored: RwSignal::new(false),
+            deepseek_key_stored: RwSignal::new(false),
             brave_key_stored: RwSignal::new(false),
             keychain_available: RwSignal::new(true),
             status: RwSignal::new(String::new()),
@@ -152,10 +165,19 @@ impl SettingsState {
 
     /// The model field belonging to whichever backend is selected.
     pub fn active_model(&self) -> RwSignal<String> {
-        if self.provider.get_untracked() == "openrouter" {
-            self.openrouter_model
-        } else {
-            self.lmstudio_model
+        match self.provider.get_untracked().as_str() {
+            "openrouter" => self.openrouter_model,
+            "deepseek" => self.deepseek_model,
+            _ => self.lmstudio_model,
+        }
+    }
+
+    /// The base-URL field belonging to whichever backend is selected.
+    pub fn active_url(&self) -> RwSignal<String> {
+        match self.provider.get_untracked().as_str() {
+            "openrouter" => self.openrouter_url,
+            "deepseek" => self.deepseek_url,
+            _ => self.lmstudio_url,
         }
     }
 
@@ -296,7 +318,8 @@ fn panel(
         // worse than showing none.
         Stack::vertical((
             provider_row(state, 0, refresh_for_switch.clone()),
-            provider_row(state, 1, refresh_for_switch),
+            provider_row(state, 1, refresh_for_switch.clone()),
+            provider_row(state, 2, refresh_for_switch),
         ))
         .style(|s| s.width_full().gap(6.0).margin_bottom(14.0)),
         // Only the selected backend's fields, because a form showing settings
@@ -306,6 +329,7 @@ fn panel(
             move || state.selected(),
             move |choice| match choice.as_str() {
                 "openrouter" => openrouter_fields(state, clear_for_provider.clone()).into_any(),
+                "deepseek" => deepseek_fields(state, clear_for_provider.clone()).into_any(),
                 _ => lmstudio_fields(state).into_any(),
             },
         ),
@@ -763,6 +787,29 @@ fn openrouter_fields(
             state.openrouter_key_stored,
             "openrouter-api-key",
             on_clear_key,
+        ),
+    ))
+    .style(|s| s.width_full().gap(10.0))
+}
+
+fn deepseek_fields(
+    state: SettingsState,
+    on_clear_key: std::rc::Rc<dyn Fn(&str)>,
+) -> impl IntoView {
+    Stack::vertical((
+        field("API base URL", state.deepseek_url, "https://api.deepseek.com"),
+        field("Model", state.deepseek_model, "deepseek-v4-flash"),
+        secret_field(
+            "API key",
+            state.deepseek_key,
+            state.deepseek_key_stored,
+            "deepseek-api-key",
+            on_clear_key,
+        ),
+        hint(
+            "Context windows and prices below are a compiled-in snapshot — DeepSeek's API does \
+             not report them, and it has announced peak-hour rates at double the list price. \
+             Use them to compare models, not to estimate a bill.",
         ),
     ))
     .style(|s| s.width_full().gap(10.0))

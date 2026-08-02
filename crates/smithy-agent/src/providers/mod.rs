@@ -11,10 +11,12 @@ use std::sync::Arc;
 use crate::config::AgentConfig;
 use crate::provider::{Provider, ProviderError};
 
+pub mod deepseek;
 pub mod lmstudio;
 pub mod openrouter;
 pub mod sse;
 
+pub use deepseek::DeepSeek;
 pub use lmstudio::{LmStudio, ModelInfo};
 pub use openrouter::OpenRouter;
 

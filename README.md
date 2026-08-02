@@ -27,6 +27,16 @@ cargo run -p smithy -- ~/code/your-project
 That's it. After the first launch, a bare `cargo run -p smithy` reopens whatever
 you had open last.
 
+To put `smithy` on your PATH — a release build, into `~/.cargo/bin`:
+
+```bash
+cargo install --path apps/smithy --force
+```
+
+`--force` is what makes it a reinstall; without it cargo declines to overwrite a
+binary of the same version, and since the version rarely changes, an upgrade
+would silently do nothing.
+
 The editor, terminal, file browser and language-server features all work without
 LM Studio — you just won't have an agent.
 
@@ -46,14 +56,21 @@ no dotfile.
 
 The dialog lists what each backend actually offers, fetched when it opens:
 
-- **OpenRouter** — the full catalogue, free tier first. **Free only** is on by
-  default; switch it off for paid models. Each row shows its context window and
-  price per million tokens. The catalogue is public, so the list populates before
-  you have a key (you still need one to *call* anything, including free models).
 - **LM Studio** — everything downloaded locally, resident models first, with size
   and context. **Load** makes one resident without leaving the editor. That's
   optional — LM Studio's JIT loader pulls in an unloaded model on the first
   request — but it turns a minute of apparent hang into a progress line.
+- **OpenRouter** — the full catalogue, free tier first. **Free only** is on by
+  default; switch it off for paid models. Each row shows its context window and
+  price per million tokens. The catalogue is public, so the list populates before
+  you have a key (you still need one to *call* anything, including free models).
+- **DeepSeek** — `deepseek-v4-flash` and `deepseek-v4-pro`, both 1M context and
+  tool-capable. Needs a key from [platform.deepseek.com](https://platform.deepseek.com)
+  before it will list anything, since its `/models` endpoint is authenticated.
+  Context windows and prices shown for DeepSeek are a **compiled-in snapshot** —
+  its API reports neither, and it has announced peak-hour rates at double list
+  price. Use them to compare models, not to estimate a bill. OpenRouter's prices,
+  by contrast, are live from its API.
 
 **Tool-capable** is on by default and should stay on. Smithy's loop is entirely
 tool-driven, so a model that can't emit `tool_calls` doesn't give worse answers,
@@ -257,10 +274,13 @@ rest have no UI and are read every time.
 
 | variable | default | what it does |
 |---|---|---|
-| `SMITHY_PROVIDER` ✱ | `openrouter` (if key set) else `lmstudio` | backend provider to use (`openrouter` or `lmstudio`) |
+| `SMITHY_PROVIDER` ✱ | first key found, else `lmstudio` | `lmstudio`, `openrouter`, or `deepseek` |
 | `OPENROUTER_API_KEY` | *(none)* | OpenRouter key, if it isn't in the credential store |
 | `OPENROUTER_MODEL` ✱ | `anthropic/claude-3.5-sonnet` | model ID to use on OpenRouter |
 | `OPENROUTER_URL` ✱ | `https://openrouter.ai/api/v1` | OpenRouter API base URL |
+| `DEEPSEEK_API_KEY` | *(none)* | DeepSeek key, if it isn't in the credential store |
+| `DEEPSEEK_MODEL` ✱ | `deepseek-v4-flash` | model ID to use on DeepSeek |
+| `DEEPSEEK_URL` ✱ | `https://api.deepseek.com` | DeepSeek API base URL |
 | `LMSTUDIO_URL` ✱ | `http://localhost:1234/v1` | LM Studio endpoint |
 | `LMSTUDIO_MODEL` ✱ | `qwen3.6-27b` | LM Studio model name to ask for |
 | `BRAVE_API_KEY` | *(none)* | Brave Search key, if it isn't in the credential store. Absent means no `web_search` tool |

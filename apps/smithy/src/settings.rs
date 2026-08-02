@@ -19,7 +19,7 @@ use std::path::Path;
 
 use floem::reactive::{SignalGet, SignalUpdate};
 use smithy_agent::catalogue;
-use smithy_agent::config::{secrets, BRAVE_KEY, OPENROUTER_KEY};
+use smithy_agent::config::{secrets, BRAVE_KEY, DEEPSEEK_KEY, OPENROUTER_KEY};
 use smithy_agent::{AgentConfig, ProviderChoice};
 use smithy_editor::{ModelRow, SettingsState};
 
@@ -35,6 +35,8 @@ pub fn open(state: SettingsState, data_dir: &Path) {
     state.lmstudio_model.set(config.lmstudio.model.clone());
     state.openrouter_url.set(config.openrouter.base_url.clone());
     state.openrouter_model.set(config.openrouter.model.clone());
+    state.deepseek_url.set(config.deepseek.base_url.clone());
+    state.deepseek_model.set(config.deepseek.model.clone());
 
     // Presence, not value. `secrets::get` does read the secret, and that is
     // unavoidable to answer the question at all — but it is dropped here and
@@ -43,6 +45,9 @@ pub fn open(state: SettingsState, data_dir: &Path) {
     state
         .openrouter_key_stored
         .set(secrets::get(OPENROUTER_KEY).is_some());
+    state
+        .deepseek_key_stored
+        .set(secrets::get(DEEPSEEK_KEY).is_some());
     state.brave_key_stored.set(secrets::get(BRAVE_KEY).is_some());
 
     state.forget_typed_secrets();
@@ -71,19 +76,17 @@ pub fn refresh_models(state: SettingsState, data_dir: &Path) {
         return;
     };
 
-    let endpoint = smithy_agent::Endpoint {
-        base_url: trimmed(match provider {
-            ProviderChoice::OpenRouter => state.openrouter_url.get_untracked(),
-            ProviderChoice::LmStudio => state.lmstudio_url.get_untracked(),
-        }),
-        model: String::new(),
-    };
-    // Fall back to the stored URL when the field is empty, so opening the dialog
-    // on a blank form still lists something.
-    let endpoint = if endpoint.base_url.is_empty() {
-        AgentConfig::load(data_dir).active().clone()
+    let typed_url = trimmed(state.active_url().get_untracked());
+    let endpoint = if typed_url.is_empty() {
+        // Fall back to what is stored *for this backend* — not to `active()`,
+        // which follows the saved selection and would hand LM Studio's URL to a
+        // dialog on which you had just clicked DeepSeek.
+        AgentConfig::load(data_dir).endpoint(provider).clone()
     } else {
-        endpoint
+        smithy_agent::Endpoint {
+            base_url: typed_url,
+            model: String::new(),
+        }
     };
 
     state.loading_models.set(true);
@@ -91,15 +94,15 @@ pub fn refresh_models(state: SettingsState, data_dir: &Path) {
 
     let (tx, rx) = crossbeam_channel::bounded::<Result<Vec<ModelRow>, String>>(1);
     crate::runtime::tokio_runtime().spawn(async move {
-        // The key is only consulted by OpenRouter, and its catalogue is public
-        // — so this is `None`-tolerant on purpose. You can browse the free tier
-        // before deciding whether to sign up for a key to use it with.
-        let key = tokio::task::spawn_blocking(|| {
-            smithy_agent::config::api_key(OPENROUTER_KEY, "OPENROUTER_API_KEY")
-        })
-        .await
-        .ok()
-        .flatten();
+        // Whichever key this backend uses, read off the UI thread because the
+        // credential store can block. `None` is fine and expected: LM Studio
+        // needs none, and OpenRouter's catalogue is public — you can browse the
+        // free tier before deciding to sign up for a key to use it with.
+        // DeepSeek is the one that will report back that it needs one.
+        let key = tokio::task::spawn_blocking(move || provider.api_key())
+            .await
+            .ok()
+            .flatten();
 
         let result = catalogue::list(provider, &endpoint, key.as_deref())
             .await
@@ -238,6 +241,10 @@ pub fn save(state: SettingsState, data_dir: &Path) -> Result<Vec<String>, String
             base_url: trimmed(state.openrouter_url.get_untracked()),
             model: trimmed(state.openrouter_model.get_untracked()),
         },
+        deepseek: smithy_agent::Endpoint {
+            base_url: trimmed(state.deepseek_url.get_untracked()),
+            model: trimmed(state.deepseek_model.get_untracked()),
+        },
     };
 
     validate(&config)?;
@@ -247,11 +254,10 @@ pub fn save(state: SettingsState, data_dir: &Path) -> Result<Vec<String>, String
     // Keys first. If the store rejects them we still want to know before
     // reporting success, and an endpoint written without its key would
     // otherwise reconnect straight into an authentication failure.
-    let typed_openrouter = state.openrouter_key.get_untracked();
-    let typed_brave = state.brave_key.get_untracked();
     for (account, typed) in [
-        (OPENROUTER_KEY, typed_openrouter),
-        (BRAVE_KEY, typed_brave),
+        (OPENROUTER_KEY, state.openrouter_key.get_untracked()),
+        (DEEPSEEK_KEY, state.deepseek_key.get_untracked()),
+        (BRAVE_KEY, state.brave_key.get_untracked()),
     ] {
         if typed.trim().is_empty() {
             continue; // an untouched field means "leave the stored key alone"
@@ -261,15 +267,16 @@ pub fn save(state: SettingsState, data_dir: &Path) -> Result<Vec<String>, String
         }
     }
 
-    // The one case worth refusing outright: OpenRouter selected, no key typed
-    // and none stored. Reconnecting would fail with a message about a missing
-    // key, which is a worse place to learn it than the form you are looking at.
-    if provider.needs_api_key()
-        && !state.openrouter_key_stored.get_untracked()
-        && state.openrouter_key.get_untracked().trim().is_empty()
-        && smithy_agent::config::api_key(OPENROUTER_KEY, "OPENROUTER_API_KEY").is_none()
-    {
-        return Err("OpenRouter needs an API key before it can connect.".to_string());
+    // The one case worth refusing outright: a hosted backend selected with no
+    // key typed and none stored. Reconnecting would fail with a message about a
+    // missing key, which is a worse place to learn it than the form in front of
+    // you. Checked *after* the writes above, so a key typed in this very visit
+    // counts.
+    if provider.needs_api_key() && provider.api_key().is_none() {
+        return Err(format!(
+            "{} needs an API key before it can connect.",
+            provider.label()
+        ));
     }
 
     config.save(data_dir)?;
@@ -326,17 +333,18 @@ fn trimmed(s: String) -> String {
 mod tests {
     use super::*;
 
+    /// A config where only the selected backend is filled in, so validation is
+    /// exercised against exactly one populated endpoint.
     fn config(provider: ProviderChoice, url: &str, model: &str) -> AgentConfig {
+        let blank = || smithy_agent::Endpoint {
+            base_url: String::new(),
+            model: String::new(),
+        };
         let mut c = AgentConfig {
             provider,
-            lmstudio: smithy_agent::Endpoint {
-                base_url: String::new(),
-                model: String::new(),
-            },
-            openrouter: smithy_agent::Endpoint {
-                base_url: String::new(),
-                model: String::new(),
-            },
+            lmstudio: blank(),
+            openrouter: blank(),
+            deepseek: blank(),
         };
         *c.active_mut() = smithy_agent::Endpoint {
             base_url: url.to_string(),
@@ -377,18 +385,65 @@ mod tests {
         assert!(validate(&c).unwrap_err().contains("http://"));
     }
 
-    /// Validation looks at the *selected* endpoint only. A blank OpenRouter
-    /// section must not block saving a local configuration, or switching
-    /// backends becomes a trap.
+    /// Validation looks at the *selected* endpoint only. A blank OpenRouter or
+    /// DeepSeek section must not block saving a local configuration, or
+    /// switching backends becomes a trap.
     #[test]
-    fn the_unselected_endpoint_is_not_validated() {
-        let mut c = config(
+    fn the_unselected_endpoints_are_not_validated() {
+        let c = config(
             ProviderChoice::LmStudio,
             "http://localhost:1234/v1",
             "qwen3.6-27b",
         );
-        c.openrouter.base_url = String::new();
-        c.openrouter.model = String::new();
+        assert!(c.openrouter.base_url.is_empty() && c.deepseek.base_url.is_empty());
         assert!(validate(&c).is_ok());
+    }
+
+    #[test]
+    fn a_deepseek_configuration_validates_and_is_named_in_its_errors() {
+        let good = config(
+            ProviderChoice::DeepSeek,
+            "https://api.deepseek.com",
+            "deepseek-v4-flash",
+        );
+        assert!(validate(&good).is_ok());
+
+        let bad = config(ProviderChoice::DeepSeek, "https://api.deepseek.com", "");
+        assert!(validate(&bad).unwrap_err().contains("DeepSeek"));
+    }
+
+    /// Every backend the dialog offers must round-trip through `parse`, or
+    /// selecting it silently falls back to the default.
+    #[test]
+    fn every_offered_backend_parses_back() {
+        for (tag, _, _) in smithy_editor::PROVIDERS {
+            let parsed = ProviderChoice::parse(tag)
+                .unwrap_or_else(|| panic!("dialog offers `{tag}` which ProviderChoice cannot parse"));
+            assert_eq!(parsed.as_str(), tag);
+        }
+        assert_eq!(
+            smithy_editor::PROVIDERS.len(),
+            ProviderChoice::ALL.len(),
+            "the dialog and the enum disagree about how many backends exist"
+        );
+    }
+
+    /// A hosted backend needs a key; the local one must not be nagged for one.
+    #[test]
+    fn only_the_hosted_backends_require_a_key() {
+        assert!(!ProviderChoice::LmStudio.needs_api_key());
+        assert!(ProviderChoice::OpenRouter.needs_api_key());
+        assert!(ProviderChoice::DeepSeek.needs_api_key());
+    }
+
+    /// Two hosted backends must not share a credential-store slot, or saving one
+    /// key would overwrite the other.
+    #[test]
+    fn each_backend_has_its_own_key_slot() {
+        let openrouter = ProviderChoice::OpenRouter.key_names().unwrap();
+        let deepseek = ProviderChoice::DeepSeek.key_names().unwrap();
+        assert_ne!(openrouter.0, deepseek.0, "credential-store accounts collide");
+        assert_ne!(openrouter.1, deepseek.1, "environment variables collide");
+        assert!(ProviderChoice::LmStudio.key_names().is_none());
     }
 }
