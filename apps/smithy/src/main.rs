@@ -1161,6 +1161,14 @@ fn app_view() -> impl IntoView {
                 }
             },
             move |account: &str| settings::clear_key(settings_state, account),
+            {
+                let dir = settings_dir.clone();
+                move || settings::refresh_models(settings_state, &dir)
+            },
+            {
+                let dir = settings_dir.clone();
+                move |model: &str| settings::load_model(settings_state, &dir, model)
+            },
         ),
     ))
     .style(|s| s.width_full().height_full())

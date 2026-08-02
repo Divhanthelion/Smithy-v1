@@ -40,9 +40,35 @@ If the server wasn't running when Smithy started, the agent panel shows a red
 dot and a **Reconnect** button. Start the server, click it.
 
 To switch backend or model, open **Agent → Backend Settings…** (or the gear in
-the agent panel header). Pick LM Studio or OpenRouter, set the URL and model, and
-press **Save & reconnect** — the session rebuilds against the new endpoint. No
-restart, no dotfile.
+the agent panel header). Pick LM Studio or OpenRouter, choose a model, and press
+**Save & reconnect** — the session rebuilds against the new endpoint. No restart,
+no dotfile.
+
+The dialog lists what each backend actually offers, fetched when it opens:
+
+- **OpenRouter** — the full catalogue, free tier first. **Free only** is on by
+  default; switch it off for paid models. Each row shows its context window and
+  price per million tokens. The catalogue is public, so the list populates before
+  you have a key (you still need one to *call* anything, including free models).
+- **LM Studio** — everything downloaded locally, resident models first, with size
+  and context. **Load** makes one resident without leaving the editor. That's
+  optional — LM Studio's JIT loader pulls in an unloaded model on the first
+  request — but it turns a minute of apparent hang into a progress line.
+
+**Tool-capable** is on by default and should stay on. Smithy's loop is entirely
+tool-driven, so a model that can't emit `tool_calls` doesn't give worse answers,
+it gives empty turns. It's a real filter on both backends: several free
+OpenRouter models are classifiers or audio models, and a typical LM Studio
+library has TTS and ASR entries that LM Studio itself types as `llm`.
+
+The model field stays editable — a picker that replaced it would make a
+brand-new id, or a self-hosted endpoint, unreachable.
+
+To see the same lists from a terminal:
+
+```bash
+cargo run -p smithy-agent --example models -- openrouter
+```
 
 API keys go to your OS credential store — Keychain on macOS — not to the settings
 file. The settings file holds the endpoint and model name only, and the dialog

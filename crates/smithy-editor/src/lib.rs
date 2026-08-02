@@ -75,7 +75,7 @@ pub use main_layout::{main_layout_view, LayoutTheme};
 pub use menu_bar::{accel, menu_bar, menu_overlay, Menu, MenuBarState, MenuItem};
 pub use problems_panel::{is_same_file, problems_panel, DiagnosticsState, ProblemRow};
 pub use review::ChangeStatus;
-pub use settings::{settings_modal, SettingsState, PROVIDERS};
+pub use settings::{settings_modal, ModelRow, SettingsState, PROVIDERS};
 pub use review::{content_with_accepted_hunks, PendingChangeManager, PendingFileChange};
 pub use syntax_styling::{EditSpan, InlineDiagnostic};
 pub use terminal::kill_all_shells;
