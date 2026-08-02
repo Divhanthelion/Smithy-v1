@@ -84,6 +84,14 @@ pub struct TerminalGrid {
     cursor_row: usize,
     /// Current cell attributes for new characters
     current_attrs: CellAttributes,
+    /// Deferred wrap: set when a character lands in the last column. The
+    /// cursor stays put, and the wrap to the next line only happens if the
+    /// *next* thing to arrive is another printable character — a CR, LF, or
+    /// cursor-movement sequence cancels it. Real terminals work this way, and
+    /// zsh's PROMPT_SP partial-line marker (the stray `%`) is tuned to it: it
+    /// pads to exactly the terminal width and then carriage-returns, which an
+    /// eager wrap turns into a stranded `%` on a line of its own.
+    wrap_pending: bool,
     /// Lines that have scrolled off the top, oldest first.
     ///
     /// Without this the grid is a fixed window onto the last `rows` lines and
@@ -107,6 +115,7 @@ impl TerminalGrid {
             cursor_col: 0,
             cursor_row: 0,
             current_attrs: CellAttributes::default(),
+            wrap_pending: false,
             scrollback: std::collections::VecDeque::new(),
         }
     }
@@ -157,20 +166,23 @@ impl TerminalGrid {
 
     /// Set a character at the cursor position and advance cursor
     fn put_char(&mut self, c: char) {
+        // A printable character is what triggers a pending wrap — nothing
+        // else does.
+        if self.wrap_pending {
+            self.wrap_pending = false;
+            self.cursor_col = 0;
+            self.line_feed();
+        }
         if self.cursor_col < self.cols && self.cursor_row < self.rows {
             let idx = self.cursor_row * self.cols + self.cursor_col;
             self.cells[idx].c = c;
             self.cells[idx].attrs = self.current_attrs;
-            self.cursor_col += 1;
 
-            // Wrap to next line if needed
-            if self.cursor_col >= self.cols {
-                self.cursor_col = 0;
-                self.cursor_row += 1;
-                if self.cursor_row >= self.rows {
-                    self.scroll_up();
-                    self.cursor_row = self.rows - 1;
-                }
+            // In the last column, defer the wrap rather than wrapping now.
+            if self.cursor_col + 1 >= self.cols {
+                self.wrap_pending = true;
+            } else {
+                self.cursor_col += 1;
             }
         }
     }
@@ -179,6 +191,7 @@ impl TerminalGrid {
     fn move_cursor(&mut self, col: usize, row: usize) {
         self.cursor_col = col.min(self.cols.saturating_sub(1));
         self.cursor_row = row.min(self.rows.saturating_sub(1));
+        self.wrap_pending = false;
     }
 
     /// Scroll the grid up by one line
@@ -212,6 +225,7 @@ impl TerminalGrid {
         }
         self.cursor_col = 0;
         self.cursor_row = 0;
+        self.wrap_pending = false;
     }
 
     /// Clear from cursor to end of line
@@ -238,10 +252,12 @@ impl TerminalGrid {
     /// Handle carriage return
     fn carriage_return(&mut self) {
         self.cursor_col = 0;
+        self.wrap_pending = false;
     }
 
     /// Handle line feed
     fn line_feed(&mut self) {
+        self.wrap_pending = false;
         self.cursor_row += 1;
         if self.cursor_row >= self.rows {
             self.scroll_up();
@@ -251,6 +267,7 @@ impl TerminalGrid {
 
     /// Handle backspace
     fn backspace(&mut self) {
+        self.wrap_pending = false;
         if self.cursor_col > 0 {
             self.cursor_col -= 1;
         }
@@ -279,6 +296,7 @@ impl TerminalGrid {
         // Clamp cursor position
         self.cursor_col = self.cursor_col.min(new_cols.saturating_sub(1));
         self.cursor_row = self.cursor_row.min(new_rows.saturating_sub(1));
+        self.wrap_pending = false;
     }
 }
 
@@ -313,6 +331,7 @@ impl Perform for TerminalPerformer {
                 // Move to next tab stop (every 8 columns)
                 let next_tab = ((self.grid.cursor_col / 8) + 1) * 8;
                 self.grid.cursor_col = next_tab.min(self.grid.cols.saturating_sub(1));
+                self.grid.wrap_pending = false;
             }
             // Bell - ignore
             0x07 => {}
@@ -347,6 +366,9 @@ impl Perform for TerminalPerformer {
             .iter()
             .map(|p| p.first().copied().unwrap_or(0))
             .collect();
+
+        // Any control sequence cancels a pending wrap.
+        self.grid.wrap_pending = false;
 
         match action {
             // Cursor Up
@@ -1155,6 +1177,10 @@ mod tests {
         assert_eq!(grid.cursor_position(), (2, 0));
     }
 
+    /// The wrap is *deferred*: a character in the last column leaves the
+    /// cursor where it is, and only the next printable character crosses to
+    /// the next row. Anything else — a carriage return, a cursor move —
+    /// cancels the crossing.
     #[test]
     fn text_past_the_right_edge_wraps_to_the_next_row() {
         let mut grid = TerminalGrid::new(5, 3);
@@ -1164,11 +1190,37 @@ mod tests {
             grid.put_char(c);
         }
 
-        // Should wrap to next line
-        assert_eq!(grid.cursor_position(), (0, 1));
+        // Not yet wrapped: the cursor waits in the last column.
+        assert_eq!(grid.cursor_position(), (4, 0));
 
         grid.put_char('!');
         assert_eq!(grid.get_cell(0, 1).unwrap().c, '!');
+        assert_eq!(grid.cursor_position(), (1, 1));
+    }
+
+    /// zsh's PROMPT_SP: output that misses its trailing newline is terminated
+    /// by a `%` padded with spaces to exactly the terminal width, then a
+    /// carriage return — and the prompt overwrites the marker. An eager wrap
+    /// used to strand that `%` on a line of its own above every prompt.
+    #[test]
+    fn a_full_width_marker_line_is_overwritten_after_a_carriage_return() {
+        let mut grid = TerminalGrid::new(5, 3);
+
+        for c in "%    ".chars() {
+            grid.put_char(c);
+        }
+        grid.carriage_return();
+        for c in "$ ".chars() {
+            grid.put_char(c);
+        }
+
+        assert_eq!(grid.cursor_position(), (2, 0), "the prompt must not wrap");
+        assert_eq!(grid.get_cell(0, 0).unwrap().c, '$');
+        assert_eq!(grid.get_cell(1, 0).unwrap().c, ' ');
+        assert!(
+            grid.get_row(1).unwrap().iter().all(|cell| cell.c == ' '),
+            "nothing may spill onto the next row"
+        );
     }
 
     #[test]
