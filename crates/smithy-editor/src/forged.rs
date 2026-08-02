@@ -136,17 +136,26 @@ fn ramp(from: Point, to: Point, stops: &[(f32, Color)]) -> Brush {
 ///
 /// Paints nothing at all when the aesthetic is [`Aesthetic::Flat`], so the flat
 /// interface pays only an empty closure for the switch existing.
-pub fn forged_frame(aesthetic: RwSignal<Aesthetic>) -> impl IntoView {
+///
+/// The tick is the sky's minute clock: the sun rides the top rail with the
+/// day, and a frame that never repaints would leave it stuck at breakfast.
+pub fn forged_frame(aesthetic: RwSignal<Aesthetic>, tick: RwSignal<u64>) -> impl IntoView {
     canvas(move |cx, size| {
         if aesthetic.get() != Aesthetic::Forged {
             return;
         }
+        tick.get();
         let (w, h) = (size.width, size.height);
         if w < 80.0 || h < 80.0 {
             return;
         }
 
         draw_moulding(cx, w, h);
+
+        // The sun, riding the top rail with the day. Painted before any
+        // ornament so the vines, the corner stones, and the wordmark all crop
+        // it — it is part of the frieze, not pasted over it.
+        crate::celestial::draw_frame_sun(cx, w);
 
         // The frieze centre, as a fraction through the frame: past the fillet
         // and ovolo, halfway into the frieze itself.

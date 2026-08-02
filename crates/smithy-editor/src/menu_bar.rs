@@ -446,7 +446,7 @@ fn clock_readout(visible: RwSignal<bool>, tick: RwSignal<u64>) -> impl IntoView 
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
-        let (sunrise, sunset) = crate::fisherman::todays_sun(seconds);
+        let (sunrise, sunset) = crate::celestial::todays_sun(seconds);
         crate::clock::format_with_sun(crate::localtime::local_hours(seconds), sunrise, sunset)
     })
     .style(move |s| {

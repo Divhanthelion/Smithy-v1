@@ -1084,8 +1084,10 @@ fn app_view() -> impl IntoView {
     });
 
     Stack::new((
-        // Behind everything, and paints nothing at all when flat.
-        smithy_editor::forged_frame(aesthetic),
+        // Behind everything, and paints nothing at all when flat. The sky's
+        // minute clock is shared: the sun riding the top rail keeps time with
+        // the sky behind the editor.
+        smithy_editor::forged_frame(aesthetic, sky_tick),
         // The mascot, on the frame's bottom rail. Over the frame rather than
         // inside it, because he animates several times a second and the frame
         // repaints only when the look changes.
