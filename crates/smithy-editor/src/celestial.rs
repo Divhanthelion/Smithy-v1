@@ -325,7 +325,6 @@ pub fn sky_backdrop(
 
         draw_stars(cx, w, h, &sky, phase);
         draw_moon(cx, w, h, &sky);
-        draw_sun(cx, w, h, &sky);
     })
     // Decoration: without this the backdrop sits over the editor for
     // hit-testing and swallows every click meant for the code.
@@ -357,48 +356,6 @@ fn draw_stars(cx: &mut floem::context::PaintCx, w: f64, h: f64, sky: &SkyState, 
             );
         }
     }
-}
-
-/// The sun, where it actually is.
-///
-/// It tracks its real arc across the pane — the stereographic projection
-/// already puts it where you would have to look, so nothing here decides
-/// anything about the sky. Low and near the rim at either end of the day, high
-/// and near the centre at noon, and further from the centre in December than in
-/// June.
-///
-/// Deliberately small and deliberately not bright white. This sits behind code:
-/// the disc is a warm mark rather than a lamp, and the glow around it does the
-/// work of saying *sun* without putting a hole in the page. An earlier version
-/// was removed outright for being a bright disc in the middle of the editor,
-/// and the lesson kept from that is the size, not the absence.
-fn draw_sun(cx: &mut floem::context::PaintCx, w: f64, h: f64, sky: &SkyState) {
-    let Some(projected) = sky.sun.projected else {
-        return;
-    };
-    let centre = to_screen(projected, w, h);
-    let radius = (w.min(h) / 62.0).clamp(5.0, 13.0);
-
-    // The corona, as three widening rings — the same trick as a star's halo,
-    // for the same reason: vger discards radial gradients.
-    for (spread, alpha) in [(4.2, 0.05_f32), (2.6, 0.09), (1.6, 0.16)] {
-        cx.fill(
-            &Circle::new(centre, radius * spread),
-            SUN_GLOW.with_alpha(alpha),
-            0.0,
-        );
-    }
-    cx.fill(&Circle::new(centre, radius), SUN_BODY.with_alpha(0.92), 0.0);
-    // The tight specular that reads as metal rather than as plastic, which is
-    // the frame's rule and applies to anything with a highlight.
-    cx.fill(
-        &Circle::new(
-            Point::new(centre.x - radius * 0.28, centre.y - radius * 0.30),
-            radius * 0.30,
-        ),
-        SUN_CORE.with_alpha(0.85),
-        0.0,
-    );
 }
 
 fn draw_moon(cx: &mut floem::context::PaintCx, w: f64, h: f64, sky: &SkyState) {
@@ -442,6 +399,96 @@ fn draw_moon(cx: &mut floem::context::PaintCx, w: f64, h: f64, sky: &SkyState) {
 
 /// The default place, until a setting exists for it.
 pub const DEFAULT_LOCATION: Location = SAN_FRANCISCO;
+
+/// Sunrise and sunset today, as hours since local midnight.
+///
+/// Computed at [`DEFAULT_LOCATION`] itself — the same place the backdrop's
+/// sky is projected from — so the frame sun sets when the sky in the window
+/// says it sets. Using the timezone's meridian instead left the two
+/// disagreeing by over an hour near the edge of a zone (San Francisco sits
+/// 17° west of the PDT meridian: the frame sun went down while the backdrop
+/// still called it day). Shared by the fisherman's routine and the frame
+/// sun, so the two always tell the same story about how much daylight is
+/// left.
+pub fn todays_sun(unix_seconds: f64) -> (f64, f64) {
+    let jd = smithy_sky::time::julian_date_from_unix(unix_seconds);
+    let location = DEFAULT_LOCATION;
+
+    match smithy_sky::sun::sunrise_sunset(jd, location) {
+        Some((rise, set)) => {
+            let to_local = |at: f64| {
+                crate::localtime::local_hours((at - smithy_sky::time::UNIX_EPOCH_JD) * 86_400.0)
+            };
+            (to_local(rise), to_local(set))
+        }
+        // Polar day or night. Civil hours rather than no day at all: a
+        // routine anchored to a sunrise that never comes would leave the
+        // fisherman asleep for six months.
+        None => (7.0, 19.0),
+    }
+}
+
+/// The frame sun's radius: big enough to *occupy* the top rail rather than
+/// sit on it. The backdrop's small disc failed by being a bright bauble in
+/// the middle of the editor — this one is sized to be cropped by the frame
+/// itself, which is what makes it part of the object.
+pub const FRAME_SUN_RADIUS: f64 = crate::forged::FRAME_INSET as f64 * 1.15;
+
+/// Where the frame sun sits at a fraction `t` of the day, 0 at sunrise and
+/// 1 at sunset.
+///
+/// An arc over the top of the window: it rises out of the left rail, crowns
+/// the header at noon — centre above the window's top edge, so the frame
+/// crops it — and sets into the right rail. Painted *under* the ornament
+/// (vines, corner stones, wordmark), so the frame always wins the overlap.
+pub fn sun_arc(t: f64, w: f64) -> Point {
+    let angle = std::f64::consts::PI * t.clamp(0.0, 1.0);
+    let y_base = crate::forged::HEADER_HEIGHT as f64 * 0.72;
+    let y_noon = FRAME_SUN_RADIUS * 0.25;
+    Point::new(
+        w * 0.5 * (1.0 - angle.cos()),
+        y_base - (y_base - y_noon) * angle.sin(),
+    )
+}
+
+/// The frame sun's centre and radius right now — `None` once the sun is down.
+pub fn frame_sun(w: f64) -> Option<(Point, f64)> {
+    let unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let (rise, set) = todays_sun(unix);
+    let t = (crate::localtime::local_hours(unix) - rise) / (set - rise);
+    if !(0.0..=1.0).contains(&t) {
+        return None;
+    }
+    Some((sun_arc(t, w), FRAME_SUN_RADIUS))
+}
+
+/// Paint the frame sun. The same vocabulary the backdrop sun used — corona
+/// rings, warm body, tight specular — at a scale where it reads as wrought
+/// into the frieze rather than printed on the page.
+pub fn draw_frame_sun(cx: &mut floem::context::PaintCx, w: f64) {
+    let Some((centre, radius)) = frame_sun(w) else {
+        return;
+    };
+    for (spread, alpha) in [(3.0, 0.05_f32), (2.0, 0.08), (1.4, 0.13)] {
+        cx.fill(
+            &Circle::new(centre, radius * spread),
+            SUN_GLOW.with_alpha(alpha),
+            0.0,
+        );
+    }
+    cx.fill(&Circle::new(centre, radius), SUN_BODY.with_alpha(0.9), 0.0);
+    cx.fill(
+        &Circle::new(
+            Point::new(centre.x - radius * 0.28, centre.y - radius * 0.30),
+            radius * 0.30,
+        ),
+        SUN_CORE.with_alpha(0.8),
+        0.0,
+    );
+}
 
 #[cfg(test)]
 mod tests {
@@ -752,5 +799,53 @@ mod tests {
                  the edge of the sky would be visible"
             );
         }
+    }
+
+    /// **The frame sun rides the top rail with the day.** Out of the left
+    /// rail at sunrise, over the header's centre at noon, into the right rail
+    /// at sunset — and high enough at midday that the window's own top edge
+    /// crops it, which is the whole of "occupying the frame".
+    #[test]
+    fn the_frame_sun_rises_and_sets_on_the_rails() {
+        let w = 1280.0;
+        let rise = sun_arc(0.0, w);
+        let noon = sun_arc(0.5, w);
+        let set = sun_arc(1.0, w);
+
+        assert!(rise.x.abs() < 1e-9, "sunrise is at the left edge");
+        assert!((noon.x - w / 2.0).abs() < 1e-9, "noon is dead centre");
+        assert!((set.x - w).abs() < 1e-9, "sunset is at the right edge");
+        assert!(noon.y < rise.y, "noon must be the high point");
+
+        // Cropped by the window's top edge at noon, or it is sitting on the
+        // frame rather than intersecting it.
+        assert!(
+            noon.y - FRAME_SUN_RADIUS < 0.0,
+            "the noon disc clears the top edge — that is sitting, not occupying"
+        );
+        // And still reaching deep into the header, or there is nothing to see.
+        assert!(
+            noon.y + FRAME_SUN_RADIUS > crate::forged::HEADER_HEIGHT as f64 * 0.5,
+            "the noon disc never enters the header"
+        );
+
+        // The arc is monotone left to right: it never walks the day backwards.
+        let mut previous = -1.0;
+        for step in 0..=100 {
+            let x = sun_arc(f64::from(step) / 100.0, w).x;
+            assert!(x >= previous, "the sun moved backwards across the frame");
+            previous = x;
+        }
+    }
+
+    /// Big is the point. The backdrop's small disc failed by reading as a
+    /// bauble; the frame sun has to be large enough for the frame to crop.
+    #[test]
+    fn the_frame_sun_is_big_enough_to_occupy_the_rail() {
+        assert!(
+            FRAME_SUN_RADIUS > crate::forged::HEADER_HEIGHT as f64 * 0.7,
+            "{FRAME_SUN_RADIUS:.1}px against a {:.0}px header is a bauble, not a presence",
+            crate::forged::HEADER_HEIGHT
+        );
     }
 }
