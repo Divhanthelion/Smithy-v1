@@ -12,13 +12,11 @@ broken, and the open design questions.
 
 ## 1. Verdict in one paragraph
 
-§2.1 automated floor passed (938 tests). Milestone 5 plumbing works. The first
-on-screen layout was **rejected** (flat high-fan-out strip). A rewrite now wraps
-hubs, fits the camera to the neighborhood, uses bus edges, drops repeated
-`Container::` on sibling labels, paints an opaque map ground, and prefers a
-moderate default focus — unit-tested, installed; **needs a human look** at the
-same kernelos `Terminal::execute_command` case. Keychain still prompts per item
-after adhoc reinstalls (§5).
+§2.1 automated floor passed. Call graph has **Overview** (Benzi-style file
+clusters of the whole graph) and **Focus** (1-hop neighborhood). Overview is
+the default on open so you are not trapped in one pocket; click a chip to
+drill into Focus, Overview button to return. Keychain still prompts per item
+after adhoc reinstalls.
 
 ---
 

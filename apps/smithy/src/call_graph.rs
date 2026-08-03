@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use floem::kurbo::{Line, Point, Stroke};
+use floem::kurbo::{Line, Point, Rect, Stroke};
 use floem::prelude::*;
 use floem::reactive::{RwSignal, SignalGet, SignalUpdate};
 use floem::views::{canvas, Decorators};
@@ -18,6 +18,13 @@ use smithy_project::callgraph::{CallGraph, Node, Staleness};
 use crate::app_state::AgentState;
 use crate::runtime;
 
+/// Overview = Benzi-style whole map; Focus = neighborhood of one symbol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    Overview,
+    Focus,
+}
+
 /// Everything the center-pane map needs, held on [`AgentState`].
 #[derive(Clone, Copy)]
 pub struct CallGraphUi {
@@ -27,6 +34,7 @@ pub struct CallGraphUi {
     pub history: RwSignal<Vec<u32>>,
     /// Jump-to-symbol filter. Non-empty opens the results strip.
     pub query: RwSignal<String>,
+    pub mode: RwSignal<ViewMode>,
     /// 1 = direct neighbors, 2 = one more hop.
     pub hops: RwSignal<u8>,
     pub building: RwSignal<bool>,
@@ -49,6 +57,7 @@ impl CallGraphUi {
             focus: RwSignal::new(None),
             history: RwSignal::new(Vec::new()),
             query: RwSignal::new(String::new()),
+            mode: RwSignal::new(ViewMode::Overview),
             hops: RwSignal::new(1),
             building: RwSignal::new(false),
             status: RwSignal::new(String::new()),
@@ -62,10 +71,11 @@ impl CallGraphUi {
     }
 }
 
-/// Refocus, remembering where we came from so Back works.
+/// Refocus, remembering where we came from so Back works. Always enters Focus.
 fn focus_on(ui: CallGraphUi, next: u32) {
     let cur = ui.focus.get_untracked();
     if cur == Some(next) {
+        ui.mode.set(ViewMode::Focus);
         return;
     }
     if let Some(cur) = cur {
@@ -80,12 +90,30 @@ fn focus_on(ui: CallGraphUi, next: u32) {
     }
     ui.focus.set(Some(next));
     ui.query.set(String::new());
+    ui.mode.set(ViewMode::Focus);
 }
 
 fn go_back(ui: CallGraphUi) {
     let prev = ui.history.try_update(|h| h.pop()).flatten();
     if let Some(prev) = prev {
         ui.focus.set(Some(prev));
+        ui.mode.set(ViewMode::Focus);
+    }
+}
+
+fn graph_summary(graph: &CallGraph, stale: &Staleness) -> String {
+    let n = graph.nodes.len();
+    let e = graph.edges.len();
+    let mut files = std::collections::HashSet::new();
+    for node in &graph.nodes {
+        files.insert(node.file.as_str());
+    }
+    let f = files.len();
+    let desc = stale.describe();
+    if desc.is_empty() {
+        format!("{n} nodes · {e} edges · {f} files")
+    } else {
+        format!("{n} nodes · {e} edges · {f} files · {desc}")
     }
 }
 
@@ -116,10 +144,11 @@ pub fn load_for_project(agent: &AgentState) {
     // looked like a no-op.
     poll_once(rx, move |result| match result {
         Ok((graph, stale)) => {
-            ui.status.set(stale.describe());
+            ui.status.set(graph_summary(&graph, &stale));
             ui.stale.set(stale);
             ui.history.set(Vec::new());
             ui.query.set(String::new());
+            ui.mode.set(ViewMode::Overview);
             ui.focus.set(default_focus(&graph));
             ui.graph.set(Some(Arc::new(graph)));
         }
@@ -128,6 +157,7 @@ pub fn load_for_project(agent: &AgentState) {
             ui.focus.set(None);
             ui.history.set(Vec::new());
             ui.query.set(String::new());
+            ui.mode.set(ViewMode::Overview);
             ui.status.set(String::new());
             ui.stale.set(Staleness::default());
         }
@@ -180,18 +210,12 @@ pub fn build(agent: &AgentState) {
         ui.building.set(false);
         match result {
             Ok((graph, stale)) => {
-                let n = graph.nodes.len();
-                let e = graph.edges.len();
-                let desc = stale.describe();
-                let summary = if desc.is_empty() {
-                    format!("{n} nodes · {e} edges")
-                } else {
-                    format!("{n} nodes · {e} edges · {desc}")
-                };
+                let summary = graph_summary(&graph, &stale);
                 ui.status.set(summary.clone());
                 ui.stale.set(stale);
                 ui.history.set(Vec::new());
                 ui.query.set(String::new());
+                ui.mode.set(ViewMode::Overview);
                 ui.focus.set(default_focus(&graph));
                 ui.graph.set(Some(Arc::new(graph)));
                 ui.pan.set((0.0, 0.0));
@@ -267,6 +291,7 @@ pub fn clear(ui: CallGraphUi) {
     ui.focus.set(None);
     ui.history.set(Vec::new());
     ui.query.set(String::new());
+    ui.mode.set(ViewMode::Overview);
     ui.status.set(String::new());
     ui.building.set(false);
     ui.pan.set((0.0, 0.0));
@@ -559,7 +584,7 @@ fn layout(
 
 /// Pan/zoom so the laid-out neighborhood fits in the pane with margin.
 fn fit_camera(nodes: &[LaidOut], pane_w: f64, pane_h: f64) -> ((f64, f64), f64) {
-    if nodes.is_empty() || pane_w < 40.0 || pane_h < 40.0 {
+    if nodes.is_empty() {
         return ((0.0, 0.0), 1.0);
     }
     let mut min_x = f64::INFINITY;
@@ -572,14 +597,29 @@ fn fit_camera(nodes: &[LaidOut], pane_w: f64, pane_h: f64) -> ((f64, f64), f64) 
         min_y = min_y.min(n.y);
         max_y = max_y.max(n.y + n.h);
     }
+    fit_bounds(min_x, max_x, min_y, max_y, pane_w, pane_h, 0.55, 1.35)
+}
+
+fn fit_bounds(
+    min_x: f64,
+    max_x: f64,
+    min_y: f64,
+    max_y: f64,
+    pane_w: f64,
+    pane_h: f64,
+    zoom_min: f64,
+    zoom_max: f64,
+) -> ((f64, f64), f64) {
+    if pane_w < 40.0 || pane_h < 40.0 {
+        return ((0.0, 0.0), 1.0);
+    }
     let bw = (max_x - min_x).max(1.0);
     let bh = (max_y - min_y).max(1.0);
     let zoom = ((pane_w - 2.0 * FIT_MARGIN) / bw)
         .min((pane_h - 2.0 * FIT_MARGIN) / bh)
-        .clamp(0.55, 1.35);
+        .clamp(zoom_min, zoom_max);
     let cx = (min_x + max_x) / 2.0;
     let cy = (min_y + max_y) / 2.0;
-    // screen = pane/2 + pan + world * zoom  →  pan = -world_center * zoom
     ((-cx * zoom, -cy * zoom), zoom)
 }
 
@@ -589,6 +629,212 @@ fn row_width_for_pane(pane_w: f64) -> f64 {
     } else {
         (pane_w - 2.0 * FIT_MARGIN).clamp(280.0, 720.0)
     }
+}
+
+// --- overview layout (file clusters) ----------------------------------------
+
+const OV_CHIP_H: f64 = 22.0;
+const OV_CHIP_PAD_X: f64 = 8.0;
+const OV_COL_GAP: f64 = 6.0;
+const OV_ROW_STEP: f64 = 26.0;
+const OV_CLUSTER_PAD: f64 = 10.0;
+const OV_TITLE_H: f64 = 18.0;
+const OV_CLUSTER_GAP: f64 = 28.0;
+const OV_INNER_WIDTH: f64 = 220.0;
+
+#[derive(Debug, Clone)]
+struct ClusterBox {
+    title: String,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+#[derive(Debug, Clone)]
+struct OverviewChip {
+    index: u32,
+    label: String,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    stale: bool,
+    cluster: usize,
+}
+
+fn file_basename(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(path)
+        .to_string()
+}
+
+fn overview_chip_width(label: &str) -> f64 {
+    (label.chars().count() as f64 * 6.4 + OV_CHIP_PAD_X * 2.0).clamp(40.0, 160.0)
+}
+
+/// Benzi-style whole-map layout: one box per source file, chips inside.
+fn overview_layout(
+    graph: &CallGraph,
+    stale: &Staleness,
+    max_row_width: f64,
+) -> (Vec<ClusterBox>, Vec<OverviewChip>) {
+    let mut by_file: std::collections::BTreeMap<&str, Vec<u32>> = std::collections::BTreeMap::new();
+    for (i, n) in graph.nodes.iter().enumerate() {
+        by_file.entry(n.file.as_str()).or_default().push(i as u32);
+    }
+    let mut files: Vec<(&str, Vec<u32>)> = by_file.into_iter().map(|(f, v)| (f, v)).collect();
+    files.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(b.0)));
+
+    let mut clusters = Vec::new();
+    let mut chips = Vec::new();
+    // First pass: measure each cluster's content size.
+    let mut measured: Vec<(String, String, Vec<(u32, String, f64)>, f64, f64)> = Vec::new();
+    for (file, indices) in &files {
+        let title = file_basename(file);
+        let mut items: Vec<(u32, String, f64)> = indices
+            .iter()
+            .map(|&i| {
+                let n = &graph.nodes[i as usize];
+                let label = n.name.clone();
+                let w = overview_chip_width(&label);
+                (i, label, w)
+            })
+            .collect();
+        items.sort_by(|a, b| a.1.cmp(&b.1));
+
+        let inner_w = OV_INNER_WIDTH;
+        let mut rows = 1usize;
+        let mut row_w = 0.0;
+        for &(_, _, w) in &items {
+            let next = if row_w == 0.0 {
+                w
+            } else {
+                row_w + OV_COL_GAP + w
+            };
+            if row_w > 0.0 && next > inner_w {
+                rows += 1;
+                row_w = w;
+            } else {
+                row_w = next;
+            }
+        }
+        let content_h = rows as f64 * OV_ROW_STEP;
+        let cw = inner_w + OV_CLUSTER_PAD * 2.0;
+        let ch = OV_TITLE_H + OV_CLUSTER_PAD + content_h + OV_CLUSTER_PAD;
+        measured.push(((*file).to_string(), title, items, cw, ch));
+    }
+
+    // Grid placement across max_row_width.
+    let grid_w = max_row_width.max(OV_INNER_WIDTH + OV_CLUSTER_PAD * 2.0);
+    let mut cursor_x = 0.0;
+    let mut cursor_y = 0.0;
+    let mut row_h = 0.0;
+
+    for (file, title, items, cw, ch) in &measured {
+        if cursor_x > 0.0 && cursor_x + cw > grid_w {
+            cursor_x = 0.0;
+            cursor_y += row_h + OV_CLUSTER_GAP;
+            row_h = 0.0;
+        }
+        let cx = cursor_x;
+        let cy = cursor_y;
+        let cluster_idx = clusters.len();
+        clusters.push(ClusterBox {
+            title: title.clone(),
+            x: cx,
+            y: cy,
+            w: *cw,
+            h: *ch,
+        });
+
+        let inner_w = OV_INNER_WIDTH;
+        let mut x = cx + OV_CLUSTER_PAD;
+        let mut y = cy + OV_TITLE_H + OV_CLUSTER_PAD;
+        let mut row_w = 0.0;
+        for &(idx, ref label, w) in items {
+            let next = if row_w == 0.0 {
+                w
+            } else {
+                row_w + OV_COL_GAP + w
+            };
+            if row_w > 0.0 && next > inner_w {
+                x = cx + OV_CLUSTER_PAD;
+                y += OV_ROW_STEP;
+                row_w = 0.0;
+            }
+            let n = &graph.nodes[idx as usize];
+            chips.push(OverviewChip {
+                index: idx,
+                label: label.clone(),
+                x,
+                y,
+                w,
+                h: OV_CHIP_H,
+                stale: graph.node_is_stale(n, stale),
+                cluster: cluster_idx,
+            });
+            x += w + OV_COL_GAP;
+            row_w = if row_w == 0.0 {
+                w
+            } else {
+                row_w + OV_COL_GAP + w
+            };
+        }
+
+        cursor_x += cw + OV_CLUSTER_GAP;
+        row_h = row_h.max(*ch);
+    }
+
+    // Center the whole grid around the origin for fit_camera.
+    if !clusters.is_empty() {
+        let min_x = clusters.iter().map(|c| c.x).fold(f64::INFINITY, f64::min);
+        let max_x = clusters
+            .iter()
+            .map(|c| c.x + c.w)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let min_y = clusters.iter().map(|c| c.y).fold(f64::INFINITY, f64::min);
+        let max_y = clusters
+            .iter()
+            .map(|c| c.y + c.h)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let ox = (min_x + max_x) / 2.0;
+        let oy = (min_y + max_y) / 2.0;
+        for c in &mut clusters {
+            c.x -= ox;
+            c.y -= oy;
+        }
+        for chip in &mut chips {
+            chip.x -= ox;
+            chip.y -= oy;
+        }
+    }
+
+    (clusters, chips)
+}
+
+fn fit_overview(
+    clusters: &[ClusterBox],
+    pane_w: f64,
+    pane_h: f64,
+) -> ((f64, f64), f64) {
+    if clusters.is_empty() {
+        return ((0.0, 0.0), 1.0);
+    }
+    let min_x = clusters.iter().map(|c| c.x).fold(f64::INFINITY, f64::min);
+    let max_x = clusters
+        .iter()
+        .map(|c| c.x + c.w)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let min_y = clusters.iter().map(|c| c.y).fold(f64::INFINITY, f64::min);
+    let max_y = clusters
+        .iter()
+        .map(|c| c.y + c.h)
+        .fold(f64::NEG_INFINITY, f64::max);
+    // Overview is wide — allow zooming further out than Focus.
+    fit_bounds(min_x, max_x, min_y, max_y, pane_w, pane_h, 0.22, 1.0)
 }
 
 // --- view -------------------------------------------------------------------
@@ -606,8 +852,14 @@ pub fn call_graph_view(
         toolbar(ui, on_build),
         nav_bar(ui),
         dyn_container(
-            move || (ui.graph.get().is_some(), ui.building.get()),
-            move |(has, building)| {
+            move || {
+                (
+                    ui.graph.get().is_some(),
+                    ui.building.get(),
+                    ui.mode.get(),
+                )
+            },
+            move |(has, building, mode)| {
                 if building && !has {
                     message_pane(
                         "Building call graph…",
@@ -616,8 +868,10 @@ pub fn call_graph_view(
                     .into_any()
                 } else if !has {
                     empty_pane(on_build_empty.clone()).into_any()
+                } else if mode == ViewMode::Overview {
+                    overview_pane(ui).into_any()
                 } else {
-                    graph_pane(ui, project_root, on_open.clone()).into_any()
+                    focus_pane(ui, project_root, on_open.clone()).into_any()
                 }
             },
         )
@@ -653,6 +907,9 @@ fn toolbar(ui: CallGraphUi, on_build: impl Fn() + 'static) -> impl IntoView {
                 })
         }),
         Label::derived(move || {
+            if ui.mode.get() != ViewMode::Focus {
+                return String::new();
+            }
             let Some(graph) = ui.graph.get() else {
                 return String::new();
             };
@@ -667,11 +924,46 @@ fn toolbar(ui: CallGraphUi, on_build: impl Fn() + 'static) -> impl IntoView {
             s.font_size(design::TEXT_XS)
                 .color(design::FG_MUTED)
                 .margin_right(design::SPACE_3)
-                .apply_if(ui.graph.get().is_none(), |s| {
-                    s.display(floem::taffy::Display::None)
-                })
+                .apply_if(
+                    ui.graph.get().is_none() || ui.mode.get() != ViewMode::Focus,
+                    |s| s.display(floem::taffy::Display::None),
+                )
         }),
         Container::new(Empty::new()).style(|s| s.flex_grow(1.0)),
+        Label::derived(move || "Overview".to_string())
+            .on_event_stop(floem::event::listener::Click, move |_, _| {
+                ui.mode.set(ViewMode::Overview);
+            })
+            .style(move |s| {
+                let active = ui.mode.get() == ViewMode::Overview;
+                s.font_size(design::TEXT_XS)
+                    .color(if active {
+                        design::ACCENT
+                    } else {
+                        design::FG_MUTED
+                    })
+                    .margin_right(design::SPACE_2)
+                    .padding_horiz(design::SPACE_2)
+                    .padding_vert(2.0)
+                    .cursor(floem::style::CursorStyle::Pointer)
+            }),
+        Label::derived(move || "Focus".to_string())
+            .on_event_stop(floem::event::listener::Click, move |_, _| {
+                ui.mode.set(ViewMode::Focus);
+            })
+            .style(move |s| {
+                let active = ui.mode.get() == ViewMode::Focus;
+                s.font_size(design::TEXT_XS)
+                    .color(if active {
+                        design::ACCENT
+                    } else {
+                        design::FG_MUTED
+                    })
+                    .margin_right(design::SPACE_3)
+                    .padding_horiz(design::SPACE_2)
+                    .padding_vert(2.0)
+                    .cursor(floem::style::CursorStyle::Pointer)
+            }),
         Label::derived(move || {
             if ui.hops.get() >= 2 {
                 "2 hops".to_string()
@@ -682,13 +974,16 @@ fn toolbar(ui: CallGraphUi, on_build: impl Fn() + 'static) -> impl IntoView {
         .on_event_stop(floem::event::listener::Click, move |_, _| {
             ui.hops.update(|h| *h = if *h >= 2 { 1 } else { 2 });
         })
-        .style(|s| {
+        .style(move |s| {
             s.font_size(design::TEXT_XS)
                 .color(design::FG_MUTED)
                 .margin_right(design::SPACE_3)
                 .padding_horiz(design::SPACE_2)
                 .padding_vert(2.0)
                 .cursor(floem::style::CursorStyle::Pointer)
+                .apply_if(ui.mode.get() != ViewMode::Focus, |s| {
+                    s.display(floem::taffy::Display::None)
+                })
         }),
         Label::derived(move || {
             if ui.building.get() {
@@ -947,7 +1242,219 @@ fn message_pane(title: &'static str, detail: &'static str) -> impl IntoView {
     })
 }
 
-fn graph_pane(
+fn overview_pane(ui: CallGraphUi) -> impl IntoView {
+    floem::reactive::Effect::new(move |_| {
+        let _mode = ui.mode.get();
+        let (pw, ph) = ui.size.get();
+        let Some(graph) = ui.graph.get() else {
+            return;
+        };
+        if pw < 40.0 || ph < 40.0 {
+            return;
+        }
+        let stale = ui.stale.get_untracked();
+        let (clusters, _) = overview_layout(&graph, &stale, row_width_for_pane(pw.max(900.0)));
+        let (pan, zoom) = fit_overview(&clusters, pw, ph);
+        let cur = ui.pan.get_untracked();
+        let cz = ui.zoom.get_untracked();
+        if (cur.0 - pan.0).abs() > 0.5
+            || (cur.1 - pan.1).abs() > 0.5
+            || (cz - zoom).abs() > 0.01
+        {
+            ui.pan.set(pan);
+            ui.zoom.set(zoom);
+        }
+    });
+
+    let edges = canvas(move |cx, size| {
+        let (w, h) = (size.width, size.height);
+        let prev = ui.size.get_untracked();
+        if (prev.0 - w).abs() > 0.5 || (prev.1 - h).abs() > 0.5 {
+            ui.size.set((w, h));
+        }
+        if w < 8.0 || h < 8.0 {
+            return;
+        }
+        cx.fill(&Rect::new(0.0, 0.0, w, h), design::BG_BASE, 0.0);
+
+        let Some(graph) = ui.graph.get() else {
+            return;
+        };
+        let stale = ui.stale.get();
+        let (clusters, chips) =
+            overview_layout(&graph, &stale, row_width_for_pane(w.max(900.0)));
+        let (pan_x, pan_y) = ui.pan.get();
+        let zoom = ui.zoom.get().clamp(0.15, 2.0);
+        let ox = w / 2.0 + pan_x;
+        let oy = h / 2.0 + pan_y;
+        let to_screen = |x: f64, y: f64| Point::new(ox + x * zoom, oy + y * zoom);
+
+        // Cluster frames.
+        let frame = Stroke::new(1.0 * zoom.max(0.6));
+        for c in &clusters {
+            let r = Rect::new(
+                ox + c.x * zoom,
+                oy + c.y * zoom,
+                ox + (c.x + c.w) * zoom,
+                oy + (c.y + c.h) * zoom,
+            );
+            cx.fill(&r, design::BG_RAISED.with_alpha(0.35), 0.0);
+            cx.stroke(&r, design::BORDER.with_alpha(0.55), &frame);
+        }
+
+        // Call edges between chip centers.
+        let pos: std::collections::HashMap<u32, Point> = chips
+            .iter()
+            .map(|c| {
+                (
+                    c.index,
+                    to_screen(c.x + c.w / 2.0, c.y + c.h / 2.0),
+                )
+            })
+            .collect();
+        for e in &graph.edges {
+            let Some(&a) = pos.get(&e.from) else {
+                continue;
+            };
+            let Some(&b) = pos.get(&e.to) else {
+                continue;
+            };
+            let same_file = graph.nodes[e.from as usize].file == graph.nodes[e.to as usize].file;
+            let color = if same_file {
+                design::BORDER.with_alpha(0.18)
+            } else {
+                design::ACCENT.with_alpha(0.35)
+            };
+            let thickness = if same_file { 0.7 } else { 1.1 } * zoom.max(0.5);
+            cx.stroke(&Line::new(a, b), color, &Stroke::new(thickness));
+        }
+    })
+    .style(|s| s.absolute().inset(0.0).width_full().height_full().pointer_events_none());
+
+    let chips_layer = dyn_container(
+        move || {
+            (
+                ui.pan.get(),
+                ui.zoom.get(),
+                ui.size.get(),
+                ui.graph.get().as_ref().map(|g| g.nodes.len()),
+                ui.stale.get().file_count(),
+            )
+        },
+        move |_| {
+            let Some(graph) = ui.graph.get_untracked() else {
+                return Empty::new().into_any();
+            };
+            let stale = ui.stale.get_untracked();
+            let (pw, _) = ui.size.get_untracked();
+            let (clusters, chips) =
+                overview_layout(&graph, &stale, row_width_for_pane(pw.max(900.0)));
+            let (pan_x, pan_y) = ui.pan.get_untracked();
+            let zoom = ui.zoom.get_untracked().clamp(0.15, 2.0);
+            let ox = pw / 2.0 + pan_x;
+            let oy = ui.size.get_untracked().1 / 2.0 + pan_y;
+
+            let mut children: Vec<_> = clusters
+                .iter()
+                .map(|c| {
+                    let title = c.title.clone();
+                    let left = ox + c.x * zoom;
+                    let top = oy + c.y * zoom;
+                    let width = c.w * zoom;
+                    Label::derived(move || title.clone())
+                        .style(move |s| {
+                            s.absolute()
+                                .inset_left(left + 6.0 * zoom)
+                                .inset_top(top + 2.0 * zoom)
+                                .width((width - 12.0 * zoom).max(20.0))
+                                .font_size((10.0 * zoom).clamp(8.0, 12.0) as f32)
+                                .font_family(design::MONO.to_string())
+                                .color(design::FG_FAINT)
+                        })
+                        .into_any()
+                })
+                .collect();
+
+            for chip in chips {
+                let idx = chip.index;
+                let label = chip.label.clone();
+                let stale = chip.stale;
+                let left = ox + chip.x * zoom;
+                let top = oy + chip.y * zoom;
+                let width = chip.w * zoom;
+                let height = chip.h * zoom;
+                children.push(
+                    Label::derived(move || label.clone())
+                        .on_event_stop(floem::event::listener::Click, move |_, _| {
+                            focus_on(ui, idx);
+                        })
+                        .style(move |s| {
+                            s.absolute()
+                                .inset_left(left)
+                                .inset_top(top)
+                                .width(width)
+                                .height(height)
+                                .font_size((9.5 * zoom).clamp(7.5, 12.0) as f32)
+                                .font_family(design::MONO.to_string())
+                                .color(if stale {
+                                    design::FG_GHOST
+                                } else {
+                                    design::FG_MUTED
+                                })
+                                .items_center()
+                                .justify_center()
+                                .background(design::BG_FLOAT.with_alpha(if stale {
+                                    0.4
+                                } else {
+                                    0.9
+                                }))
+                                .border(1.0)
+                                .border_color(if stale {
+                                    design::FG_GHOST
+                                } else {
+                                    design::BORDER
+                                })
+                                .border_radius(3.0)
+                                .cursor(floem::style::CursorStyle::Pointer)
+                        })
+                        .into_any(),
+                );
+            }
+
+            Stack::new(children)
+                .style(|s| s.absolute().inset(0.0).width_full().height_full())
+                .into_any()
+        },
+    )
+    .style(|s| s.absolute().inset(0.0).width_full().height_full());
+
+    Stack::new((edges, chips_layer))
+        .style(|s| {
+            s.width_full()
+                .height_full()
+                .min_height(0.0)
+                .background(design::BG_BASE)
+        })
+        .on_event_stop(floem::event::listener::PointerWheel, move |_, update| {
+            use floem::event::PointerScrollEventExt;
+            let delta = update.resolve_to_points(None, None);
+            let mods = update.state.modifiers;
+            if mods.contains(floem::prelude::Modifiers::META)
+                || mods.contains(floem::prelude::Modifiers::CONTROL)
+            {
+                ui.zoom.update(|z| {
+                    *z = (*z * (1.0 - delta.y * 0.001)).clamp(0.15, 2.5);
+                });
+            } else {
+                ui.pan.update(|(x, y)| {
+                    *x += delta.x;
+                    *y += delta.y;
+                });
+            }
+        })
+}
+
+fn focus_pane(
     ui: CallGraphUi,
     project_root: RwSignal<PathBuf>,
     on_open: impl Fn(PathBuf, usize) + 'static + Clone,
@@ -989,12 +1496,7 @@ fn graph_pane(
         if w < 8.0 || h < 8.0 {
             return;
         }
-        // Opaque fill — forged sky must not read as part of the map.
-        cx.fill(
-            &floem::kurbo::Rect::new(0.0, 0.0, w, h),
-            design::BG_BASE,
-            0.0,
-        );
+        cx.fill(&Rect::new(0.0, 0.0, w, h), design::BG_BASE, 0.0);
 
         let Some(graph) = ui.graph.get() else {
             return;
@@ -1019,8 +1521,6 @@ fn graph_pane(
             focus_laid.y + focus_laid.h,
         );
 
-        // Bus edges: stub from focus → horizontal spine → drop to each node.
-        // A star of diagonals is unreadable past ~4 siblings.
         let mut draw_bus = |layer: Layer, focus_pt: Point, toward_down: bool| {
             let group: Vec<&LaidOut> = nodes.iter().filter(|n| n.layer == layer).collect();
             if group.is_empty() {
@@ -1426,5 +1926,33 @@ mod tests {
             sources: Default::default(),
         };
         assert_eq!(default_focus(&g), Some(1));
+    }
+
+    #[test]
+    fn overview_clusters_by_file_and_keeps_every_node() {
+        let g = tiny_graph(); // a.rs, b.rs, c.rs
+        let (clusters, chips) = overview_layout(&g, &Staleness::default(), 800.0);
+        assert!(
+            clusters.len() >= 2,
+            "expected multiple file clusters, got {}",
+            clusters.len()
+        );
+        assert_eq!(chips.len(), g.nodes.len());
+        let mut seen = std::collections::HashSet::new();
+        for c in &chips {
+            assert!(seen.insert(c.index), "duplicate chip {}", c.index);
+        }
+        // Cross-file edge 0→1: endpoints in different clusters
+        let c0 = chips.iter().find(|c| c.index == 0).unwrap().cluster;
+        let c1 = chips.iter().find(|c| c.index == 1).unwrap().cluster;
+        assert_ne!(c0, c1);
+    }
+
+    #[test]
+    fn overview_summary_mentions_files() {
+        let g = tiny_graph();
+        let s = graph_summary(&g, &Staleness::default());
+        assert!(s.contains("3 files"), "{s}");
+        assert!(s.contains("3 nodes"), "{s}");
     }
 }
