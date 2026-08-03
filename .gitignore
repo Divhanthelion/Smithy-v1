@@ -31,6 +31,10 @@ CODEBASE_DUMP.txt
 # else. Any `tests/golden/` tree is therefore kept.
 *.png
 !**/tests/golden/**/*.png
+# Screenshots the README actually shows. Same trap as the goldens: a blanket
+# `*.png` swallows them silently, and a README whose image is missing looks
+# worse than one with no image at all.
+!assets/*.png
 
 script.sh
 

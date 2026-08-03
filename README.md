@@ -11,6 +11,52 @@ write comes back as a diff you approve hunk by hunk, and every shell command
 waits for your go-ahead. It never touches anything outside the project you have
 open.
 
+![Smithy showing a compiler-resolved call graph beside the agent panel](assets/smithy.png)
+
+---
+
+## Why this and not the editor you already have
+
+Most agent IDEs ask you to trust the agent. Smithy is built so you don't have
+to. Every distinctive thing in it exists to let you *check* something you would
+otherwise have to take on faith.
+
+**You can see what it is about to do.** Every `edit` and `write` opens as a diff
+and the agent's tool call *waits* for your decision, then hears the real outcome
+— "accepted in full", "3 of 5 hunks", "rejected" — as that call's own result.
+That sounds like a detail and is not. Before it worked this way, a measured
+session made 25 edits in one turn and spent **26 of its 76 tool calls** trying
+to discover whether they had landed. They all had.
+
+**You can see what it cost.** The agent panel breaks the prompt into system
+prompt, project map, tool schemas and conversation, marks which of those are
+frozen for the session and which are still growing, and shows how much came
+from the provider's cache rather than being paid for again. On a recent session
+that was 76–79%. Most tools show you a spend figure; this one shows you where
+it went.
+
+**The sandbox is a capability, not a path check.** The tool layer holds a
+`cap-std` directory handle for your project root, so the operating system itself
+refuses to let the agent out — symlinks included. There is no string comparison
+to outwit.
+
+**The call graph is resolved by the compiler.** Edges come from rust-analyzer
+via SCIP, not from matching names. Name matching was tried first and measured:
+it was right 55% of the time on this workspace, and it failed hardest on
+`new`, `default` and `run` — the most-called names in any codebase. A map that
+is confidently wrong about half your call sites is worse than no map.
+
+**The model is yours.** Point it at LM Studio and nothing leaves your machine;
+it keeps working with the network off. Point it at DeepSeek or OpenRouter if you
+would rather. Either way the editor is not a subscription and the code is not
+someone else's training data.
+
+**Honestly, what it is not:** macOS only. The deep features — symbol index, call
+graph — are Rust; other languages get syntax highlighting, LSP and the agent,
+but not the map. It is young, and the [known gaps](#known-gaps) below are the
+real list, not a polite one. If you want the most mature agent IDE, it is not
+this. If you want one whose claims you can verify, that is the whole idea.
+
 ---
 
 ## Getting started
