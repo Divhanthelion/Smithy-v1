@@ -5,6 +5,7 @@
 //! Writes `target/fisherman/`:
 //!   report.json   — every check, measured / threshold / pass
 //!   day.png       — 96 cropped tiles in a grid, every 15 min
+//!   midnight.png  — ~21:00–03:00 with day seed rolling (the day seam)
 //!   scenes.png    — all 12 Doing states in place (1×, golden candidate)
 //!   scenes_3x.png — same at 3×, eyes only (not a golden)
 //!   build.png     — hut across BUILD_SECONDS

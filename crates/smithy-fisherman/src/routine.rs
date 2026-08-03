@@ -126,6 +126,40 @@ pub const STEP_SECONDS: f64 = 0.6;
 const SMOKE_MINUTES: f64 = 3.0;
 const SMOKE_JITTER_MINUTES: f64 = 22.0;
 
+/// When he gets up, hours since local midnight: half an hour before sunrise.
+pub fn wake_at(sunrise: f64) -> f64 {
+    sunrise - 30.0 / 60.0
+}
+
+/// When he goes to bed, hours since local midnight: two hours after sunset,
+/// capped so the evening sleep block still fits before the day wraps.
+pub fn bed_at(sunset: f64) -> f64 {
+    (sunset + 2.0).min(23.5)
+}
+
+/// How far through overnight sleep, treating the midnight split as one night.
+///
+/// Sleep is two blocks in [`day_plan`] (`[bed, 24)` and `[0, up)`) so every
+/// block stays inside `0.0..24.0`. Progress that resets at midnight makes
+/// `window_light` think he just went to bed at 00:00 and lights the lamp
+/// mid-sleep — measured 0.000 @ 23:45, 0.450 @ 00:00, 0.000 @ 00:15. One
+/// continuous night for anything that reads sleep progress.
+pub fn sleep_progress(hours: f64, sunrise: f64, sunset: f64) -> f64 {
+    let up = wake_at(sunrise);
+    let bed = bed_at(sunset);
+    let total = (24.0 - bed) + up;
+    if total <= 0.0 {
+        return 0.0;
+    }
+    let elapsed = if hours >= bed {
+        hours - bed
+    } else {
+        // Morning continuation — hours are in `[0, up)`.
+        (24.0 - bed) + hours
+    };
+    (elapsed / total).clamp(0.0, 1.0)
+}
+
 /// The whole day, in order, covering every hour with no gaps.
 ///
 /// `sunrise` and `sunset` are hours since local midnight. Blocks are scheduled
@@ -135,7 +169,7 @@ const SMOKE_JITTER_MINUTES: f64 = 22.0;
 ///
 /// Sleep is split around midnight rather than wrapping, so every block lies in
 /// `0.0..24.0` and "the day is contiguous" is a property that can simply be
-/// checked.
+/// checked. Progress across that split is rejoined in [`sleep_progress`].
 pub fn day_plan(sunrise: f64, sunset: f64) -> Vec<Block> {
     let hour = 1.0;
     let minutes = |m: f64| m / 60.0;
@@ -143,8 +177,8 @@ pub fn day_plan(sunrise: f64, sunset: f64) -> Vec<Block> {
     // Noon is taken as the midpoint of the day rather than as twelve o'clock,
     // so lunch sits in the middle of *his* day and not the clock's.
     let noon = (sunrise + sunset) / 2.0;
-    let up = sunrise - minutes(30.0);
-    let bed = (sunset + 2.0 * hour).min(23.5);
+    let up = wake_at(sunrise);
+    let bed = bed_at(sunset);
 
     let scripted = [
         (Doing::Waking, Place::Hut, up),
@@ -257,7 +291,11 @@ pub fn at(hours: f64, sunrise: f64, sunset: f64, day: i64) -> (Block, f64) {
         }
     }
 
-    let progress = block.progress(hours);
+    let progress = if block.doing == Doing::Sleeping {
+        sleep_progress(hours, sunrise, sunset)
+    } else {
+        block.progress(hours)
+    };
     (block, progress)
 }
 
@@ -351,6 +389,46 @@ mod tests {
         assert_eq!(doing(sunset - 0.2), Doing::Eating);
         assert_eq!(doing(sunset + 1.0), Doing::Reading, "a book after dark");
         assert_eq!(doing(23.9), Doing::Sleeping, "and bed");
+    }
+
+    /// Sleep spans midnight as two blocks; progress that resets at 00:00
+    /// lights the lamp mid-sleep via `window_light`. The night is one stretch.
+    #[test]
+    fn sleep_progress_does_not_reset_at_midnight() {
+        let (sunrise, sunset) = SUMMER;
+        let before = sleep_progress(23.75, sunrise, sunset);
+        let on_the_hour = sleep_progress(0.0, sunrise, sunset);
+        let after = sleep_progress(0.25, sunrise, sunset);
+
+        // Contiguous: the jump at midnight is one sample of elapsed time, not
+        // a reset to the going-to-bed edge. 15 minutes of an ~7h night ≈ 0.036.
+        assert!(
+            (on_the_hour - before).abs() < 0.05,
+            "midnight jumped sleep progress {before:.3} → {on_the_hour:.3}"
+        );
+        assert!(
+            after > on_the_hour,
+            "00:15 should be further through than midnight ({after:.3} ≤ {on_the_hour:.3})"
+        );
+        assert!(
+            on_the_hour > before,
+            "midnight should be after 23:45, not before ({on_the_hour:.3} ≤ {before:.3})"
+        );
+
+        // And the lamp cue that depends on it must stay dark across the seam —
+        // the measured flare was 0.450 at 00:00 after 0.000 at 23:45.
+        let lamp = |hours: f64| {
+            let (block, progress) = at(hours, sunrise, sunset, 0);
+            assert_eq!(block.doing, Doing::Sleeping);
+            crate::fisherman::window_light(block.doing, block.place, progress)
+        };
+        let a = lamp(23.75);
+        let b = lamp(0.0);
+        let c = lamp(0.25);
+        assert!(
+            a < 0.01 && b < 0.01 && c < 0.01,
+            "lamp across midnight: 23:45={a:.3} 00:00={b:.3} 00:15={c:.3}"
+        );
     }
 
     /// The whole point of anchoring to the sun. A winter day has to be a
