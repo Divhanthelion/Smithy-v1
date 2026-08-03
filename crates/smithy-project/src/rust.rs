@@ -59,6 +59,9 @@ pub struct ApiItem {
     pub module: String,
     pub kind: ApiKind,
     pub signature: String,
+    /// First `///` doc line, when present. Used for the top-ranked API rows
+    /// in the context block — a one-line purpose beats a parameter list.
+    pub doc_line: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -377,6 +380,7 @@ pub fn public_items_in(source: &str, module: &str) -> Vec<ApiItem> {
                     module: module.to_string(),
                     kind,
                     signature,
+                    doc_line: doc_first_line(source, capture.node),
                 });
             }
         }
@@ -414,6 +418,56 @@ fn signature_of(text: &str) -> Option<String> {
         return None;
     }
     Some(signature)
+}
+
+/// First non-empty `///` line immediately above an item.
+///
+/// Walks previous siblings, skipping attributes, collecting doc comments in
+/// source order. Ordinary `//` comments stop the walk — they are not docs.
+fn doc_first_line(source: &str, node: tree_sitter::Node<'_>) -> Option<String> {
+    let mut docs: Vec<String> = Vec::new();
+    let mut prev = node.prev_named_sibling();
+    while let Some(p) = prev {
+        match p.kind() {
+            "line_comment" => {
+                let Ok(text) = p.utf8_text(source.as_bytes()) else {
+                    break;
+                };
+                let trimmed = text.trim();
+                if let Some(rest) = trimmed.strip_prefix("///") {
+                    docs.push(rest.trim().to_string());
+                    prev = p.prev_named_sibling();
+                } else {
+                    // A plain `//` between docs and the item is not documentation.
+                    break;
+                }
+            }
+            "attribute_item" => {
+                prev = p.prev_named_sibling();
+            }
+            _ => break,
+        }
+    }
+    docs.reverse();
+    docs.into_iter().find(|l| !l.is_empty())
+}
+
+/// Bare name inside a signature: `pub fn run_turn(...)` → `run_turn`.
+pub fn api_item_name(signature: &str) -> Option<&str> {
+    const KINDS: &[&str] = &["fn", "struct", "enum", "trait", "type", "const"];
+    let tokens: Vec<&str> = signature.split_whitespace().collect();
+    for (i, token) in tokens.iter().enumerate() {
+        if KINDS.contains(token) {
+            let raw = tokens.get(i + 1)?;
+            let name = raw.split('<').next().unwrap_or(raw);
+            let name = name.split('(').next().unwrap_or(name);
+            if name.is_empty() {
+                return None;
+            }
+            return Some(name);
+        }
+    }
+    None
 }
 
 /// Group API items by module, preserving the sorted order.
@@ -577,15 +631,45 @@ pub mod inner {
                 module: "b".into(),
                 kind: ApiKind::Function,
                 signature: "pub fn y()".into(),
+                doc_line: None,
             },
             ApiItem {
                 module: "a".into(),
                 kind: ApiKind::Function,
                 signature: "pub fn x()".into(),
+                doc_line: None,
             },
         ];
         let grouped = group_by_module(&items);
         assert_eq!(grouped.keys().copied().collect::<Vec<_>>(), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn the_first_doc_line_is_captured_for_an_item() {
+        let source = r#"
+/// Build the context block for a project.
+///
+/// More detail the map does not need.
+pub fn extract() {}
+"#;
+        let items = public_items_in(source, "");
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].doc_line.as_deref(),
+            Some("Build the context block for a project.")
+        );
+    }
+
+    #[test]
+    fn api_item_name_strips_generics_and_args() {
+        assert_eq!(
+            api_item_name("pub fn extract(project: &Project, budget: ContextBudget) -> ProjectContext"),
+            Some("extract")
+        );
+        assert_eq!(
+            api_item_name("pub struct Config<T>"),
+            Some("Config")
+        );
     }
 
     #[test]

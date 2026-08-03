@@ -127,6 +127,7 @@ impl Explore {
             context_warn: CONTEXT_HARD / 2,
             context_hard: CONTEXT_HARD,
             max_parse_retries: 2,
+            tool_result_warn_chars: crate::limits::tool_result_warn_for_window(CONTEXT_HARD),
         }
     }
 }

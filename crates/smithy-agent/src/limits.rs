@@ -27,6 +27,34 @@ pub struct Limits {
     pub context_hard: i64,
     /// Give up after this many consecutive unusable responses.
     pub max_parse_retries: usize,
+    /// Soft cap on cumulative tool-result characters in one turn.
+    ///
+    /// Per-call caps are fine in isolation (`read` 2000 lines, `web_fetch` 64k
+    /// chars) but nothing bound their *sum*. One `web_fetch` at default is
+    /// ~16k tokens of uncached history; three greps and two fetches clear the
+    /// soft context warn inside five steps — all permanent, none of it in the
+    /// cached prefix (HANDOFF §5.1). Past this threshold we append a narrowing
+    /// hint to the result itself: warn, don't truncate — cutting risks removing
+    /// the answer the model needed, and would fail silently.
+    #[serde(default = "default_tool_result_warn_chars")]
+    pub tool_result_warn_chars: usize,
+}
+
+fn default_tool_result_warn_chars() -> usize {
+    // 8% of the default hard ceiling, as chars (×4). Same formula
+    // `suggested_limits` uses once a window is known.
+    tool_result_warn_for_window(110_000)
+}
+
+/// Soft tool-result budget derived from the model's context window.
+///
+/// Eight percent of the window, counted as characters (`chars ≈ tokens * 4`).
+/// The fraction is the failure above: enough headroom for a few focused reads,
+/// tight enough that a default `web_fetch` (64k chars) trips the warn on a
+/// 110k-class window before a second one lands.
+pub fn tool_result_warn_for_window(context_length: i64) -> usize {
+    const SHARE: f64 = 0.08;
+    ((context_length.max(0) as f64) * SHARE * 4.0) as usize
 }
 
 impl Default for Limits {
@@ -37,6 +65,7 @@ impl Default for Limits {
             context_warn: 32_000,
             context_hard: 110_000,
             max_parse_retries: 3,
+            tool_result_warn_chars: default_tool_result_warn_chars(),
         }
     }
 }
@@ -64,6 +93,8 @@ pub struct Budget {
     started: Instant,
     steps: usize,
     last_prompt_tokens: i64,
+    /// Cumulative tool-result characters this turn (pre-annotation).
+    tool_result_chars: usize,
     warned: bool,
     warned_steps: bool,
 }
@@ -84,6 +115,7 @@ impl Budget {
             started: Instant::now(),
             steps: 0,
             last_prompt_tokens,
+            tool_result_chars: 0,
             warned: false,
             warned_steps: false,
         }
@@ -155,6 +187,23 @@ impl Budget {
     pub fn last_prompt_tokens(&self) -> i64 {
         self.last_prompt_tokens
     }
+
+    /// Count a tool result toward the per-turn aggregate and, past the soft
+    /// threshold, append a narrowing hint to the content *before* it enters
+    /// history. Append-only-safe: we shape the result, we do not rewrite it
+    /// later. Warn rather than truncate — cutting risks deleting the answer.
+    pub fn annotate_tool_result(&mut self, content: &mut String) {
+        self.tool_result_chars = self.tool_result_chars.saturating_add(content.len());
+        if self.tool_result_chars > self.limits.tool_result_warn_chars {
+            content.push_str(
+                "\n\n[results are running long this turn; narrow the query rather than fetching more]",
+            );
+        }
+    }
+
+    pub fn tool_result_chars(&self) -> usize {
+        self.tool_result_chars
+    }
 }
 
 #[cfg(test)]
@@ -168,6 +217,7 @@ mod tests {
             context_warn: 100,
             context_hard: 200,
             max_parse_retries: 3,
+            tool_result_warn_chars: 1_000,
         }
     }
 
@@ -274,5 +324,43 @@ mod tests {
     fn stop_reasons_are_legible() {
         assert_eq!(Stop::Steps(60).to_string(), "step limit reached (60)");
         assert!(Stop::Context(120_000).to_string().contains("120000 tokens"));
+    }
+
+    /// One web_fetch at default is ~64k chars. Without an aggregate cap those
+    /// land uncached in history forever; the warn must fire on the result
+    /// itself so the model narrows before the next call.
+    #[test]
+    fn tool_results_past_the_aggregate_cap_get_a_narrowing_hint() {
+        let mut b = Budget::new(Limits {
+            tool_result_warn_chars: 100,
+            ..limits()
+        });
+        let mut first = "x".repeat(60);
+        b.annotate_tool_result(&mut first);
+        assert!(
+            !first.contains("running long"),
+            "under the cap must stay clean: {first}"
+        );
+        let mut second = "y".repeat(50);
+        b.annotate_tool_result(&mut second);
+        assert!(
+            second.contains("narrow the query"),
+            "over the cap must tell the model what to do: {second}"
+        );
+        assert!(
+            second.contains("running long"),
+            "and say why: {second}"
+        );
+        // The body is still intact — we warn, we do not truncate.
+        assert!(second.starts_with(&"y".repeat(50)));
+        assert_eq!(b.tool_result_chars(), 110);
+    }
+
+    #[test]
+    fn tool_result_warn_scales_with_the_window() {
+        let small = tool_result_warn_for_window(32_768);
+        let large = tool_result_warn_for_window(1_000_000);
+        assert!(large > small);
+        assert_eq!(small, ((32_768.0_f64) * 0.08 * 4.0) as usize);
     }
 }

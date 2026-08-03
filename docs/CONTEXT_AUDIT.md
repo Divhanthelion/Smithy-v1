@@ -68,33 +68,20 @@ for a long session is a guillotine.
    done on confirm, showing what is about to be dropped. Not automatic, not
    silent, not every turn.
 
-### B. The project block is priced as if it were paid once. It is paid every request.
+### ~~B. The project block is priced as if it were paid once. It is paid every request.~~ — **withdrawn**
 
-`ContextBudget::for_window` gives 5 % of the window, floor 6k tokens, ceiling
-40k. The reasoning is sound as far as it goes, and the comment is right that a
-1M-token model should not be handed the same 6k a 32k model gets.
+Struck 2026-08-03. The premise was that the project block is **prefilled at full
+price on every request** of the session, so sizing it as a share of the window
+overpays. Measured hit rate on `deepseek-v4-pro` is **76–79%**
+([HANDOFF §5.1](HANDOFF.md)): the frozen part of the prompt — system, project
+block, tool schemas — is exactly what the cache serves, at roughly a tenth the
+cold rate. At that hit rate the "paid every request at full price" claim is off
+by roughly 10×.
 
-But the block is frozen into the system prompt precisely so it sits in the
-cached prefix — which means it is **prefilled on every request of the session**.
-A 60-step turn against a 1M model carries 40k tokens of `pub fn` signatures 60
-times. Sizing it as a share of the *window* prices it like a one-off; it is a
-per-request rent.
-
-Worse, the system prompt already tells the model not to trust it for detail:
-
-> The project summary below is a *map*: it tells you what exists, not what shape
-> it has. Guessing a variant name or an argument count from the map is the single
-> commonest way to write code that does not compile.
-
-If the model must call `symbol` before using anything anyway, then every
-signature past the point where the *map* is complete is being paid for on every
-request to deliver information the model has been instructed to re-fetch.
-
-**Recommendation:** re-derive the ceiling from expected requests per session
-rather than window share. Concretely, cap around **8–10k tokens regardless of
-window**, and let `symbol` serve the tail. Then measure: run the same task at
-8k and at 40k and compare tool-call counts and total prompt tokens. This project
-measures things; this is worth measuring rather than arguing.
+The conversation is what is *not* cached and what grows. Re-deriving a flatter
+project-block ceiling from cache-blind arithmetic would shrink the cheap half
+to free room that the expensive half would refill. Do not re-derive this item
+from the prefill comment alone; the measurement revises it.
 
 ### C. The API layer is 6k tokens of undifferentiated list
 
@@ -304,10 +291,46 @@ Ranked by value per unit of work.
 | 1 | §2F cached tokens | **Done on `context/measure`.** Turns the central bet into a measurement. |
 | 2 | §2A carry `last_prompt_tokens` across turns | **Done.** Stops billing for calls that are guaranteed to be discarded. |
 | 3 | §4 `Session::ledger()` + panel | **Done.** Attribution scaled to the billed total; cached vs cold; frozen vs live. |
-| 4 | §2D per-turn tool-result budget | Closes the last uncapped inflow. |
-| 5 | §2C rank the API layer by call-graph degree | Best tokens-per-token improvement available; needs the graph, which exists. |
-| 6 | §2B re-derive the block ceiling, then **measure** | Do it after the panel, so it can show the before/after. |
-| 7 | §2A compaction | Largest, and wants the panel first so the drop is visible. |
+| 4 | §2D per-turn tool-result budget | **Done on `context/spend`.** Closes the last uncapped inflow. |
+| 5 | §2C rank the API layer by call-graph degree | **Done.** Fan-in order when a graph is loaded; source order otherwise. |
+| 6 | §2A compaction | Deferred — see §6. Invalidates the prefix cache by definition. |
 
 ~~Former #3 (`context_warn` as a fraction of window) withdrawn — already done via
 `suggested_limits`; see struck §2E.~~
+
+~~Former #6 (`§2B` re-derive the block ceiling) withdrawn — cache hit rate makes
+the full-price-every-request premise wrong by ~10×; see struck §2B and
+HANDOFF §5.1.~~
+
+---
+
+## 6. Closing — what this audit became
+
+Written 2026-08-03 against a codebase that could not see its own context cost.
+Closed the same day once the meter existed and the priorities flipped.
+
+### Implemented
+
+| Item | Where |
+|---|---|
+| §2F cached tokens + cost split + hit rate | `providers/sse.rs`, `Usage`, Context Usage panel |
+| §2A carry `last_prompt_tokens` across turns | `Budget::seeded`, `Session` |
+| §4 `Session::ledger()` + panel | frozen vs live, cached vs cold; calibration held on first completion |
+| §2D per-turn tool-result budget | `Budget::annotate_tool_result`, threshold from window |
+| §2C rank API by call-graph fan-in | `context::extract(..., graph)`; noise dropped; top-50 doc lines |
+
+### Withdrawn
+
+| Item | Why |
+|---|---|
+| §2E flat `context_warn` | Already scaled by `suggested_limits` — misread the Defaults table. |
+| §2B shrink the project block | Premise was full-price prefill every request. Measured hit rate 76–79% (HANDOFF §5.1) says the frozen half is cached at ~1/10×; the expensive half is the growing conversation. Shrinking the cheap half to feed the expensive one is the wrong cut. |
+
+### Deferred — compaction (§2A part 2)
+
+Compaction invalidates the prefix cache **by definition**: it rewrites the
+history the cache was keyed on. With a measured 76–79% hit rate that cache is
+worth keeping, and on a 1M-token window the ceiling is not the binding
+constraint yet. Offer it later as a rare, user-visible event at ~70% of window
+— not automatic, not silent — when a session actually needs it. Deferred with
+that reason is a decision; leaving it unmarked would have been a loose end.
