@@ -139,24 +139,42 @@ use floem::views::canvas;
 
 use crate::aesthetic::Aesthetic;
 
+/// Everything the fisherman needs to be drawn, and nothing else.
+///
+/// Two methods because that is genuinely all he uses — checked, not assumed.
+/// A wider trait would be a wider thing to keep in sync, and the whole point
+/// of this seam is that there is nothing to keep in sync.
+pub trait Ink {
+    fn fill(&mut self, path: &BezPath, color: Color);
+    fn stroke(&mut self, path: &BezPath, color: Color, width: f64);
+}
+
+/// Flatten a kurbo shape to a path for [`Ink`].
+///
+/// Tolerance 0.25: he is a few dozen pixels tall on the rail, and a tighter
+/// flatten only thickened the path lists without changing a pixel that mattered.
+fn shape_path(shape: &impl Shape) -> BezPath {
+    BezPath::from_vec(shape.path_elements(0.25).collect())
+}
+
 /// Dark metal, in the frame's own vocabulary. He is a wrought figure someone
 /// set there, not a cartoon pasted on: a cartoon on an engraved steel object
 /// reads as a sticker, a weathervane reads as part of the object.
-const IRON: Color = Color::from_rgb8(17, 20, 27);
+pub const IRON: Color = Color::from_rgb8(17, 20, 27);
 /// The gold rim light, the frame's inlay.
-const RIM: Color = Color::from_rgb8(186, 148, 72);
-const RIM_BRIGHT: Color = Color::from_rgb8(240, 210, 140);
+pub const RIM: Color = Color::from_rgb8(186, 148, 72);
+pub const RIM_BRIGHT: Color = Color::from_rgb8(240, 210, 140);
 /// The line, visible against the moulding without competing with it.
-const LINE: Color = Color::from_rgb8(126, 138, 162);
-const FIRE_CORE: Color = Color::from_rgb8(255, 224, 150);
-const FIRE_BODY: Color = Color::from_rgb8(226, 132, 44);
-const FIRE_DEEP: Color = Color::from_rgb8(126, 48, 18);
-const FISH: Color = Color::from_rgb8(150, 172, 196);
-const SMOKE: Color = Color::from_rgb8(150, 158, 172);
+pub const LINE: Color = Color::from_rgb8(126, 138, 162);
+pub const FIRE_CORE: Color = Color::from_rgb8(255, 224, 150);
+pub const FIRE_BODY: Color = Color::from_rgb8(226, 132, 44);
+pub const FIRE_DEEP: Color = Color::from_rgb8(126, 48, 18);
+pub const FISH: Color = Color::from_rgb8(150, 172, 196);
+pub const SMOKE: Color = Color::from_rgb8(150, 158, 172);
 /// Paper, the one genuinely pale thing on him — which is why the book reads.
-const GREEN: Color = Color::from_rgb8(96, 138, 84);
+pub const GREEN: Color = Color::from_rgb8(96, 138, 84);
 /// Paper, the one genuinely pale thing he owns.
-const PAGE: Color = Color::from_rgb8(196, 190, 172);
+pub const PAGE: Color = Color::from_rgb8(196, 190, 172);
 
 /// A figure, in a unit box: `0,0` top-left, `1,1` bottom-right, facing right.
 ///
@@ -663,6 +681,202 @@ pub fn stage_layout(w: f64, band: f64) -> (f64, f64, f64) {
     (scale, left, width)
 }
 
+/// Everything a frame needs. No clock, no globals — a value.
+///
+/// The Aesthetic gate and the tiny-window early return live in
+/// [`fisherman_view`], not here: `paint` draws whatever Scene it is handed so
+/// the harness can render sizes the app refuses.
+pub struct Scene {
+    pub width: f64,
+    pub height: f64,
+    pub band: f64,
+    pub doing: Doing,
+    pub place: Place,
+    pub previous: Place,
+    pub progress: f64,
+    pub completion: f64,
+    pub frame: u64,
+    pub seconds: f64,
+}
+
+/// The clock half. Everything nondeterministic lives in the arguments and
+/// nowhere else — `launched` is a parameter rather than `session_seconds()`
+/// because that OnceLock cannot be reset, and two scenes in one process would
+/// otherwise share a launch time (the preview's whole reason for existing).
+pub fn scene_at(
+    width: f64,
+    height: f64,
+    band: f64,
+    hours: f64,
+    sunrise: f64,
+    sunset: f64,
+    day: i64,
+    launched: f64,
+    frame: u64,
+) -> Scene {
+    let (block, progress) = crate::routine::at(hours, sunrise, sunset, day);
+    let previous = crate::routine::at(block.start - 1e-4, sunrise, sunset, day)
+        .0
+        .place;
+    if std::env::var("SMITHY_FISHERMAN_DEBUG").is_ok_and(|v| v != "0") {
+        eprintln!(
+            "fisherman: {width:.0}x{height:.0} band {band:.0} | {hours:.2}h day {day} | \
+             sun {sunrise:.2}..{sunset:.2} | {:?} at {:?} {:.0}% | indoors {}",
+            block.doing,
+            block.place,
+            progress * 100.0,
+            block.doing.is_indoors(block.place)
+        );
+    }
+    Scene {
+        width,
+        height,
+        band,
+        doing: block.doing,
+        place: block.place,
+        previous,
+        progress,
+        completion: hut_completion(launched),
+        frame,
+        // Wall-clock seconds of animation phase, same as the live view's
+        // `frame as f64 / 5.0` — kept on Scene so paint never reads a clock.
+        seconds: frame as f64 / 5.0,
+    }
+}
+
+/// The drawing half. Pure: same Scene, same ink calls, forever.
+pub fn paint(ink: &mut impl Ink, scene: &Scene) {
+    let (w, h, band) = (scene.width, scene.height, scene.band);
+    let frame = scene.frame;
+    let seconds = scene.seconds;
+    let phase = seconds / 6.0;
+    let progress = scene.progress;
+    let completion = scene.completion;
+    let came_from = scene.previous;
+    let block_doing = scene.doing;
+    let block_place = scene.place;
+
+    let (scale, stage_left, stage) = stage_layout(w, band);
+    let top = h - band + (band - scale) * 0.55;
+
+    let hut = HutGeometry::new(
+        stage_left - scale * 0.35,
+        h - band * 0.10,
+        scale * 1.45,
+        band,
+    );
+    // While he is walking home at the end of the build, the door answers to
+    // that walk rather than to the routine.
+    let door_open = if completion < 1.0 {
+        let handover = ((completion - HANDOVER) / (1.0 - HANDOVER)).clamp(0.0, 1.0);
+        door_openness(Doing::Walking, block_place, Place::Garden, handover)
+    } else {
+        door_openness(block_doing, block_place, came_from, progress)
+    };
+    // A stand-in Block for the draw helpers that still take one — same fields
+    // paint already has on Scene, without dragging routine into every call.
+    let block = crate::routine::Block {
+        doing: block_doing,
+        place: block_place,
+        start: 0.0,
+        end: 1.0,
+    };
+    draw_hut(ink, &hut, &block, progress, frame, completion, door_open);
+
+    // While the hut is going up he is building it, whatever the clock
+    // says. He does not go to bed halfway through raising a wall.
+    let building = completion < 1.0;
+    let (doing, along) = if building && completion < HANDOVER {
+        (Doing::Walking, build_position(completion))
+    } else if building {
+        // Finished building; now walk to wherever the day has him, so the
+        // handover is a walk rather than a jump.
+        let handover = ((completion - HANDOVER) / (1.0 - HANDOVER)).clamp(0.0, 1.0);
+        let from = build_position(HANDOVER);
+        let to = place_position(block_place);
+        (
+            Doing::Walking,
+            from + (to - from) * ease((handover / ARRIVAL).min(1.0)),
+        )
+    } else {
+        (
+            block_doing,
+            position_along(came_from, block_place, block_doing, progress),
+        )
+    };
+    // Where he was a moment ago decides which way he is pointing. Reading
+    // it off the movement rather than tracking a heading means it can never
+    // disagree with where he is actually going.
+    //
+    // Within-block lookback rather than a wall-clock second: the old lookback
+    // needed the sun and the day inside Scene, which forced every harness tile
+    // to invent a coherent clock. The facing *sign* is what matters, and that
+    // is the same along any monotonic stretch of `position_along` /
+    // `build_position`.
+    let a_moment_ago = if building && completion < HANDOVER {
+        build_position((completion - 0.004).max(0.0))
+    } else if building {
+        let handover = ((completion - HANDOVER - 0.004) / (1.0 - HANDOVER)).clamp(0.0, 1.0);
+        let from = build_position(HANDOVER);
+        from + (place_position(block_place) - from) * ease((handover / ARRIVAL).min(1.0))
+    } else {
+        position_along(came_from, block_place, block_doing, (progress - 0.004).max(0.0))
+    };
+    let face = facing(a_moment_ago, along);
+    // During the beat at a walk's end he is standing still, and stillness
+    // reads as facing right — which at the hut is *away* from the door
+    // opening beside him. A stopped walker keeps the walk's own heading.
+    let face = if !building && doing == Doing::Walking && (along - a_moment_ago).abs() < 1e-6
+    {
+        facing(place_position(came_from), place_position(block_place))
+    } else {
+        face
+    };
+    let left = stage_left + along * stage;
+    // Mirrored about his own centre when he is heading left, so the rod
+    // and the plank swap sides with him rather than staying put.
+    let at = |p: Point| {
+        let x = if face < 0.0 { 1.0 - p.x } else { p.x };
+        Point::new(left + x * scale, top + p.y * scale)
+    };
+    // A plank-carrying walk is just a walk with the arms out, at the
+    // walk's own cadence: `pose_for` scales its input by `strides()`, so
+    // the span here is the build's duration measured in walk-lengths.
+    let walk_progress = if building {
+        completion * (BUILD_SECONDS * HANDOVER / crate::routine::WALK_SECONDS)
+    } else {
+        progress
+    };
+    let mut pose = breathe(
+        pose_for(doing, walk_progress, phase),
+        secondary(seconds, doing),
+    );
+    pose.hat_tilt += head_drift(seconds);
+
+    // Indoors he is a shape behind glass and nothing else — see
+    // `draw_hut`, which paints him into the window.
+    if !building && block_doing.is_indoors(block_place) {
+        return;
+    }
+
+    if building {
+        draw_figure(ink, &pose, &at, scale);
+        draw_plank(ink, &pose, &at, scale, completion);
+    } else {
+        // The fire is a fixture at the pit, not a prop that follows him —
+        // a hearth that teleports to the doorstep for dinner reads as a
+        // decal, the same failure as flames without a glow.
+        let fire_base = Point::new(
+            stage_left + place_position(Place::Fire) * stage + scale * 0.80,
+            top + scale * 0.92,
+        );
+        draw_fire(ink, &block, progress, fire_base, scale, frame);
+        draw_line_and_rod(ink, &block, &pose, &at, scale, h, frame);
+        draw_figure(ink, &pose, &at, scale);
+        draw_props(ink, &block, progress, &pose, &at, scale, frame);
+    }
+}
+
 /// The fisherman and his hut, on the frame's bottom rail.
 ///
 /// He lives on the metalwork rather than on the terminal's tab bar, which is
@@ -684,145 +898,15 @@ pub fn fisherman_view(aesthetic: RwSignal<Aesthetic>, tick: RwSignal<u64>) -> im
             return;
         }
 
-        let seconds = std::time::SystemTime::now()
+        let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
-        let hours = crate::localtime::local_hours(seconds);
-        let day = crate::localtime::local_day(seconds);
-        let (sunrise, sunset) = crate::celestial::todays_sun(seconds);
-        let (block, progress) = crate::routine::at(hours, sunrise, sunset, day);
-
-        if std::env::var("SMITHY_FISHERMAN_DEBUG").is_ok_and(|v| v != "0") {
-            eprintln!(
-                "fisherman: {w:.0}x{h:.0} band {band:.0} | {hours:.2}h day {day} |                  sun {sunrise:.2}..{sunset:.2} | {:?} at {:?} {:.0}% | indoors {}",
-                block.doing,
-                block.place,
-                progress * 100.0,
-                block.doing.is_indoors(block.place)
-            );
-        }
-
-        // A slow phase for anything that cycles within an activity.
-        // Wall-clock seconds, so the secondary periods mean what they say.
-        let seconds = frame as f64 / 5.0;
-        let phase = seconds / 6.0;
-
-        let (scale, stage_left, stage) = stage_layout(w, band);
-        let top = h - band + (band - scale) * 0.55;
-
-        // The hut is a fixture at the left end, and it is drawn whether he is
-        // in it or not — a house does not come and go with its occupant.
-        let hut = HutGeometry::new(
-            stage_left - scale * 0.35,
-            h - band * 0.10,
-            scale * 1.45,
-            band,
-        );
-        let completion = hut_completion(session_seconds());
-        // Where he came from, which decides both which way he faces and
-        // whether the door is opening or closing.
-        let came_from = crate::routine::at(block.start - 1e-4, sunrise, sunset, day)
-            .0
-            .place;
-        // While he is walking home at the end of the build, the door answers to
-        // that walk rather than to the routine.
-        let door_open = if completion < 1.0 {
-            let handover = ((completion - HANDOVER) / (1.0 - HANDOVER)).clamp(0.0, 1.0);
-            door_openness(Doing::Walking, block.place, Place::Garden, handover)
-        } else {
-            door_openness(block.doing, block.place, came_from, progress)
-        };
-        draw_hut(cx, &hut, &block, progress, frame, completion, door_open);
-
-        // While the hut is going up he is building it, whatever the clock
-        // says. He does not go to bed halfway through raising a wall.
-        let building = completion < 1.0;
-        let (doing, along) = if building && completion < HANDOVER {
-            (Doing::Walking, build_position(completion))
-        } else if building {
-            // Finished building; now walk to wherever the day has him, so the
-            // handover is a walk rather than a jump.
-            let handover = ((completion - HANDOVER) / (1.0 - HANDOVER)).clamp(0.0, 1.0);
-            let from = build_position(HANDOVER);
-            let to = place_position(block.place);
-            (
-                Doing::Walking,
-                from + (to - from) * ease((handover / ARRIVAL).min(1.0)),
-            )
-        } else {
-            (
-                block.doing,
-                position_along(came_from, block.place, block.doing, progress),
-            )
-        };
-        // Where he was a moment ago decides which way he is pointing. Reading
-        // it off the movement rather than tracking a heading means it can never
-        // disagree with where he is actually going.
-        let a_moment_ago = if building && completion < HANDOVER {
-            build_position((completion - 0.004).max(0.0))
-        } else if building {            let handover = ((completion - HANDOVER - 0.004) / (1.0 - HANDOVER)).clamp(0.0, 1.0);
-            let from = build_position(HANDOVER);
-            from + (place_position(block.place) - from) * ease((handover / ARRIVAL).min(1.0))
-        } else {
-            let then = (hours - 1.0 / 3600.0).max(0.0);
-            let (was, was_progress) = crate::routine::at(then, sunrise, sunset, day);
-            let before = crate::routine::at(was.start - 1e-4, sunrise, sunset, day).0.place;
-            position_along(before, was.place, was.doing, was_progress)
-        };
-        let face = facing(a_moment_ago, along);
-        // During the beat at a walk's end he is standing still, and stillness
-        // reads as facing right — which at the hut is *away* from the door
-        // opening beside him. A stopped walker keeps the walk's own heading.
-        let face = if !building && doing == Doing::Walking && (along - a_moment_ago).abs() < 1e-6
-        {
-            facing(place_position(came_from), place_position(block.place))
-        } else {
-            face
-        };
-        let left = stage_left + along * stage;
-        // Mirrored about his own centre when he is heading left, so the rod
-        // and the plank swap sides with him rather than staying put.
-        let at = |p: Point| {
-            let x = if face < 0.0 { 1.0 - p.x } else { p.x };
-            Point::new(left + x * scale, top + p.y * scale)
-        };
-        // A plank-carrying walk is just a walk with the arms out, at the
-        // walk's own cadence: `pose_for` scales its input by `strides()`, so
-        // the span here is the build's duration measured in walk-lengths.
-        let walk_progress = if building {
-            completion * (BUILD_SECONDS * HANDOVER / crate::routine::WALK_SECONDS)
-        } else {
-            progress
-        };
-        let mut pose = breathe(
-            pose_for(doing, walk_progress, phase),
-            secondary(seconds, doing),
-        );
-        pose.hat_tilt += head_drift(seconds);
-
-        // Indoors he is a shape behind glass and nothing else — see
-        // `draw_hut`, which paints him into the window.
-        if !building && block.doing.is_indoors(block.place) {
-            return;
-        }
-
-        if building {
-            draw_figure(cx, &pose, &at, scale);
-            draw_plank(cx, &pose, &at, scale, completion);
-        } else {
-            // The fire is a fixture at the pit, not a prop that follows him —
-            // a hearth that teleports to the doorstep for dinner reads as a
-            // decal, the same failure as flames without a glow.
-            let fire_base = Point::new(
-                stage_left + place_position(Place::Fire) * stage + scale * 0.80,
-                top + scale * 0.92,
-            );
-            draw_fire(cx, &block, progress, fire_base, scale, frame);
-            draw_line_and_rod(cx, &block, &pose, &at, scale, h, frame);
-            draw_figure(cx, &pose, &at, scale);
-            draw_props(cx, &block, progress, &pose, &at, scale, frame);
-        }
+        let hours = crate::localtime::local_hours(now);
+        let day = crate::localtime::local_day(now);
+        let (sunrise, sunset) = crate::celestial::todays_sun(now);
+        let scene = scene_at(w, h, band, hours, sunrise, sunset, day, session_seconds(), frame);
+        paint(cx, &scene);
     })
     .style(|s| {
         s.absolute()
@@ -832,8 +916,20 @@ pub fn fisherman_view(aesthetic: RwSignal<Aesthetic>, tick: RwSignal<u64>) -> im
     })
 }
 
+impl Ink for floem::context::PaintCx<'_> {
+    fn fill(&mut self, path: &BezPath, color: Color) {
+        // Deref to the inner renderer: calling `self.fill` would resolve to this
+        // Ink method and recurse. PaintCx's fill lives on the Deref target.
+        (**self).fill(path, color, 0.0);
+    }
+
+    fn stroke(&mut self, path: &BezPath, color: Color, width: f64) {
+        (**self).stroke(path, color, &Stroke::new(width));
+    }
+}
+
 fn draw_figure(
-    cx: &mut floem::context::PaintCx,
+    ink: &mut impl Ink,
     pose: &Pose,
     at: &impl Fn(Point) -> Point,
     scale: f64,
@@ -843,8 +939,8 @@ fn draw_figure(
         let placed = place(&path, at);
         // Dark body, gold edge — the frame's own treatment, so he belongs to
         // the same object rather than sitting on it.
-        cx.fill(&placed, IRON, 0.0);
-        cx.stroke(&placed, RIM.with_alpha(0.85), &Stroke::new(edge));
+        ink.fill(&placed, IRON);
+        ink.stroke(&placed, RIM.with_alpha(0.85), edge);
     }
 }
 
@@ -865,7 +961,7 @@ fn place(path: &BezPath, at: &impl Fn(Point) -> Point) -> BezPath {
 }
 
 fn draw_line_and_rod(
-    cx: &mut floem::context::PaintCx,
+    ink: &mut impl Ink,
     block: &crate::routine::Block,
     pose: &Pose,
     at: &impl Fn(Point) -> Point,
@@ -888,12 +984,8 @@ fn draw_line_and_rod(
     let mut rod = BezPath::new();
     rod.move_to(at(pose.rod_butt));
     rod.line_to(tip);
-    cx.stroke(&rod, IRON, &Stroke::new((scale * 0.06).max(1.2)));
-    cx.stroke(
-        &rod,
-        RIM.with_alpha(0.9),
-        &Stroke::new((scale * 0.025).max(0.6)),
-    );
+    ink.stroke(&rod, IRON, (scale * 0.06).max(1.2));
+    ink.stroke(&rod, RIM.with_alpha(0.9), (scale * 0.025).max(0.6));
 
     if !at_the_water {
         return;
@@ -904,12 +996,12 @@ fn draw_line_and_rod(
     let seconds = frame as f64 / 5.0;
     let sway = (((seconds - 0.4) / LINE_SWAY_SECONDS) * std::f64::consts::TAU).sin() * scale * 0.08;
     let path = line_path(tip, panel_height - 2.0, sway);
-    cx.stroke(&path, LINE.with_alpha(0.75), &Stroke::new(0.9));
+    ink.stroke(&path, LINE.with_alpha(0.75), 0.9);
 }
 
 /// The cooking fire, burning at its pit.
 fn draw_fire(
-    cx: &mut floem::context::PaintCx,
+    ink: &mut impl Ink,
     block: &crate::routine::Block,
     progress: f64,
     base: Point,
@@ -934,11 +1026,7 @@ fn draw_fire(
 
     // The hearth glow first, under everything: bare flames on cold metal read
     // as a decal, and it is the light on the ground that says *fire*.
-    cx.fill(
-        &Ellipse::new(base, (scale * 0.30, scale * 0.09), 0.0),
-        FIRE_BODY.with_alpha(0.22 * strength as f32),
-        0.0,
-    );
+    ink.fill(&shape_path(&Ellipse::new(base, (scale * 0.30, scale * 0.09), 0.0)), FIRE_BODY.with_alpha(0.22 * strength as f32));
 
     for (index, colour, spread) in [
         (0usize, FIRE_DEEP, 1.0),
@@ -958,7 +1046,7 @@ fn draw_fire(
             Point::new(base.x + half, base.y),
         );
         flame.close_path();
-        cx.fill(&flame, colour.with_alpha(0.92), 0.0);
+        ink.fill(&flame, colour.with_alpha(0.92));
     }
 
     // Sparks, rising off the top of the flame and winking out — a fire that
@@ -966,20 +1054,16 @@ fn draw_fire(
     for spark in 0..3 {
         let p = ((frame as f64 / 18.0) + f64::from(spark) * 0.37).fract();
         let wander = (f64::from(spark) - 1.0) * scale * 0.05 + p * scale * 0.03;
-        cx.fill(
-            &Circle::new(
+        ink.fill(&shape_path(&Circle::new(
                 Point::new(base.x + wander, base.y - height * (0.5 + p * 0.9)),
                 (scale * 0.018).max(0.4),
-            ),
-            FIRE_CORE.with_alpha((1.0 - p) as f32 * 0.8 * strength as f32),
-            0.0,
-        );
+            )), FIRE_CORE.with_alpha((1.0 - p) as f32 * 0.8 * strength as f32));
     }
 }
 
 /// Whatever he happens to be holding.
 fn draw_props(
-    cx: &mut floem::context::PaintCx,
+    ink: &mut impl Ink,
     block: &crate::routine::Block,
     progress: f64,
     pose: &Pose,
@@ -991,36 +1075,28 @@ fn draw_props(
         Doing::Cooking => {
             // A fish on a stick, held out over the flame.
             let fish = Point::new(0.74, 0.72);
-            draw_fish(cx, at(fish), scale, 1.0);
+            draw_fish(ink, at(fish), scale, 1.0);
             let mut stick = BezPath::new();
             stick.move_to(at(pose.hand));
             stick.line_to(at(fish));
-            cx.stroke(
-                &stick,
-                RIM_BRIGHT.with_alpha(0.8),
-                &Stroke::new((scale * 0.02).max(0.5)),
-            );
+            ink.stroke(&stick, RIM_BRIGHT.with_alpha(0.8), (scale * 0.02).max(0.5));
         }
         Doing::Eating => {
             let left = 1.0 - ease(progress);
             if left > 0.15 {
-                draw_fish(cx, at(pose.hand), scale, left);
+                draw_fish(ink, at(pose.hand), scale, left);
             }
         }
         Doing::Coffee => {
             // The mug, and steam off it — the cheapest possible "this is hot".
             let mug = at(Point::new(pose.hand.x, pose.hand.y));
-            cx.fill(&Circle::new(mug, scale * 0.055), PAGE.with_alpha(0.9), 0.0);
+            ink.fill(&shape_path(&Circle::new(mug, scale * 0.055)), PAGE.with_alpha(0.9));
             for puff in 0..2 {
                 let p = ((frame as f64 / 26.0) + f64::from(puff) * 0.5).fract();
-                cx.fill(
-                    &Circle::new(
+                ink.fill(&shape_path(&Circle::new(
                         Point::new(mug.x + p * scale * 0.05, mug.y - p * scale * 0.30),
                         (scale * 0.022).max(0.5),
-                    ),
-                    SMOKE.with_alpha((1.0 - p) as f32 * 0.48),
-                    0.0,
-                );
+                    )), SMOKE.with_alpha((1.0 - p) as f32 * 0.48));
             }
         }
         Doing::Smoking => {
@@ -1031,26 +1107,14 @@ fn draw_props(
             let mut cigarette = BezPath::new();
             cigarette.move_to(butt);
             cigarette.line_to(tip);
-            cx.stroke(
-                &cigarette,
-                PAGE.with_alpha(0.9),
-                &Stroke::new((scale * 0.018).max(0.6)),
-            );
-            cx.fill(
-                &Circle::new(tip, (scale * 0.028).max(0.7)),
-                FIRE_CORE.with_alpha(0.9),
-                0.0,
-            );
+            ink.stroke(&cigarette, PAGE.with_alpha(0.9), (scale * 0.018).max(0.6));
+            ink.fill(&shape_path(&Circle::new(tip, (scale * 0.028).max(0.7))), FIRE_CORE.with_alpha(0.9));
             for puff in 0..3 {
                 let p = ((frame as f64 / 22.0) + f64::from(puff) * 0.33).fract();
-                cx.fill(
-                    &Circle::new(
+                ink.fill(&shape_path(&Circle::new(
                         Point::new(tip.x + p * scale * 0.12, tip.y - p * scale * 0.45),
                         (scale * 0.03).max(0.6) * (1.0 + p * 1.6),
-                    ),
-                    SMOKE.with_alpha((1.0 - p) as f32 * 0.44),
-                    0.0,
-                );
+                    )), SMOKE.with_alpha((1.0 - p) as f32 * 0.44));
             }
         }
         Doing::Gardening => {
@@ -1064,11 +1128,7 @@ fn draw_props(
                     Point::new(base.x - scale * 0.02, base.y - scale * 0.06),
                     Point::new(base.x + scale * 0.03, base.y - scale * 0.10),
                 );
-                cx.stroke(
-                    &shoot,
-                    GREEN.with_alpha(0.8),
-                    &Stroke::new((scale * 0.02).max(0.5)),
-                );
+                ink.stroke(&shoot, GREEN.with_alpha(0.8), (scale * 0.02).max(0.5));
             }
         }
         _ => {}
@@ -1080,7 +1140,7 @@ fn draw_props(
 /// Only on the way *to* the wall — he walks back empty-handed, which is the
 /// detail that makes the trip read as a trip rather than as pacing.
 fn draw_plank(
-    cx: &mut floem::context::PaintCx,
+    ink: &mut impl Ink,
     pose: &Pose,
     at: &impl Fn(Point) -> Point,
     scale: f64,
@@ -1097,18 +1157,14 @@ fn draw_plank(
         hand.x + scale * 0.10,
         hand.y + scale * 0.02,
     );
-    cx.fill(&board, HUT_WALL, 0.0);
-    cx.stroke(
-        &board,
-        RIM.with_alpha(0.6),
-        &Stroke::new((scale * 0.02).max(0.5)),
-    );
+    ink.fill(&shape_path(&board), HUT_WALL);
+    ink.stroke(&shape_path(&board), RIM.with_alpha(0.6), (scale * 0.02).max(0.5));
 }
 
 /// A small fish, `size` of full.
-fn draw_fish(cx: &mut floem::context::PaintCx, centre: Point, scale: f64, size: f64) {
+fn draw_fish(ink: &mut impl Ink, centre: Point, scale: f64, size: f64) {
     let body = Ellipse::new(centre, (scale * 0.075 * size, scale * 0.042 * size), 0.0);
-    cx.fill(&body, FISH, 0.0);
+    ink.fill(&shape_path(&body), FISH);
     let tail = Point::new(centre.x - scale * 0.075 * size, centre.y);
     let mut fin = BezPath::new();
     fin.move_to(tail);
@@ -1121,22 +1177,22 @@ fn draw_fish(cx: &mut floem::context::PaintCx, centre: Point, scale: f64, size: 
         tail.y + scale * 0.035 * size,
     ));
     fin.close_path();
-    cx.fill(&fin, FISH, 0.0);
+    ink.fill(&fin, FISH);
 }
 
 // ---------------------------------------------------------------------------
 // The hut
 // ---------------------------------------------------------------------------
 
-const HUT_WALL: Color = Color::from_rgb8(23, 26, 34);
+pub const HUT_WALL: Color = Color::from_rgb8(23, 26, 34);
 /// Inside, seen through an open door — darker than the wall, which is what
 /// makes it read as a hole rather than a panel.
-const DOORWAY: Color = Color::from_rgb8(8, 9, 13);
-const HUT_ROOF: Color = Color::from_rgb8(15, 17, 23);
+pub const DOORWAY: Color = Color::from_rgb8(8, 9, 13);
+pub const HUT_ROOF: Color = Color::from_rgb8(15, 17, 23);
 /// Lamplight. The only warm thing on the frame after dark, which is exactly why
 /// it reads from across the room.
-const LAMP: Color = Color::from_rgb8(255, 186, 92);
-const LAMP_DEEP: Color = Color::from_rgb8(148, 84, 26);
+pub const LAMP: Color = Color::from_rgb8(255, 186, 92);
+pub const LAMP_DEEP: Color = Color::from_rgb8(148, 84, 26);
 
 /// Where the hut and its parts sit, in panel pixels.
 pub struct HutGeometry {
@@ -1281,7 +1337,7 @@ pub fn build_position(completion: f64) -> f64 {
 
 #[allow(clippy::too_many_arguments)]
 fn draw_hut(
-    cx: &mut floem::context::PaintCx,
+    ink: &mut impl Ink,
     hut: &HutGeometry,
     block: &crate::routine::Block,
     progress: f64,
@@ -1299,10 +1355,10 @@ fn draw_hut(
         let top = base - h * (plank as f64 + 1.0) / PLANKS as f64;
         let bottom = base - h * plank as f64 / PLANKS as f64;
         let board = Rect::new(left, top, left + w, bottom);
-        cx.fill(&board, HUT_WALL, 0.0);
+        ink.fill(&shape_path(&board), HUT_WALL);
         // Each board keeps its own edge, so the wall reads as planks rather
         // than as a filled rectangle.
-        cx.stroke(&board, RIM.with_alpha(0.30), &Stroke::new(edge * 0.7));
+        ink.stroke(&shape_path(&board), RIM.with_alpha(0.30), edge * 0.7);
     }
 
     if roofed {
@@ -1313,8 +1369,8 @@ fn draw_hut(
         roof.line_to(Point::new(left + w * 0.5, base - h * 1.34));
         roof.line_to(Point::new(left + w * 1.10, base - h));
         roof.close_path();
-        cx.fill(&roof, HUT_ROOF, 0.0);
-        cx.stroke(&roof, RIM.with_alpha(0.6), &Stroke::new(edge));
+        ink.fill(&roof, HUT_ROOF);
+        ink.stroke(&roof, RIM.with_alpha(0.6), edge);
     }
 
     if chimney {
@@ -1324,8 +1380,8 @@ fn draw_hut(
             left + w * 0.30,
             base - h * 0.80,
         );
-        cx.fill(&stack, HUT_ROOF, 0.0);
-        cx.stroke(&stack, RIM.with_alpha(0.5), &Stroke::new(edge * 0.8));
+        ink.fill(&shape_path(&stack), HUT_ROOF);
+        ink.stroke(&shape_path(&stack), RIM.with_alpha(0.5), edge * 0.8);
     }
 
     if doored {
@@ -1334,7 +1390,7 @@ fn draw_hut(
         // opening far better than any attempt at perspective would.
         let (x0, x1) = (left + w * 0.30, left + w * 0.46);
         let top = base - h * 0.52;
-        cx.fill(&Rect::new(x0, top, x1, base), DOORWAY, 0.0);
+        ink.fill(&shape_path(&Rect::new(x0, top, x1, base)), DOORWAY);
         // Lamplight spills through the open door. The window gets all the
         // attention, but the door opening onto a lit room is the warmer cue —
         // it is what "he just got home" looks like from across the room.
@@ -1346,20 +1402,12 @@ fn draw_hut(
             0.0
         };
         if spill > 0.01 {
-            cx.fill(
-                &Rect::new(x0, top, x1, base),
-                LAMP.with_alpha(spill as f32),
-                0.0,
-            );
+            ink.fill(&shape_path(&Rect::new(x0, top, x1, base)), LAMP.with_alpha(spill as f32));
         }
         let panel = x1 - (x1 - x0) * door_open;
         if panel > x0 {
-            cx.fill(&Rect::new(x0, top, panel, base), HUT_ROOF, 0.0);
-            cx.stroke(
-                &Rect::new(x0, top, panel, base),
-                RIM.with_alpha(0.45),
-                &Stroke::new(edge * 0.6),
-            );
+            ink.fill(&shape_path(&Rect::new(x0, top, panel, base)), HUT_ROOF);
+            ink.stroke(&shape_path(&Rect::new(x0, top, panel, base)), RIM.with_alpha(0.45), edge * 0.6);
         }
     }
 
@@ -1369,8 +1417,8 @@ fn draw_hut(
         return;
     }
 
-    draw_window(cx, hut, block, lit, h);
-    draw_chimney_smoke(cx, hut, chimney_smoke(block.doing, block.place), frame, h);
+    draw_window(ink, hut, block, lit, h);
+    draw_chimney_smoke(ink, hut, chimney_smoke(block.doing, block.place), frame, h);
 }
 
 /// The window, and him behind it.
@@ -1380,7 +1428,7 @@ fn draw_hut(
 /// rectangle survives being three pixels tall, whereas a figure lit from
 /// outside is a grey smudge on a dark one.
 fn draw_window(
-    cx: &mut floem::context::PaintCx,
+    ink: &mut impl Ink,
     hut: &HutGeometry,
     block: &crate::routine::Block,
     lit: f64,
@@ -1390,27 +1438,19 @@ fn draw_window(
 
     if lit < 0.02 {
         // Dark glass still reads as glass — a hole in the wall would not.
-        cx.fill(&pane, Color::from_rgb8(11, 13, 18), 0.0);
-        cx.stroke(
-            &pane,
-            RIM.with_alpha(0.30),
-            &Stroke::new((h * 0.02).max(0.4)),
-        );
+        ink.fill(&shape_path(&pane), Color::from_rgb8(11, 13, 18));
+        ink.stroke(&shape_path(&pane), RIM.with_alpha(0.30), (h * 0.02).max(0.4));
         return;
     }
 
     // The spill first, under the pane: light does not stop at the frame.
-    cx.fill(
-        &Rect::new(
+    ink.fill(&shape_path(&Rect::new(
             pane.x0 - h * 0.10,
             pane.y0 - h * 0.10,
             pane.x1 + h * 0.10,
             pane.y1 + h * 0.10,
-        ),
-        LAMP_DEEP.with_alpha(0.16 * lit as f32),
-        0.0,
-    );
-    cx.fill(&pane, LAMP.with_alpha((0.55 + 0.4 * lit) as f32), 0.0);
+        )), LAMP_DEEP.with_alpha(0.16 * lit as f32));
+    ink.fill(&shape_path(&pane), LAMP.with_alpha((0.55 + 0.4 * lit) as f32));
 
     // Him, inside — a shape on the glass, occupying its lower half so he reads
     // as sitting at a table rather than floating.
@@ -1425,34 +1465,22 @@ fn draw_window(
     {
         let cx0 = pane.x0 + pane.width() * 0.55;
         let head = pane.y0 + pane.height() * 0.34;
-        cx.fill(
-            &Circle::new(Point::new(cx0, head), pane.height() * 0.15),
-            HUT_ROOF,
-            0.0,
-        );
+        ink.fill(&shape_path(&Circle::new(Point::new(cx0, head), pane.height() * 0.15)), HUT_ROOF);
         // Shoulders, and whatever is in front of him.
-        cx.fill(
-            &Rect::new(
+        ink.fill(&shape_path(&Rect::new(
                 cx0 - pane.width() * 0.22,
                 head + pane.height() * 0.12,
                 cx0 + pane.width() * 0.20,
                 pane.y1,
-            ),
-            HUT_ROOF,
-            0.0,
-        );
+            )), HUT_ROOF);
         if block.doing == Doing::Reading {
             // The book, edge-on and catching the lamp.
-            cx.fill(
-                &Rect::new(
+            ink.fill(&shape_path(&Rect::new(
                     cx0 - pane.width() * 0.44,
                     head + pane.height() * 0.22,
                     cx0 - pane.width() * 0.16,
                     head + pane.height() * 0.52,
-                ),
-                PAGE.with_alpha(0.85),
-                0.0,
-            );
+                )), PAGE.with_alpha(0.85));
         }
     }
 
@@ -1461,16 +1489,12 @@ fn draw_window(
     let mut bar = BezPath::new();
     bar.move_to(Point::new(mid, pane.y0));
     bar.line_to(Point::new(mid, pane.y1));
-    cx.stroke(&bar, HUT_ROOF, &Stroke::new((h * 0.03).max(0.6)));
-    cx.stroke(
-        &pane,
-        RIM.with_alpha(0.55),
-        &Stroke::new((h * 0.025).max(0.5)),
-    );
+    ink.stroke(&bar, HUT_ROOF, (h * 0.03).max(0.6));
+    ink.stroke(&shape_path(&pane), RIM.with_alpha(0.55), (h * 0.025).max(0.5));
 }
 
 fn draw_chimney_smoke(
-    cx: &mut floem::context::PaintCx,
+    ink: &mut impl Ink,
     hut: &HutGeometry,
     strength: f64,
     frame: u64,
@@ -1490,14 +1514,10 @@ fn draw_chimney_smoke(
         // Drifting as it climbs, and widening — smoke that went straight up in
         // a column would read as a chimney diagram.
         let drift = phase * phase * h * 0.30;
-        cx.fill(
-            &Circle::new(
+        ink.fill(&shape_path(&Circle::new(
                 Point::new(mouth.x + drift, mouth.y - rise),
                 (h * 0.05).max(0.7) * (0.6 + phase * 1.9),
-            ),
-            SMOKE.with_alpha((1.0 - phase) as f32 * 0.36 * strength as f32),
-            0.0,
-        );
+            )), SMOKE.with_alpha((1.0 - phase) as f32 * 0.36 * strength as f32));
     }
 }
 
