@@ -274,7 +274,7 @@ says in as many words that files with no functions must be recorded too. Sources
 now come from the documents the **indexer** saw, never from the nodes: 107 files
 → 114.
 
-### 5. Rendering
+### 5. Rendering — *not started; see `HANDOFF.md` §3 for the executable plan*
 floem `canvas` — precedent exists in `celestial.rs` and `squiggle.rs`.
 Layered layout (callers above, callee below, breadth-first from a focus node),
 bounded to ~60 visible nodes with "+N more" expansion. Click to re-focus, hover
@@ -284,7 +284,7 @@ text.
 *Largest single piece. Deliberately last, so everything under it is already
 proven.*
 
-### 6. Live linking
+### 6. Live linking — *not started; see `HANDOFF.md` §3*
 Nodes highlight as the agent reads files, edits them, and calls `symbol`.
 **Done when:** running a turn visibly lights the path the agent walked.
 *This is the part that makes it verification rather than decoration.*
