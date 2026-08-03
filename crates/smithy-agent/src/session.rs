@@ -107,6 +107,13 @@ pub struct Session {
     /// Cached portion of [`Self::last_prompt_tokens`], for the ledger's
     /// cached-vs-cold row.
     last_cached_tokens: i64,
+    /// `prompt_tokens / (chars/4)` from the session's **first** completion.
+    ///
+    /// Held for the life of the session so frozen rows stay literally frozen.
+    /// Recomputing every turn multiplies every row by a ratio that drifts with
+    /// the conversation's chars-per-token mix — a "fixed" label that moves,
+    /// and a genuinely varying prefix that looks identical to ordinary growth.
+    ledger_calibration: Option<f64>,
     system_base_chars: usize,
     project_context_chars: usize,
     /// Every reasoning block the model has produced, in order.
@@ -189,10 +196,10 @@ pub struct ContextSegment {
 
 /// Per-segment attribution for one prompt, plus cache / reasoning sidecars.
 ///
-/// Chars are measured locally; tokens are scaled so
-/// `segments.iter().map(|s| s.tokens).sum() == prompt_tokens`. That is what
-/// keeps the panel from contradicting the meter without introducing a
-/// tokenizer (`session.rs` forbids one).
+/// Chars are measured locally; tokens are scaled by the session's held
+/// calibration so frozen rows stay put and
+/// `segments.iter().map(|s| s.tokens).sum() == prompt_tokens`. Conversation
+/// absorbs the rounding residue. No tokenizer (`session.rs` forbids one).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContextLedger {
     pub segments: Vec<ContextSegment>,
@@ -206,18 +213,14 @@ pub struct ContextLedger {
     pub estimate_tokens: i64,
 }
 
-impl ContextLedger {
-    fn from_session(session: &Session) -> Self {
-        let system_chars = session.system_base_chars;
-        let project_chars = session.project_context_chars;
-        // The wire form already sits on the session as a Value; counting its
-        // JSON length is the schema the model sees.
-        let tools_chars = session.tools.to_string().len();
-
+impl Session {
+    /// Char counts for each ledger row, right now.
+    fn ledger_char_rows(&self) -> [(&'static str, usize, bool); 4] {
+        let tools_chars = self.tools.to_string().len();
         // Conversation = everything after the system message. Attachments
         // already live inside user messages; the panel adds a pending-chip
         // row from its own state.
-        let conversation_chars: usize = session
+        let conversation_chars: usize = self
             .history
             .messages()
             .iter()
@@ -230,29 +233,55 @@ impl ContextLedger {
                         .sum::<usize>()
             })
             .sum();
-
-        let reasoning_chars: usize = session.reasoning.iter().map(|e| e.text.len()).sum();
-
-        let rows: [(&'static str, usize, bool); 4] = [
-            ("System prompt", system_chars, true),
-            ("Project context", project_chars, true),
+        [
+            ("System prompt", self.system_base_chars, true),
+            ("Project context", self.project_context_chars, true),
             ("Tool schemas", tools_chars, true),
             ("Conversation", conversation_chars, false),
-        ];
+        ]
+    }
 
-        let total_chars: usize = rows.iter().map(|(_, c, _)| *c).sum();
-        let estimate_tokens = (total_chars as i64) / 4;
+    fn estimate_prompt_tokens(&self) -> i64 {
+        (self
+            .ledger_char_rows()
+            .iter()
+            .map(|(_, c, _)| *c)
+            .sum::<usize>() as i64)
+            / 4
+    }
+
+    /// Lock the chars→tokens scale on the first billed prompt.
+    fn capture_ledger_calibration(&mut self, prompt_tokens: i64) {
+        if self.ledger_calibration.is_some() || prompt_tokens <= 0 {
+            return;
+        }
+        let estimate = self.estimate_prompt_tokens();
+        if estimate > 0 {
+            self.ledger_calibration = Some(prompt_tokens as f64 / estimate as f64);
+        }
+    }
+}
+
+impl ContextLedger {
+    fn from_session(session: &Session) -> Self {
+        let rows = session.ledger_char_rows();
+        let reasoning_chars: usize = session.reasoning.iter().map(|e| e.text.len()).sum();
+
+        let estimate_tokens = session.estimate_prompt_tokens();
         let prompt_tokens = session.last_prompt_tokens;
         let cached_tokens = session.last_cached_tokens.min(prompt_tokens).max(0);
         let cold_tokens = (prompt_tokens - cached_tokens).max(0);
 
-        // Scale so the breakdown sums to the billed number. When there is no
-        // completion yet, fall back to the chars/4 estimate.
-        let calibration = if estimate_tokens > 0 && prompt_tokens > 0 {
-            prompt_tokens as f64 / estimate_tokens as f64
-        } else {
-            1.0
-        };
+        // Prefer the session-held scale. Falling back to a one-shot ratio is
+        // only for the gap before the first completion (or a resume that has
+        // not yet re-locked); never recompute once held — that is the drift.
+        let calibration = session.ledger_calibration.unwrap_or_else(|| {
+            if estimate_tokens > 0 && prompt_tokens > 0 {
+                prompt_tokens as f64 / estimate_tokens as f64
+            } else {
+                1.0
+            }
+        });
 
         let mut segments: Vec<ContextSegment> = rows
             .iter()
@@ -267,7 +296,8 @@ impl ContextLedger {
             })
             .collect();
 
-        // Fix rounding so the rows sum exactly to prompt_tokens when known.
+        // Residue lands on conversation — where growth actually is — so the
+        // rows still sum to the billed number and frozen counts stay put.
         if prompt_tokens > 0 {
             let sum: i64 = segments.iter().map(|s| s.tokens).sum();
             if let Some(last) = segments.last_mut() {
@@ -339,6 +369,7 @@ impl Session {
             usage: Usage::default(),
             last_prompt_tokens: 0,
             last_cached_tokens: 0,
+            ledger_calibration: None,
             system_base_chars: config.system_base_chars,
             project_context_chars: config.project_context_chars,
             reasoning: Vec::new(),
@@ -377,6 +408,7 @@ impl Session {
             usage: Usage::default(),
             last_prompt_tokens: 0,
             last_cached_tokens: 0,
+            ledger_calibration: None,
             system_base_chars: system_chars,
             project_context_chars: 0,
             reasoning: Vec::new(),
@@ -548,6 +580,9 @@ impl Session {
             self.usage.reasoning_tokens += completion.reasoning_tokens;
             self.last_prompt_tokens = completion.prompt_tokens;
             self.last_cached_tokens = completion.cached_tokens;
+            // First completion locks the scale. Capture before history grows
+            // further this turn so the ratio matches what was actually billed.
+            self.capture_ledger_calibration(completion.prompt_tokens);
 
             // Capture the reasoning *here*, not in the UI. The panel clears it
             // between turns and never had the whole of it anyway; this is the
@@ -1082,6 +1117,55 @@ mod tests {
                 .iter()
                 .any(|seg| seg.name == "Conversation" && !seg.frozen),
             "conversation must be live"
+        );
+    }
+
+    /// Frozen means fixed. Recomputing calibration each turn made system /
+    /// project / tools drift with the conversation's chars-per-token ratio —
+    /// the label lied, and a genuinely varying prefix looked the same.
+    #[tokio::test]
+    async fn frozen_ledger_rows_stay_put_across_completions() {
+        let (_t, mut s, _) = harness(vec![
+            answer_at("first", 4_000),
+            answer_at("second", 8_000),
+        ]);
+        s.run_turn("hi", None).await.unwrap();
+        let first = s.ledger();
+        let frozen_first: Vec<(&str, i64)> = first
+            .segments
+            .iter()
+            .filter(|seg| seg.frozen)
+            .map(|seg| (seg.name, seg.tokens))
+            .collect();
+        assert!(
+            !frozen_first.is_empty(),
+            "expected frozen segments after the first completion"
+        );
+
+        s.run_turn(
+            "a longer follow-up that grows the conversation enough that a \
+             per-turn recalibration would have moved every row",
+            None,
+        )
+        .await
+        .unwrap();
+        let second = s.ledger();
+        assert_eq!(second.prompt_tokens, 8_000);
+        let sum: i64 = second.segments.iter().map(|seg| seg.tokens).sum();
+        assert_eq!(
+            sum, second.prompt_tokens,
+            "residue still lands so the panel matches the meter"
+        );
+
+        let frozen_second: Vec<(&str, i64)> = second
+            .segments
+            .iter()
+            .filter(|seg| seg.frozen)
+            .map(|seg| (seg.name, seg.tokens))
+            .collect();
+        assert_eq!(
+            frozen_first, frozen_second,
+            "frozen token counts must be byte-identical across completions"
         );
     }
 
