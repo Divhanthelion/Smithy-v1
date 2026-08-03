@@ -65,6 +65,7 @@ pub struct Budget {
     steps: usize,
     last_prompt_tokens: i64,
     warned: bool,
+    warned_steps: bool,
 }
 
 impl Budget {
@@ -75,7 +76,36 @@ impl Budget {
             steps: 0,
             last_prompt_tokens: 0,
             warned: false,
+            warned_steps: false,
         }
+    }
+
+    /// The step at which the model is told to start wrapping up.
+    ///
+    /// Four-fifths of the way through. Late enough not to cut work short,
+    /// early enough that there is room to finish a file and say what is left.
+    fn wrap_up_step(&self) -> usize {
+        (self.limits.max_steps * 4) / 5
+    }
+
+    /// Whether this tick is the one that should carry a wrap-up warning.
+    ///
+    /// Fires once. A turn that died at the step ceiling used to do so with no
+    /// warning at all — the observed session stopped mid-implementation having
+    /// never been told it was running out, so it neither finished nor reported
+    /// what remained.
+    pub fn should_warn_steps(&mut self) -> Option<String> {
+        if self.warned_steps || self.steps < self.wrap_up_step() {
+            return None;
+        }
+        self.warned_steps = true;
+        let left = self.limits.max_steps.saturating_sub(self.steps);
+        Some(format!(
+            "You have used {} of {} tool calls for this turn; about {left} remain. Start \
+             finishing: verify what you have already changed, then reply with what is done and \
+             what is still outstanding. Do not begin new work you cannot complete.",
+            self.steps, self.limits.max_steps
+        ))
     }
 
     /// Call at the top of each loop iteration. `Err` means a ceiling was hit.
@@ -130,6 +160,62 @@ mod tests {
             context_hard: 200,
             max_parse_retries: 3,
         }
+    }
+
+    /// The turn that prompted this died at its step ceiling with no warning at
+    /// all — it neither finished nor said what was left. The nudge has to come
+    /// while there is still room to act on it.
+    #[test]
+    fn the_model_is_warned_before_the_step_ceiling_not_at_it() {
+        let mut b = Budget::new(Limits {
+            max_steps: 10,
+            ..limits()
+        });
+        let mut warned_at = None;
+        for step in 1..=10 {
+            b.tick().expect("within budget");
+            if b.should_warn_steps().is_some() && warned_at.is_none() {
+                warned_at = Some(step);
+            }
+        }
+        assert_eq!(warned_at, Some(8), "four-fifths of the way through");
+    }
+
+    /// Once only. A nudge repeated every step is noise the model learns to skip,
+    /// and it would be appended to history each time.
+    #[test]
+    fn the_step_warning_fires_exactly_once() {
+        let mut b = Budget::new(Limits {
+            max_steps: 5,
+            ..limits()
+        });
+        let mut warnings = 0;
+        for _ in 0..5 {
+            b.tick().ok();
+            if b.should_warn_steps().is_some() {
+                warnings += 1;
+            }
+        }
+        assert_eq!(warnings, 1);
+    }
+
+    /// It has to say what to do, not merely that time is short.
+    #[test]
+    fn the_step_warning_asks_for_a_wrap_up_and_a_status() {
+        let mut b = Budget::new(Limits {
+            max_steps: 10,
+            ..limits()
+        });
+        for _ in 0..8 {
+            b.tick().ok();
+        }
+        let warning = b.should_warn_steps().expect("warned");
+        assert!(warning.contains("remain"), "{warning}");
+        assert!(warning.contains("outstanding"), "{warning}");
+        assert!(
+            warning.contains("Do not begin new work"),
+            "starting something unfinishable is the failure being prevented: {warning}"
+        );
     }
 
     #[test]

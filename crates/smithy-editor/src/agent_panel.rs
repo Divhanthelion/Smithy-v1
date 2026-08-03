@@ -106,6 +106,11 @@ pub struct AgentPanelState {
     pub attachments: RwSignal<Vec<crate::attachment::Attachment>>,
     /// Whether a drag is currently over the panel. Drives the drop outline.
     pub drop_active: RwSignal<bool>,
+    /// Whether file edits skip the review modal and land directly.
+    ///
+    /// Mirrored by the app into an `AtomicBool` the write hook reads, because
+    /// the hook runs on the tokio side where floem signals cannot be touched.
+    pub auto_approve: RwSignal<bool>,
     /// The project root, for naming attachments relative to it.
     ///
     /// Lives here because the panel is the only thing that needs it and it
@@ -132,6 +137,7 @@ impl AgentPanelState {
             expanded: RwSignal::new(Vec::new()),
             attachments: RwSignal::new(Vec::new()),
             drop_active: RwSignal::new(false),
+            auto_approve: RwSignal::new(false),
             project_root: RwSignal::new(std::path::PathBuf::new()),
         }
     }
@@ -457,6 +463,35 @@ fn header(
         // Always available, never hidden behind a full context bar. A session
         // restored at launch reports zero tokens until its first turn while
         // remembering everything, which is precisely when you want this.
+        // Off by default, and it says which it is rather than only what it
+        // would become — a toggle that reads "Auto-approve" gives you no way to
+        // tell whether edits are currently being gated.
+        Label::derived(move || {
+            if state.auto_approve.get() {
+                format!("{} edits land directly", crate::design::glyph::WARN)
+            } else {
+                format!("{} edits reviewed", crate::design::glyph::OK)
+            }
+        })
+        .on_event_stop(floem::event::listener::Click, move |_, _| {
+            state.auto_approve.update(|v| *v = !*v)
+        })
+        .style(move |s| {
+            let on = state.auto_approve.get();
+            s.font_family(crate::design::SYMBOL.to_string())
+                .font_size(10.0)
+                .margin_right(6.0)
+                .padding_horiz(6.0)
+                .padding_vert(2.0)
+                .border_radius(3.0)
+                .cursor(floem::style::CursorStyle::Pointer)
+                .color(if on {
+                    catppuccin::PEACH
+                } else {
+                    catppuccin::SURFACE2
+                })
+                .hover(|s| s.background(catppuccin::SURFACE0))
+        }),
         Label::derived(|| "New session".to_string())
             .on_event_stop(floem::event::listener::Click, move |_, _| on_clear_context())
             .style(move |s| {

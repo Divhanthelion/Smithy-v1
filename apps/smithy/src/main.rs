@@ -217,6 +217,7 @@ fn app_view() -> impl IntoView {
     // Translate agent events into panel state, then connect in the background.
     setup_agent_effect(agent_state.clone());
     app_state::setup_shell_approval_effect(agent_state.clone());
+    app_state::setup_auto_approve_effect(agent_state.clone());
     connect_agent(&agent_state);
 
     // The microphone. Built once and shared: the button and the hotkey must
@@ -1016,13 +1017,32 @@ fn app_view() -> impl IntoView {
     // is immediate feedback for the user; the queued note reaches the model at
     // the head of its next turn, because by now its tool result is frozen in
     // history. See `agent::describe_review_outcome`.
+    // Deliver a review decision to whoever is waiting for it.
+    //
+    // The tool call is suspended inside `WriteReviewHook`, so the answer goes
+    // back as *its* result — that is the whole point of the blocking gate, and
+    // why this takes the `tool_call_id`. `outcomes` is now only the fallback for
+    // a decision nobody is waiting on (a review abandoned by a project switch,
+    // or one whose turn has already ended), where the next turn's preamble is
+    // still the only way to say what happened.
     let record_outcome = {
         let panel = agent_state.panel;
         let outcomes = agent_state.review.outcomes.clone();
-        move |path: &str, accepted: usize, total: usize| {
+        let review = agent_state.review.clone();
+        move |id: &str, path: &str, accepted: usize, total: usize| {
             let note = agent::describe_review_outcome(path, accepted, total);
             panel.push(smithy_editor::AgentEntry::Notice(note.clone()));
-            outcomes.borrow_mut().push(note);
+
+            let delivered = review.respond(
+                id,
+                app_state::ReviewOutcome {
+                    message: note.clone(),
+                    applied: accepted > 0,
+                },
+            );
+            if !delivered {
+                outcomes.borrow_mut().push(note);
+            }
         }
     };
 
@@ -1046,12 +1066,12 @@ fn app_view() -> impl IntoView {
             // every other write does.
             let root = project.borrow().root.clone();
             match agent::apply_change(&root, &diff.path, &content) {
-                Ok(()) => record_outcome(&diff.path, accepted, total),
+                Ok(()) => record_outcome(&id, &diff.path, accepted, total),
                 Err(e) => {
                     eprintln!("could not apply the accepted change to {}: {e}", diff.path);
                     // The write failed, so nothing landed. Telling the model it
                     // was accepted would be a lie it then edits against.
-                    record_outcome(&diff.path, 0, total);
+                    record_outcome(&id, &diff.path, 0, total);
                 }
             }
             advance_queue(id);
@@ -1063,7 +1083,7 @@ fn app_view() -> impl IntoView {
         let record_outcome = record_outcome.clone();
         move || {
             if let Some(change) = current_diff.get_untracked() {
-                record_outcome(change.path(), 0, change.diff.hunks.len());
+                record_outcome(&change.id, change.path(), 0, change.diff.hunks.len());
                 advance_queue(change.id);
             }
         }
@@ -1075,7 +1095,7 @@ fn app_view() -> impl IntoView {
     let on_diff_close = {
         move || {
             if let Some(change) = current_diff.get_untracked() {
-                record_outcome(change.path(), 0, change.diff.hunks.len());
+                record_outcome(&change.id, change.path(), 0, change.diff.hunks.len());
                 advance_queue(change.id);
             }
         }

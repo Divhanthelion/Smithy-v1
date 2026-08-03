@@ -50,6 +50,33 @@ pub struct StoredSession {
     pub sampling: Sampling,
     pub limits: Limits,
     pub messages: Vec<Message>,
+    /// The model's reasoning channel, kept **beside** the messages and never in
+    /// them.
+    ///
+    /// This is the whole trick. Reasoning must not enter [`History`] — the
+    /// endpoint does not replay it, and putting it there would change the cached
+    /// prefix on every turn, which is the one thing this crate is built not to
+    /// do. But discarding it entirely, which is what happened before, meant the
+    /// most interesting record of a long session was gone the moment the panel
+    /// cleared. A sidecar keeps both properties: `into_history` still
+    /// round-trips byte-exactly, and the traces survive.
+    ///
+    /// `#[serde(default)]` so every session written before this parses.
+    #[serde(default)]
+    pub reasoning: Vec<ReasoningEntry>,
+}
+
+/// One completion's reasoning, with enough context to line it up afterwards.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReasoningEntry {
+    /// Which step of which turn produced it.
+    pub step: usize,
+    /// How many messages were in the history when it was emitted, so a reader
+    /// can place it against the transcript.
+    pub after_message: usize,
+    /// Unix seconds.
+    pub at: u64,
+    pub text: String,
 }
 
 pub const SCHEMA_VERSION: u32 = 1;
@@ -62,6 +89,20 @@ impl StoredSession {
         history: &History,
         sampling: &Sampling,
         limits: &Limits,
+    ) -> StoredSession {
+        Self::from_history_with_reasoning(id, workspace, model, history, sampling, limits, Vec::new())
+    }
+
+    /// As [`StoredSession::from_history`], keeping the reasoning sidecar.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_history_with_reasoning(
+        id: impl Into<String>,
+        workspace: &Path,
+        model: &str,
+        history: &History,
+        sampling: &Sampling,
+        limits: &Limits,
+        reasoning: Vec<ReasoningEntry>,
     ) -> StoredSession {
         let now = unix_seconds();
         let messages = history.messages().to_vec();
@@ -76,6 +117,7 @@ impl StoredSession {
             sampling: sampling.clone(),
             limits: limits.clone(),
             messages,
+            reasoning,
         }
     }
 
@@ -100,7 +142,7 @@ fn derive_title(messages: &[Message]) -> String {
     }
 }
 
-fn unix_seconds() -> u64 {
+pub(crate) fn unix_seconds() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

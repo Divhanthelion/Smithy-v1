@@ -108,7 +108,16 @@ impl Tool for Glob {
         };
 
         if found.is_empty() {
-            return ToolOutput::ok(format!("No files match `{pattern}`."));
+            // Naming the ignore rules matters. A real session asked for
+            // `**/PLUGIN_PLAN.md` in a repository whose `.gitignore` held
+            // `*.md`; this said only "No files match", and the plan the user had
+            // asked to be implemented looked absent. It was there, and `read`
+            // could reach it — nothing said so.
+            return ToolOutput::ok(format!(
+                "No files match `{pattern}`. Note that this search skips anything the \
+                 repository ignores (`.gitignore`), so an ignored file will not appear here even \
+                 though it exists — if you were given an exact path, try `read` on it directly."
+            ));
         }
 
         let total = found.len();
@@ -302,5 +311,75 @@ mod tests {
             .run(&serde_json::json!({"pattern": "*.rs"}), &ctx)
             .await;
         assert!(!out.content.contains("ignored.rs"), "got: {}", out.content);
+    }
+}
+
+/// What the walker can and cannot see.
+///
+/// Written after a real session lost a step to it: the user asked the agent to
+/// implement `PLUGIN_PLAN.md`, `glob **/PLUGIN_PLAN.md` answered "No files
+/// match", and the plan was reachable only because the model guessed the exact
+/// path and used `read`. The repository's `.gitignore` contained `*.md`.
+///
+/// That is the walker behaving as designed — but the consequence is worth
+/// pinning down, because "the design document is invisible to search" is a
+/// surprising thing for a coding agent to be true of.
+#[cfg(test)]
+mod visibility {
+    use super::*;
+    use crate::sandbox::Workspace;
+
+    fn workspace_with(files: &[(&str, &str)]) -> (tempfile::TempDir, ToolCtx) {
+        let tmp = tempfile::tempdir().unwrap();
+        for (path, contents) in files {
+            let full = tmp.path().join(path);
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(full, contents).unwrap();
+        }
+        let ws = Workspace::open(tmp.path()).unwrap();
+        (tmp, ToolCtx::new(ws))
+    }
+
+    /// `**/` must match a file sitting at the workspace root, not only nested
+    /// ones. This was the first hypothesis for the miss above, and it is wrong —
+    /// which is worth keeping a test for so it stays wrong.
+    #[tokio::test]
+    async fn double_star_matches_a_file_at_the_workspace_root() {
+        let (_t, ctx) = workspace_with(&[("PLUGIN_PLAN.md", "# plan"), ("src/deep.md", "x")]);
+        let out = Glob
+            .run(&serde_json::json!({"pattern": "**/PLUGIN_PLAN.md"}), &ctx)
+            .await;
+        assert!(
+            out.content.contains("PLUGIN_PLAN.md"),
+            "`**/` must match at the root; got: {}",
+            out.content
+        );
+    }
+
+    /// The actual cause: an ignored file is invisible to `glob`, whether or not
+    /// the directory is a git checkout. `read` still reaches it by exact path,
+    /// which is the only reason that session recovered.
+    #[tokio::test]
+    async fn a_gitignored_file_is_invisible_to_glob() {
+        let (_t, ctx) = workspace_with(&[
+            (".gitignore", "*.md\n!README.md\n"),
+            ("PLUGIN_PLAN.md", "# plan"),
+            ("README.md", "# readme"),
+        ]);
+        let out = Glob
+            .run(&serde_json::json!({"pattern": "**/*.md"}), &ctx)
+            .await;
+        assert!(
+            !out.content.contains("PLUGIN_PLAN.md"),
+            "ignored files are excluded by design; got: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("README.md"),
+            "a negated rule must still be visible; got: {}",
+            out.content
+        );
     }
 }

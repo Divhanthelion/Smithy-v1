@@ -11,6 +11,8 @@
 //! Nothing in `smithy-agent` or `smithy-tools` touches a floem type.
 
 use smithy_project::{ContextBudget, Project};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -23,7 +25,7 @@ use smithy_agent::{
 use smithy_editor::{PendingChangeManager, PendingFileChange};
 use smithy_tools::{HookDecision, Registry, ToolCall, ToolCtx, ToolHook, Workspace};
 
-use crate::app_state::{AgentUiEvent, ShellApprovalRequest};
+use crate::app_state::{AgentUiEvent, ReviewOutcome, ShellApprovalRequest};
 
 /// Gate: a shell command needs the user's go-ahead before it runs.
 ///
@@ -72,13 +74,37 @@ impl ToolHook for ShellApprovalHook {
 
 /// Gate: a file write is captured for review instead of landing on disk.
 ///
-/// This intercepts `write` and `edit` *before* the tool runs, computes the diff
-/// against the current file, and queues it. The tool is then denied, so the
-/// model is told plainly that the change is awaiting review rather than being
-/// led to believe it succeeded.
+/// Intercepts `write` and `edit` *before* the tool runs, computes the diff
+/// against the current file, queues it, and **suspends the call until the user
+/// decides** — the same shape [`ShellApprovalHook`] has always had.
+///
+/// ## Why it blocks now
+///
+/// It used to queue the change and deny the tool, with the outcome delivered at
+/// the head of the *next* turn so that accepting a diff could not mutate the
+/// cached prefix. That reasoning about the prefix is still right, and the
+/// outcome still never rewrites an earlier message — but the conclusion drawn
+/// from it was wrong, because a turn is not a short thing. A measured session
+/// against a real plan made 25 edits inside a single 60-step turn: every one
+/// came back "waiting for the user to approve", none of them ever resolved
+/// within the turn, and the model spent 26 of its 76 tool calls re-editing files
+/// and polling them with `grep` and escalating `sleep`s to find out whether its
+/// work had landed. It had. It could not see that.
+///
+/// Suspending costs nothing the previous design was protecting: the answer
+/// arrives as this call's own result, which is appended like any other, and the
+/// prefix is untouched. What it buys is that the model is never guessing.
+///
+/// The cost that is real: a turn blocked here counts against `max_seconds`, so
+/// walking away mid-review will eventually end the turn. That is visible and
+/// recoverable, unlike the failure it replaces.
 pub struct WriteReviewHook {
     pub pending: Arc<Mutex<PendingChangeManager>>,
     pub notify: Sender<AgentUiEvent>,
+    /// Where the modal's answer comes back. Keyed by `tool_call_id`.
+    pub responders: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<ReviewOutcome>>>>,
+    /// When set, the gate is off entirely and writes go straight to disk.
+    pub auto_approve: Arc<AtomicBool>,
 }
 
 #[async_trait]
@@ -88,6 +114,13 @@ impl ToolHook for WriteReviewHook {
     }
 
     async fn before(&self, call: &ToolCall, args: &Value, ctx: &ToolCtx) -> HookDecision {
+        // The gate switched off: the tool runs and writes for itself, and this
+        // hook is not in the picture at all. Checked before any diffing, so the
+        // fuzzy cascade is not paid for a review nobody will see.
+        if self.auto_approve.load(Ordering::Relaxed) {
+            return HookDecision::Allow;
+        }
+
         let Some(path) = args.get("path").and_then(|v| v.as_str()) else {
             return HookDecision::Allow;
         };
@@ -141,30 +174,57 @@ impl ToolHook for WriteReviewHook {
         let display = ctx.workspace.display_path(path);
         let change = PendingFileChange::new(&call.id, &display, old_content, new_content);
 
+        // Register where the answer should come back *before* announcing the
+        // review, or a very fast click could resolve it against an empty map.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if let Ok(mut responders) = self.responders.lock() {
+            responders.insert(call.id.clone(), tx);
+        }
+
         if let Ok(mut pending) = self.pending.lock() {
             pending.add(change.clone());
         }
-        let _ = self.notify.send(AgentUiEvent::ReviewRequested(change));
+        if self.notify.send(AgentUiEvent::ReviewRequested(change)).is_err() {
+            // Nobody is listening, so nobody can approve. Failing closed matches
+            // shell approval: an unreviewable write must not become an
+            // unreviewed one.
+            if let Ok(mut responders) = self.responders.lock() {
+                responders.remove(&call.id);
+            }
+            return HookDecision::Deny(
+                "the review panel is unavailable, so this change could not be shown to the user. \
+                 Nothing was written."
+                    .to_string(),
+            );
+        }
 
-        // Worded against an observed failure, not in the abstract. The previous
-        // message said the change was "queued for review, do not retry", and a
-        // model read that as *the edit did not happen*: it reasoned "the user had
-        // edits queued but they weren't applied" and rewrote the whole file to
-        // compensate — duplicating both edits and queueing a third review.
-        //
-        // So it now says plainly that the edit succeeded and is waiting on a
-        // person, names rewriting as the specific wrong move, and says when the
-        // answer will arrive. "Do not retry" was too narrow: the model did not
-        // retry, it escalated.
-        HookDecision::Deny(format!(
-            "your edit to `{display}` was computed successfully and is now waiting for the user to \
-             approve it. Nothing has gone wrong and there is nothing to fix. Do not edit \
-             `{display}` again and do not rewrite it in full — a second change to the same file \
-             queues a second review of the same work. Continue with the rest of the task, or \
-             finish if it is done; you will be told whether this change was applied at the start \
-             of the next turn."
-        ))
+        // Suspend here. The whole point: the answer becomes this call's result,
+        // so the model is told what happened at the moment it asks rather than
+        // one turn later. See the type docs for the session this was written
+        // against.
+        match rx.await {
+            Ok(outcome) if outcome.applied => HookDecision::Fulfilled(outcome.message),
+            Ok(outcome) => HookDecision::Deny(outcome.message),
+            // The sender was dropped without answering — the modal went away.
+            // Reported as a refusal, since nothing was written.
+            Err(_) => HookDecision::Deny(format!(
+                "the review of `{display}` was dismissed without a decision, so nothing was \
+                 written. Ask the user how they would like to proceed rather than trying again."
+            )),
+        }
     }
+}
+
+/// The three pieces of review state the hook needs.
+///
+/// Bundled rather than passed as three parameters because they are only ever
+/// used together, and a `build_session` that took eight positional arguments was
+/// already one mistake from being unreadable.
+#[derive(Clone)]
+pub struct ReviewGate {
+    pub pending: Arc<Mutex<PendingChangeManager>>,
+    pub responders: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<ReviewOutcome>>>>,
+    pub auto_approve: Arc<AtomicBool>,
 }
 
 /// What the app needs to spin up an agent session.
@@ -195,7 +255,7 @@ pub async fn build_session(
     config: AgentConfig,
     events: Sender<AgentUiEvent>,
     shell_approval: Sender<ShellApprovalRequest>,
-    pending: Arc<Mutex<PendingChangeManager>>,
+    review: ReviewGate,
     resume_from: Option<smithy_agent::persist::StoredSession>,
 ) -> Result<AgentHandle, String> {
     // Both of these read the OS credential store, which is synchronous and can
@@ -246,11 +306,13 @@ pub async fn build_session(
         Some(_) => None,
         None => {
             let context_project = project.clone();
-            let extracted = tokio::task::spawn_blocking(move || {
-                context_project.context(ContextBudget::standard())
-            })
-            .await
-            .map_err(|e| format!("project scan failed: {e}"))?;
+            // Sized against the window this model actually has, rather than the
+            // flat 6k every model used to get. See `ContextBudget::for_window`.
+            let budget = ContextBudget::for_window(info.as_ref().and_then(|i| i.context_length));
+            let extracted =
+                tokio::task::spawn_blocking(move || context_project.context(budget))
+                    .await
+                    .map_err(|e| format!("project scan failed: {e}"))?;
             for warning in &extracted.warnings {
                 eprintln!("[project] {warning}");
             }
@@ -290,8 +352,10 @@ pub async fn build_session(
     )));
 
     registry.add_hook(Box::new(WriteReviewHook {
-        pending,
+        pending: review.pending,
         notify: events.clone(),
+        responders: review.responders,
+        auto_approve: review.auto_approve,
     }));
     registry.add_hook(Box::new(ShellApprovalHook { tx: shell_approval }));
 
@@ -337,25 +401,25 @@ pub async fn build_session(
             let id = stored.id.clone();
             let sampling = stored.sampling.clone();
             let stored_limits = stored.limits.clone();
+            // Carried across the resume so a session's traces accumulate rather
+            // than restarting from empty every time the editor is reopened.
+            let stored_reasoning = stored.reasoning.clone();
             let history = stored.into_history();
             let entries = smithy_agent::transcript(&history);
             let effective_limits = match &info {
                 Some(info) if info.context_length.is_some() => limits.clone(),
                 _ => stored_limits,
             };
-            (
-                Session::resume(
-                    provider.clone(),
-                    Arc::new(registry),
-                    ctx,
-                    history,
-                    sampling,
-                    effective_limits.clone(),
-                ),
-                entries,
-                Some(id),
-                effective_limits,
-            )
+            let mut session = Session::resume(
+                provider.clone(),
+                Arc::new(registry),
+                ctx,
+                history,
+                sampling,
+                effective_limits.clone(),
+            );
+            session.restore_reasoning(stored_reasoning);
+            (session, entries, Some(id), effective_limits)
         }
         None => (
             Session::new(provider.clone(), Arc::new(registry), ctx, config),
@@ -642,72 +706,270 @@ mod hook_tests {
         ToolCall::new(id, name, "{}")
     }
 
+    /// The hook is shared rather than owned so a test can hold it while a
+    /// spawned task awaits inside it — which is now the ordinary case, because
+    /// `before` suspends until the review is answered.
+    #[derive(Clone)]
     struct Harness {
-        hook: WriteReviewHook,
+        hook: Arc<WriteReviewHook>,
         pending: Arc<Mutex<PendingChangeManager>>,
+        responders: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<ReviewOutcome>>>>,
+        auto_approve: Arc<AtomicBool>,
         events: crossbeam_channel::Receiver<AgentUiEvent>,
     }
 
     fn write_hook() -> Harness {
         let pending = Arc::new(Mutex::new(PendingChangeManager::new()));
+        let responders = Arc::new(Mutex::new(HashMap::new()));
+        let auto_approve = Arc::new(AtomicBool::new(false));
         let (tx, events) = unbounded();
         Harness {
-            hook: WriteReviewHook {
+            hook: Arc::new(WriteReviewHook {
                 pending: pending.clone(),
                 notify: tx,
-            },
+                responders: responders.clone(),
+                auto_approve: auto_approve.clone(),
+            }),
             pending,
+            responders,
+            auto_approve,
             events,
         }
+    }
+
+    impl Harness {
+        /// Answer whatever review is waiting on `id`, the way the modal does.
+        fn answer(&self, id: &str, message: &str, applied: bool) {
+            let tx = self
+                .responders
+                .lock()
+                .unwrap()
+                .remove(id)
+                .unwrap_or_else(|| panic!("nothing was waiting on `{id}`"));
+            tx.send(ReviewOutcome {
+                message: message.to_string(),
+                applied,
+            })
+            .expect("the hook is still listening");
+        }
+
+        /// Wait until the hook has registered a responder for `id`.
+        ///
+        /// The hook runs on another task and there is no completion signal
+        /// before it suspends, so this polls. Bounded so a genuine failure ends
+        /// the test rather than hanging it.
+        async fn wait_for_review(&self, id: &str) {
+            for _ in 0..200 {
+                if self.responders.lock().unwrap().contains_key(id) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            panic!("no review was ever raised for `{id}`");
+        }
+    }
+
+    /// Drive one gated call to completion: spawn it, wait for the review, answer
+    /// it, and return what the model would have seen.
+    async fn reviewed(
+        h: &Harness,
+        ctx: &Arc<ToolCtx>,
+        call_id: &str,
+        name: &str,
+        args: serde_json::Value,
+        message: &str,
+        applied: bool,
+    ) -> HookDecision {
+        let hook = h.hook.clone();
+        let ctx = ctx.clone();
+        let call = call(call_id, name);
+        let task = tokio::spawn(async move { hook.before(&call, &args, &ctx).await });
+
+        h.wait_for_review(call_id).await;
+        h.answer(call_id, message, applied);
+        task.await.expect("the hook task completed")
     }
 
     fn denial(decision: &HookDecision) -> &str {
         match decision {
             HookDecision::Deny(reason) => reason,
             HookDecision::Allow => panic!("expected a denial, got Allow"),
+            HookDecision::Fulfilled(m) => panic!("expected a denial, got Fulfilled({m})"),
         }
     }
 
     // ---- WriteReviewHook -------------------------------------------------
 
-    /// The whole point of the gate: the model's write must not reach disk, and
-    /// the model must be told so rather than being allowed to believe it landed.
+    /// The whole point of the gate: the model's write must not reach disk on its
+    /// own, and the call must suspend rather than returning a guess.
     #[tokio::test]
-    async fn a_write_is_queued_and_denied_rather_than_reaching_disk() {
+    async fn a_write_is_queued_and_the_call_waits_for_a_decision() {
         let (_dir, ctx) = workspace();
         let h = write_hook();
 
-        let decision = h
-            .hook
-            .before(
+        let hook = h.hook.clone();
+        let ctx_for_task = ctx.clone();
+        let task = tokio::spawn(async move {
+            hook.before(
                 &call("c1", "write"),
                 &serde_json::json!({ "path": "src/new.rs", "content": "fn main() {}\n" }),
-                &ctx,
+                &ctx_for_task,
             )
-            .await;
+            .await
+        });
 
+        h.wait_for_review("c1").await;
+        assert!(
+            !task.is_finished(),
+            "the call must still be suspended while the review is open — returning early is \
+             exactly the bug this replaced"
+        );
         assert!(
             !ctx.workspace.exists("src/new.rs"),
             "the gate must not let the write through"
         );
         assert_eq!(h.pending.lock().unwrap().queued().len(), 1);
-        // The wording is asserted because a real model got the previous wording
-        // wrong in a specific way: it read "queued for review" as "the edit
-        // failed" and rewrote the whole file to compensate, queueing a second
-        // review of the same work.
+
+        h.answer("c1", "applied in full", true);
+        assert!(matches!(
+            task.await.expect("completed"),
+            HookDecision::Fulfilled(_)
+        ));
+    }
+
+    /// An approved change comes back as a **success**, not an error.
+    ///
+    /// This is the finding the blocking gate exists for. A measured session
+    /// against a real plan made 25 edits in one turn, every one answered
+    /// "waiting for the user to approve" — an error, from the model's side — and
+    /// it spent 26 of 76 tool calls re-editing and polling files whose edits had
+    /// in fact been approved and written. Success has to read as success.
+    #[tokio::test]
+    async fn an_approved_change_is_reported_as_success() {
+        let (_dir, ctx) = workspace();
+        let h = write_hook();
+
+        let decision = reviewed(
+            &h,
+            &ctx,
+            "c1",
+            "write",
+            serde_json::json!({ "path": "a.rs", "content": "x\n" }),
+            "Your change to `a.rs` was accepted in full and is now on disk.",
+            true,
+        )
+        .await;
+
+        match decision {
+            HookDecision::Fulfilled(message) => {
+                assert!(message.contains("accepted in full"), "{message}");
+                assert!(
+                    !message.contains("was not run"),
+                    "the registry must not prefix a fulfilled call with a failure: {message}"
+                );
+            }
+            other => panic!("an approved change must be a success, got {other:?}"),
+        }
+    }
+
+    /// A rejected change is an error, so the model stops rather than assuming.
+    #[tokio::test]
+    async fn a_rejected_change_is_reported_as_a_refusal() {
+        let (_dir, ctx) = workspace();
+        let h = write_hook();
+
+        let decision = reviewed(
+            &h,
+            &ctx,
+            "c1",
+            "write",
+            serde_json::json!({ "path": "a.rs", "content": "x\n" }),
+            "Your proposed change to `a.rs` was rejected. The file is unchanged.",
+            false,
+        )
+        .await;
+
+        assert!(denial(&decision).contains("rejected"));
+    }
+
+    /// Dismissing the modal drops the sender. The call must resolve rather than
+    /// hanging for the rest of the turn.
+    #[tokio::test]
+    async fn dismissing_the_review_resolves_the_call_as_refused() {
+        let (_dir, ctx) = workspace();
+        let h = write_hook();
+
+        let hook = h.hook.clone();
+        let ctx_for_task = ctx.clone();
+        let task = tokio::spawn(async move {
+            hook.before(
+                &call("c1", "write"),
+                &serde_json::json!({ "path": "a.rs", "content": "x\n" }),
+                &ctx_for_task,
+            )
+            .await
+        });
+
+        h.wait_for_review("c1").await;
+        drop(h.responders.lock().unwrap().remove("c1")); // the modal went away
+
+        let decision = task.await.expect("completed");
         let reason = denial(&decision);
+        assert!(reason.contains("dismissed"), "{reason}");
         assert!(
-            reason.contains("waiting for the user"),
-            "the model must be told the edit succeeded and is pending, not that it failed: {reason}"
+            reason.contains("nothing was written"),
+            "the model must know disk is untouched: {reason}"
+        );
+    }
+
+    /// With the gate off the tool runs normally — no diff, no queue, no wait.
+    #[tokio::test]
+    async fn auto_approve_lets_the_write_through_untouched() {
+        let (_dir, ctx) = workspace();
+        let h = write_hook();
+        h.auto_approve.store(true, Ordering::Relaxed);
+
+        let decision = h
+            .hook
+            .before(
+                &call("c1", "write"),
+                &serde_json::json!({ "path": "a.rs", "content": "x\n" }),
+                &ctx,
+            )
+            .await;
+
+        assert!(matches!(decision, HookDecision::Allow));
+        assert!(
+            h.pending.lock().unwrap().is_empty(),
+            "nothing should be queued when the gate is off"
         );
         assert!(
-            reason.contains("nothing to fix"),
-            "a model that thinks something broke will try to repair it: {reason}"
+            h.responders.lock().unwrap().is_empty(),
+            "and nothing should be left waiting"
         );
+    }
+
+    /// If the UI channel is gone there is nobody to approve anything, so the
+    /// write must fail closed rather than becoming an unreviewed write.
+    #[tokio::test]
+    async fn a_dead_ui_channel_refuses_rather_than_writing() {
+        let (_dir, ctx) = workspace();
+        let h = write_hook();
+        drop(h.events); // the UI has gone away
+
+        let decision = h
+            .hook
+            .before(
+                &call("c1", "write"),
+                &serde_json::json!({ "path": "a.rs", "content": "x\n" }),
+                &ctx,
+            )
+            .await;
+
+        assert!(denial(&decision).contains("Nothing was written"));
         assert!(
-            reason.contains("rewrite it in full"),
-            "rewriting is the escalation actually observed, so it has to be named by \
-             itself — \"do not retry\" did not cover it: {reason}"
+            h.responders.lock().unwrap().is_empty(),
+            "a responder left behind would leak for the life of the session"
         );
     }
 
@@ -717,13 +979,16 @@ mod hook_tests {
         let (_dir, ctx) = workspace();
         let h = write_hook();
 
-        h.hook
-            .before(
-                &call("c1", "write"),
-                &serde_json::json!({ "path": "a.rs", "content": "x\n" }),
-                &ctx,
-            )
-            .await;
+        reviewed(
+            &h,
+            &ctx,
+            "c1",
+            "write",
+            serde_json::json!({ "path": "a.rs", "content": "x\n" }),
+            "accepted",
+            true,
+        )
+        .await;
 
         match h.events.try_recv() {
             Ok(AgentUiEvent::ReviewRequested(change)) => {
@@ -742,13 +1007,16 @@ mod hook_tests {
         let h = write_hook();
 
         for (id, content) in [("c1", "first\n"), ("c2", "second\n")] {
-            h.hook
-                .before(
-                    &call(id, "write"),
-                    &serde_json::json!({ "path": "a.rs", "content": content }),
-                    &ctx,
-                )
-                .await;
+            reviewed(
+                &h,
+                &ctx,
+                id,
+                "write",
+                serde_json::json!({ "path": "a.rs", "content": content }),
+                "accepted",
+                true,
+            )
+            .await;
         }
 
         let queued = h.pending.lock().unwrap();
@@ -767,20 +1035,21 @@ mod hook_tests {
             .expect("seed");
         let h = write_hook();
 
-        let decision = h
-            .hook
-            .before(
-                &call("c1", "edit"),
-                &serde_json::json!({
-                    "path": "lib.rs",
-                    "old_string": "fn b() {}",
-                    "new_string": "fn b() { todo!() }"
-                }),
-                &ctx,
-            )
-            .await;
+        reviewed(
+            &h,
+            &ctx,
+            "c1",
+            "edit",
+            serde_json::json!({
+                "path": "lib.rs",
+                "old_string": "fn b() {}",
+                "new_string": "fn b() { todo!() }"
+            }),
+            "rejected",
+            false,
+        )
+        .await;
 
-        denial(&decision);
         let queued = h.pending.lock().unwrap();
         let diff = &queued.queued()[0].diff;
         assert_eq!(
@@ -908,13 +1177,16 @@ mod hook_tests {
         let (_dir, ctx) = workspace();
         let h = write_hook();
 
-        h.hook
-            .before(
-                &call("c1", "write"),
-                &serde_json::json!({ "path": "brand/new.rs", "content": "fn main() {}\n" }),
-                &ctx,
-            )
-            .await;
+        reviewed(
+            &h,
+            &ctx,
+            "c1",
+            "write",
+            serde_json::json!({ "path": "brand/new.rs", "content": "fn main() {}\n" }),
+            "accepted",
+            true,
+        )
+        .await;
 
         let queued = h.pending.lock().unwrap();
         let diff = &queued.queued()[0].diff;

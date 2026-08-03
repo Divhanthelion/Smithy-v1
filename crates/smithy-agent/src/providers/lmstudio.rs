@@ -354,12 +354,110 @@ impl ModelInfo {
         crate::limits::Limits {
             context_hard: (ctx as f64 * 0.85) as i64,
             context_warn: (ctx as f64 * 0.25) as i64,
+            max_steps: steps_for_context(ctx),
             ..defaults
         }
     }
 }
 
+/// How many tool calls one turn may make, given the model's context window.
+///
+/// The step ceiling used to be a flat 60 no matter what, while the context
+/// ceiling scaled — so a million-token model got the budget picked for a local
+/// 32k one. A measured session died at exactly 60 steps mid-implementation
+/// having used **6.3% of its context budget**. The ceiling was stopping healthy
+/// work, not a runaway loop.
+///
+/// Grows sublinearly and caps hard. The step limit is a backstop against a loop,
+/// not a target: the wall clock and the context ceiling are the budgets that
+/// should ordinarily bind, and a genuinely stuck agent must still be stopped in
+/// finite time.
+fn steps_for_context(context_length: i64) -> usize {
+    const BASELINE_CONTEXT: i64 = 32_768;
+    const BASELINE_STEPS: usize = 60;
+    const PER_DOUBLING: usize = 30;
+    const CEILING: usize = 300;
 
+    if context_length <= BASELINE_CONTEXT {
+        return BASELINE_STEPS;
+    }
+    // One increment per *whole* doubling past the baseline:
+    //   32k→60, 64k→90, 128k→120, 256k→150, 512k→180, 1,048,576→210.
+    // Note the floor: DeepSeek advertises 1,000,000 rather than 1 MiB, which is
+    // 4.93 doublings and so earns 180, not 210. Rounding down is the right
+    // direction for a backstop.
+    let doublings = ((context_length as f64) / (BASELINE_CONTEXT as f64)).log2().floor() as usize;
+    (BASELINE_STEPS + doublings * PER_DOUBLING).min(CEILING)
+}
+
+
+
+#[cfg(test)]
+mod step_budget_tests {
+    use super::*;
+
+    fn info(context_length: Option<i64>) -> ModelInfo {
+        ModelInfo {
+            context_length,
+            ..Default::default()
+        }
+    }
+
+    /// The regression: a 1M-context model got the 60-step budget chosen for a
+    /// 32k one, and a real session died at exactly 60 having used 6% of its
+    /// context.
+    /// The regression: a 1M-context model got the 60-step budget chosen for a
+    /// 32k one, and a real session died at exactly 60 having used 6% of its
+    /// context.
+    #[test]
+    fn a_larger_window_earns_more_steps() {
+        let small = info(Some(32_768)).suggested_limits().max_steps;
+        let deepseek = info(Some(1_000_000)).suggested_limits().max_steps;
+        assert_eq!(small, 60, "the baseline is preserved");
+        assert_eq!(deepseek, 180, "three times the budget the failed session had");
+    }
+
+    #[test]
+    fn the_step_budget_grows_per_doubling() {
+        assert_eq!(steps_for_context(32_768), 60);
+        assert_eq!(steps_for_context(65_536), 90);
+        assert_eq!(steps_for_context(131_072), 120);
+        assert_eq!(steps_for_context(262_144), 150);
+        assert_eq!(steps_for_context(1_048_576), 210);
+    }
+
+    /// Only whole doublings count, so an advertised "1M" that is not 1 MiB
+    /// rounds down rather than up. Rounding down is right for a backstop.
+    #[test]
+    fn a_partial_doubling_rounds_down() {
+        assert_eq!(steps_for_context(1_000_000), 180);
+        assert_eq!(steps_for_context(60_000), 60, "just under the first doubling");
+    }
+
+    /// A backstop that grew without bound would stop being a backstop.
+    #[test]
+    fn the_step_budget_is_capped() {
+        assert_eq!(steps_for_context(i64::MAX / 4), 300);
+        assert!(steps_for_context(1_000_000) <= 300);
+    }
+
+    /// A tiny window must not get *fewer* steps than the baseline — the ceiling
+    /// is protection against a loop, not a handicap.
+    #[test]
+    fn a_small_window_keeps_the_baseline() {
+        assert_eq!(steps_for_context(4_096), 60);
+        assert_eq!(steps_for_context(1), 60);
+    }
+
+    /// An endpoint that reports nothing falls back to the defaults whole.
+    #[test]
+    fn an_unknown_window_uses_the_defaults() {
+        let limits = info(None).suggested_limits();
+        let defaults = crate::limits::Limits::default();
+        assert_eq!(limits.max_steps, defaults.max_steps);
+        assert_eq!(limits.context_hard, defaults.context_hard);
+    }
+}
 
 /// Extract the `id` of every entry in a `/v1/models` response.
 fn parse_model_ids(body: &str) -> Vec<String> {

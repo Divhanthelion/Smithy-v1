@@ -116,6 +116,25 @@ project doesn't paste `target/` or `.env` into a prompt. Binaries and anything
 over 256 kB are named rather than inlined, so the agent knows they exist and can
 `read` a slice.
 
+### Reviewing what the agent writes
+
+Every `edit` and `write` is held for review: the diff modal opens and **the
+agent's tool call waits for your decision**, then hears the real outcome —
+"accepted in full", "3 of 5 hunks", "rejected" — as that call's own result.
+
+That waiting is the point. It used to queue the change, tell the model "waiting
+for the user to approve", and deliver the outcome only at the start of the *next*
+turn. Inside one long turn the model therefore never learned whether anything had
+landed. A measured session made 25 edits in a single turn and spent **26 of its
+76 tool calls** re-editing files and polling them with `grep` and escalating
+`sleep`s, trying to find out. The edits had all been approved and written.
+
+The trade: a turn blocked on a review counts against its wall-clock budget, so
+walking away mid-review will eventually end the turn. The header says which mode
+you are in — **`✓ edits reviewed`** or **`⚠ edits land directly`**. Click it to
+switch. Auto-approve is worth it for a long implementation run against a plan you
+have already read; it skips the modal entirely.
+
 **New session** in the panel header (or **Agent → New Session**) is the one that
 forgets. The `↺` icon beside it only clears the transcript you're looking at —
 the model still remembered everything. New Session throws away the history, the
@@ -289,6 +308,36 @@ rest have no UI and are read every time.
 
 The dictation hotkey is stored in `~/.local/share/smithy/voice-hotkey` as the
 string you'd type — `cmd+shift+v`, any order, any case. Edit it to rebind.
+
+## Reading back a session
+
+Every conversation is written to
+`~/.local/share/smithy/projects/<project>/sessions/*.json` — the whole thing,
+every tool call and result. The model's **reasoning** is stored beside the
+messages rather than inside them, so the transcript still replays byte-for-byte
+into a warm prefix cache while the thinking survives the session.
+
+```bash
+cargo run -p smithy-agent --example transcript -- list
+```
+
+Then `show <FILE> --reasoning` to read one in the terminal, or
+`md <FILE> > session.md` to export it with reasoning in collapsible blocks.
+
+Reasoning only exists for sessions recorded after this was added; older files
+list `0` and replay without it.
+
+## Budgets
+
+A turn stops on whichever ceiling it reaches first: tool calls, wall clock, or
+context. The step ceiling **scales with the model's context window** — 60 at 32k,
+120 at 128k, 180 at 1M — because a flat 60 killed a turn that had used 6% of its
+context budget. At four-fifths of the way through, the agent is told how many
+calls remain and asked to finish and report what is outstanding, rather than
+being cut off mid-edit with no warning.
+
+Project context scales the same way: ~5% of the window rather than a flat 6k
+tokens, floored at the old value and capped at 40k.
 
 ---
 

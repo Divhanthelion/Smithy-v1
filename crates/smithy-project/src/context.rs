@@ -68,6 +68,33 @@ impl ContextBudget {
     pub fn compact() -> Self {
         Self::from_tokens(1_500)
     }
+
+    /// Size the block against the model's actual context window.
+    ///
+    /// The app used to pass [`ContextBudget::standard`] unconditionally, so the
+    /// project description was ~6k tokens whether the model had 32k of room or a
+    /// million. On a large window that is a rounding error being treated as a
+    /// constraint: a measured session against a 1M-token model went in with a
+    /// 1,550-token system prompt and then spent tool calls rediscovering the
+    /// layout it could have been handed.
+    ///
+    /// Five per cent of the window, clamped. The floor keeps a small model's
+    /// context honest — the layers below [`compact`] stop being a usable map at
+    /// all. The ceiling exists because this block is prefilled on *every*
+    /// request of the session, so past a point more of it buys less than the
+    /// tokens would buy elsewhere, and because the extraction itself grows with
+    /// the workspace rather than with the window.
+    pub fn for_window(context_length: Option<i64>) -> Self {
+        const SHARE: f64 = 0.05;
+        const FLOOR_TOKENS: usize = 6_000;
+        const CEILING_TOKENS: usize = 40_000;
+
+        let Some(window) = context_length.filter(|w| *w > 0) else {
+            return Self::standard();
+        };
+        let tokens = ((window as f64) * SHARE) as usize;
+        Self::from_tokens(tokens.clamp(FLOOR_TOKENS, CEILING_TOKENS))
+    }
 }
 
 impl Default for ContextBudget {
@@ -422,6 +449,63 @@ fn fingerprint_str(s: &str) -> u64 {
         hash = hash.wrapping_mul(0x100_0000_01b3);
     }
     hash
+}
+
+#[cfg(test)]
+mod window_budget_tests {
+    use super::*;
+
+    /// The regression: a flat 6k block regardless of window, so a million-token
+    /// model was handed the same map as a 32k one.
+    #[test]
+    fn a_larger_window_earns_a_larger_block() {
+        let small = ContextBudget::for_window(Some(32_768)).max_chars;
+        let large = ContextBudget::for_window(Some(1_000_000)).max_chars;
+        assert!(large > small, "1M got {large}, 32k got {small}");
+    }
+
+    /// The floor: below it the API layer starts being dropped and the block
+    /// stops being a usable map, so a small window keeps the old standard.
+    #[test]
+    fn a_small_window_never_drops_below_the_standard_block() {
+        for window in [4_096, 8_192, 32_768, 100_000] {
+            assert_eq!(
+                ContextBudget::for_window(Some(window)).max_chars,
+                ContextBudget::standard().max_chars,
+                "{window} should keep the standard floor"
+            );
+        }
+    }
+
+    /// The ceiling: this block is prefilled on every request of the session, so
+    /// it must not scale without bound.
+    #[test]
+    fn a_huge_window_is_capped() {
+        let capped = ContextBudget::for_window(Some(100_000_000)).max_chars;
+        assert_eq!(capped, ContextBudget::from_tokens(40_000).max_chars);
+    }
+
+    #[test]
+    fn five_percent_of_the_window_is_what_lands_between_the_bounds() {
+        // 400k window → 20k tokens, comfortably inside both bounds.
+        assert_eq!(
+            ContextBudget::for_window(Some(400_000)).max_chars,
+            ContextBudget::from_tokens(20_000).max_chars
+        );
+    }
+
+    /// An endpoint that reports no window must not produce a zero-size budget,
+    /// which would drop every layer including the layout.
+    #[test]
+    fn an_unknown_or_nonsense_window_falls_back_to_the_standard() {
+        for window in [None, Some(0), Some(-1)] {
+            assert_eq!(
+                ContextBudget::for_window(window).max_chars,
+                ContextBudget::standard().max_chars,
+                "{window:?} must fall back rather than produce an empty context"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

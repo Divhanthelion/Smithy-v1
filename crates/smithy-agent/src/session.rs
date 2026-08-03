@@ -77,6 +77,15 @@ pub struct Session {
     limits: Limits,
     /// Cooperative cancellation for the Stop button. See [`Stopper`].
     cancel: Arc<Mutex<CancellationToken>>,
+    /// Every reasoning block the model has produced, in order.
+    ///
+    /// **Deliberately not in [`History`].** The endpoint does not replay
+    /// reasoning, and putting it in history would change the cached prefix on
+    /// every turn — the one thing this crate is built not to do. Kept here so it
+    /// can be persisted alongside the transcript instead of being discarded,
+    /// which is what used to happen: the traces vanished the moment the panel
+    /// cleared, and a long session's most legible record went with them.
+    reasoning: Vec<crate::persist::ReasoningEntry>,
 }
 
 /// What `Outcome::Stopped` says when the user pressed Stop. A constant because
@@ -128,6 +137,7 @@ impl Session {
             sampling: config.sampling,
             limits: config.limits,
             cancel: Arc::new(Mutex::new(CancellationToken::new())),
+            reasoning: Vec::new(),
         }
     }
 
@@ -153,6 +163,7 @@ impl Session {
             sampling,
             limits,
             cancel: Arc::new(Mutex::new(CancellationToken::new())),
+            reasoning: Vec::new(),
         }
     }
 
@@ -201,6 +212,20 @@ impl Session {
         &self.sampling
     }
 
+    /// Every reasoning block the model has produced, for persistence.
+    pub fn reasoning(&self) -> &[crate::persist::ReasoningEntry] {
+        &self.reasoning
+    }
+
+    /// Restore a reasoning log alongside a resumed history.
+    ///
+    /// Separate from [`Session::resume`] because reasoning is *not* part of the
+    /// history contract: a session restored without it is still correct, just
+    /// missing its earlier traces.
+    pub fn restore_reasoning(&mut self, entries: Vec<crate::persist::ReasoningEntry>) {
+        self.reasoning = entries;
+    }
+
     pub async fn preflight(&self) -> Result<(), ProviderError> {
         self.provider.preflight().await
     }
@@ -245,6 +270,20 @@ impl Session {
                 return Ok(Outcome::Stopped(stop.to_string()));
             }
 
+            // Tell the model it is running out of steps, once, while it still
+            // has room to act on it. Appended here and nowhere else: this is the
+            // one point in the loop where the previous step's tool results are
+            // all present and the next request has not been built, so inserting
+            // a message cannot come between an assistant's `tool_calls` and the
+            // results that must immediately follow them.
+            //
+            // Append-only is preserved — nothing earlier is rewritten — so the
+            // cached prefix stays valid.
+            if let Some(warning) = budget.should_warn_steps() {
+                self.history.push(Message::user(&warning));
+                emit(events, TurnEvent::Warning(warning));
+            }
+
             // Checkpoint 2. Nothing is appended until the model call returns, so
             // abandoning it mid-stream leaves the history byte-identical to what
             // it was before the request — which is what keeps the cached prefix
@@ -257,6 +296,19 @@ impl Session {
                 }
                 result = self.complete(events) => result?,
             };
+
+            // Capture the reasoning *here*, not in the UI. The panel clears it
+            // between turns and never had the whole of it anyway; this is the
+            // one place the complete block exists. It goes into a sidecar and
+            // never into `history` — see the field's docs.
+            if !completion.reasoning.trim().is_empty() {
+                self.reasoning.push(crate::persist::ReasoningEntry {
+                    step: budget.step(),
+                    after_message: self.history.len(),
+                    at: crate::persist::unix_seconds(),
+                    text: completion.reasoning.clone(),
+                });
+            }
 
             if let Some(warning) = budget.record_prompt_tokens(completion.prompt_tokens) {
                 emit(events, TurnEvent::Warning(warning));
@@ -447,6 +499,10 @@ pub fn default_system_prompt(
          Guidelines:\n\
          - Discover files with `glob` (by name) and `ls` (a directory); search contents with \
          `grep`. Use `read` with offset/limit for large files.\n\
+         - `glob` and `grep` skip anything the repository ignores, so a file they cannot find may \
+         still exist. `read` and `ls` do not skip it. If the user names a file and `glob` finds \
+         nothing, `read` the path directly before concluding it is missing — plans and design \
+         notes are often in ignored paths.\n\
          - For a small change to an existing file use `edit`. Use `write` to create a new file or \
          fully rewrite one — always emit the COMPLETE contents, never a diff.\n\
          - For a multi-step job, call `todo` first to lay out the plan, and update it as you \

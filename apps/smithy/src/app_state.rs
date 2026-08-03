@@ -7,8 +7,10 @@
 //! the agent's own state inside [`AgentPanelState`].
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
@@ -196,13 +198,43 @@ pub struct ReviewState {
     /// turn queues two writes to the same file.
     pub current: RwSignal<Option<smithy_editor::PendingFileChange>>,
     /// Review results the model has not been told about yet, delivered at the
-    /// head of the next turn. See [`crate::agent::describe_review_outcome`] for
-    /// why they cannot go back as the original tool result.
+    /// head of the next turn.
+    ///
+    /// **Now a fallback rather than the main path.** With a blocking gate the
+    /// outcome goes back as the tool's own result, which is where the model
+    /// looks for it. This still catches the cases where nobody was waiting: a
+    /// review abandoned by a project switch, or one whose tool call had already
+    /// gone away.
     ///
     /// `Rc<RefCell<_>>` rather than `Arc<Mutex<_>>`: only the UI thread ever
     /// touches this — the modal writes it, `submit_task` drains it — and both
     /// happen before the turn is handed to the runtime.
     pub outcomes: Rc<RefCell<Vec<String>>>,
+    /// Where a blocked `edit`/`write` call is waiting, keyed by `tool_call_id`.
+    ///
+    /// **This is what makes the gate observable.** Before it, the hook denied
+    /// the tool and the outcome arrived only at the start of the *next* turn —
+    /// so inside one long turn the model never learned whether any of its edits
+    /// had landed. A measured session spent 26 of 76 tool calls re-editing and
+    /// polling files whose edits were sitting approved on disk. The tool now
+    /// suspends here until the modal answers, exactly as shell approval already
+    /// did.
+    pub responders: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<ReviewOutcome>>>>,
+    /// When true the gate is off: writes go straight to disk with no modal.
+    ///
+    /// An `AtomicBool` and not a signal because the hook reads it from the tokio
+    /// side, where floem's reactive graph cannot be touched.
+    pub auto_approve: Arc<AtomicBool>,
+}
+
+/// What the modal decided, as the tool will hear it.
+#[derive(Debug, Clone)]
+pub struct ReviewOutcome {
+    /// The sentence handed back to the model.
+    pub message: String,
+    /// Whether anything was written. Drives success versus error, which is the
+    /// difference between the model continuing and the model investigating.
+    pub applied: bool,
 }
 
 impl ReviewState {
@@ -211,6 +243,23 @@ impl ReviewState {
             pending: Arc::new(Mutex::new(PendingChangeManager::new())),
             current: RwSignal::new(None),
             outcomes: Rc::new(RefCell::new(Vec::new())),
+            responders: Arc::new(Mutex::new(HashMap::new())),
+            auto_approve: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Answer a blocked tool call, if one is waiting on this id.
+    ///
+    /// Returns whether anybody was listening. `false` means the outcome has to
+    /// go through [`ReviewState::outcomes`] instead — the turn it belonged to is
+    /// gone.
+    pub fn respond(&self, id: &str, outcome: ReviewOutcome) -> bool {
+        let Ok(mut responders) = self.responders.lock() else {
+            return false;
+        };
+        match responders.remove(id) {
+            Some(tx) => tx.send(outcome).is_ok(),
+            None => false,
         }
     }
 
@@ -222,6 +271,20 @@ impl ReviewState {
     /// grounded in, and the session that would have received them is torn down
     /// and rebuilt by the same switch.
     pub fn abandon(&self) {
+        // Answer anyone still blocked before dropping the queue. A tool waiting
+        // on a oneshot whose sender is dropped sees `Err` and reports the modal
+        // as dismissed, which is true but says nothing about why — and a turn
+        // stalled behind a project switch is worth naming.
+        if let Ok(mut responders) = self.responders.lock() {
+            for (_, tx) in responders.drain() {
+                let _ = tx.send(ReviewOutcome {
+                    message: "the review was abandoned because the project changed. The file was \
+                              not written."
+                        .to_string(),
+                    applied: false,
+                });
+            }
+        }
         if let Ok(mut pending) = self.pending.lock() {
             pending.clear();
         }
@@ -546,7 +609,11 @@ fn spawn_session(agent: &AgentState, resume_from: Option<smithy_agent::persist::
 
     let tx = agent.tx.clone();
     let shell_tx = agent.shell_approval_tx.clone();
-    let pending = agent.review.pending.clone();
+    let review = crate::agent::ReviewGate {
+        pending: agent.review.pending.clone(),
+        responders: agent.review.responders.clone(),
+        auto_approve: agent.review.auto_approve.clone(),
+    };
     let slot = agent.session.clone();
     let stopper_slot = agent.stopper.clone();
 
@@ -556,7 +623,7 @@ fn spawn_session(agent: &AgentState, resume_from: Option<smithy_agent::persist::
             config,
             tx.clone(),
             shell_tx,
-            pending,
+            review,
             resume_from,
         )
         .await
@@ -675,6 +742,20 @@ pub fn submit_task(agent: &AgentState, task: String) {
 /// Separate from the modal itself because a request can arrive while one is
 /// already on screen: the modal advances when answered, and this covers the case
 /// where the queue was empty at that moment and filled afterwards.
+/// Mirror the panel's auto-approve toggle into the flag the write hook reads.
+///
+/// Two representations of one setting, because they live on different threads:
+/// the toggle is a floem signal on the UI thread, and the hook runs on the tokio
+/// runtime where floem's reactive graph must not be touched. An `Effect` is the
+/// one-way bridge, so the signal stays the source of truth.
+pub fn setup_auto_approve_effect(agent: AgentState) {
+    let toggle = agent.panel.auto_approve;
+    let flag = agent.review.auto_approve.clone();
+    floem::reactive::Effect::new(move |_| {
+        flag.store(toggle.get(), std::sync::atomic::Ordering::Relaxed);
+    });
+}
+
 pub fn setup_shell_approval_effect(agent: AgentState) {
     let tick = agent.shell_tick;
     let inbox = agent.shell_inbox.clone();
@@ -795,13 +876,14 @@ pub fn save_session(agent: &AgentState) {
             return;
         };
 
-        let stored = smithy_agent::persist::StoredSession::from_history(
+        let stored = smithy_agent::persist::StoredSession::from_history_with_reasoning(
             id,
             &project_root,
             &model,
             session.history(),
             session.sampling(),
             session.limits(),
+            session.reasoning().to_vec(),
         );
         drop(guard);
 

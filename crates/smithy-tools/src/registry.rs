@@ -74,6 +74,16 @@ pub enum HookDecision {
     /// Refuse. The reason is fed back to the model as an error result, so it can
     /// choose a different approach rather than silently stalling.
     Deny(String),
+    /// The hook did the work itself. The message is returned as a **successful**
+    /// result and the tool is not run.
+    ///
+    /// Added for write review. Before it, a hook could only say "no", so an edit
+    /// the user had approved and which the UI had already written to disk still
+    /// came back to the model as an error — and the model, reasonably, went
+    /// looking for what had gone wrong. A session was measured spending 26 of
+    /// its 76 tool calls re-editing and polling files whose edits had in fact
+    /// landed. Success needs to be expressible.
+    Fulfilled(String),
 }
 
 /// A pre/post interceptor around every tool call.
@@ -205,8 +215,21 @@ impl Registry {
         };
 
         for hook in &self.hooks {
-            if let HookDecision::Deny(reason) = hook.before(call, &args, ctx).await {
-                return ToolResult::err(call, format!("`{}` was not run: {reason}", call.name));
+            match hook.before(call, &args, ctx).await {
+                HookDecision::Allow => {}
+                HookDecision::Deny(reason) => {
+                    return ToolResult::err(call, format!("`{}` was not run: {reason}", call.name));
+                }
+                // No `was not run` prefix: from the model's side the call
+                // succeeded, and saying otherwise is what sent it hunting.
+                HookDecision::Fulfilled(message) => {
+                    return ToolResult {
+                        tool_call_id: call.id.clone(),
+                        name: call.name.clone(),
+                        content: message,
+                        is_error: false,
+                    };
+                }
             }
         }
 
