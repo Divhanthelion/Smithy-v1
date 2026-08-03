@@ -477,12 +477,12 @@ or LSP layer, the output from the relevant debug flag above.
 ## Building on it
 
 ```bash
-cargo test --workspace     # 726 passing
-cargo build --workspace    # 0 warnings, and it stays 0
+cargo test --workspace     # 947 passing
+cargo build --workspace    # 0 warnings, and CI keeps it that way
 cargo clippy --workspace --all-targets
 ```
 
-Seven crates. `apps/smithy` is the binary; the rest are libraries:
+Eight crates. `apps/smithy` is the binary; the rest are libraries:
 
 | crate | what it is |
 |---|---|
@@ -490,12 +490,13 @@ Seven crates. `apps/smithy` is the binary; the rest are libraries:
 | `smithy-agent` | the agent loop, budgets, session persistence, backend selection, the `explore` sub-agent |
 | `smithy-tools` | the agent's tools and the capability sandbox |
 | `smithy-project` | project detection and context extraction |
+| `smithy-fisherman` | the figure on the bottom rail: his day, his poses, and the drawing |
 | `smithy-sky` | astronomy for the backdrop. No dependencies at all |
 | `smithy-voice` | microphone in, string out |
 
-`smithy-agent`, `smithy-tools`, `smithy-sky` and `smithy-voice` have **no UI
-dependency**, so a different front-end would be a new consumer of the same core
-rather than a rewrite.
+`smithy-agent`, `smithy-tools`, `smithy-fisherman`, `smithy-sky` and
+`smithy-voice` have **no UI dependency**, so a different front-end would be a
+new consumer of the same core rather than a rewrite.
 
 The sandbox is a capability, not a path check: the tool layer holds a `cap-std`
 directory handle for your project root, so the OS itself refuses to let the

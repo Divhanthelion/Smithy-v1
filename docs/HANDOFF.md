@@ -1,189 +1,208 @@
-# Handoff — 2026-08-03 (evening)
+# Handoff — 2026-08-03 (late)
 
-Continuation after the call-graph Overview pass. For the next model
-(Claude): what landed, what the user accepted by eye, what is still open.
+Session state: what landed, what is open, what to pick up. Stable orientation
+(crate map, conventions, landmines) lives in `AGENTS.md` — read that first.
 
-**Manual test project:** `~/Desktop/kernelos-master`  
-**Install:** `cargo install --path apps/smithy --force` → `~/.cargo/bin/smithy`  
-**Prefer while iterating:** `cargo run -p smithy --release` (or
-`target/release/smithy`) so ad-hoc reinstalls do not re-prompt Keychain.  
-**Data dir:** `~/.local/share/smithy/`  
-**Graph for kernelos:**
-`~/.local/share/smithy/projects/kernelos-master-ebfea94305350e37/callgraph.json`
-(~278 nodes, ~355–366 edges, 24 files)
-
-Inspiration: [Benzi](https://github.com/shobhitx64/Benzi) / CodeMap — file-
-clustered whole map + click-into neighborhood.
+**Manual test project:** `~/Desktop/kernelos-master`
+**Prefer while iterating:** `cargo run -p smithy --release` — do *not*
+`cargo install --force` in a loop (Keychain ACLs).
+**Data dir:** `~/.local/share/smithy/`
 
 ---
 
-## 1. Verdict in one paragraph
+## 1. One paragraph
 
-§2.1 automated floor passed earlier. Call graph UI has **Overview** (whole
-map, one box per source file, every symbol as a chip) and **Focus** (1-hop
-neighborhood with wrap, fit camera, bus edges, jump/Back/hubs). Overview is
-the default on load/build. User accepted Overview as “pretty stinkin good”
-after a wider fill-the-pane pack and dropping the 8-chip/`+N` cap. Focus
-fan-out rewrite from earlier is in place; double-click → editor is still
-open. Keychain still prompts per item after ad-hoc reinstalls.
+Three tracks moved. **Repo infrastructure** now exists: CI, an agent brief, and
+a `.gitignore` that no longer eats golden images. **The fisherman** got a real
+verification harness — the preview used to render a *copy* of the drawing code
+and now renders the drawing code itself, with automated checks, contact sheets
+and a blessed golden. **The context audit** was written and nothing in it has
+been implemented; that is the largest untouched item in the tree.
+
+The harness found two production bugs on its first runs. Neither is fixed.
 
 ---
 
-## 2. What changed this stretch (call graph)
+## 2. What landed
 
-All of this lives in `apps/smithy/src/call_graph.rs` (~2.1k lines).
+### 2.1 Infrastructure (`ad36a3a`, on main)
 
-### 2.1 Modes
+- `.github/workflows/ci.yml` — macOS runner (the workspace does not build on
+  Linux: `smithy-voice` uses `candle-core` with the `accelerate` feature).
+  Build gated at zero warnings; **clippy reports but does not gate**, with its
+  ten findings enumerated and instructions to flip the ratchet.
+- `AGENTS.md` — the entry point that did not exist. Crate map, build commands,
+  house conventions, landmines.
+- `.gitignore` — blanket `*.png` was swallowing golden images. Now
+  `!**/tests/golden/**/*.png`.
 
-| Mode | Behavior |
-|---|---|
-| **Overview** (default) | File clusters across the full center pane; chips = symbols; edges between chips; click chip → Focus |
-| **Focus** | Callers above / focus / callees below; wrap; fit camera; bus edges for high fan-out |
+### 2.2 The seam — PR #1, **merged** (`d3430ed`)
 
-Toolbar: Overview / Focus / Rebuild / Editor. Jump search + hub pills + Back
-history work in Focus.
+`fisherman_preview.rs` shared the *math* with `fisherman.rs` and duplicated the
+*drawing*: 16 palette constants retyped, its own `draw_figure`/`draw_fish`, and
+a 315-line `draw_scene` replicating hut, window, smoke, fire and props. Tuning
+the flame changed no pixel in the PNG, silently.
 
-### 2.2 Overview layout (accepted direction)
+Closed with:
 
-Earlier Overview was a **tall pillar**: it reused the Focus strip width
-(~720px) → ~2 columns → fit-zoom crushed it. Fixes that landed:
+- **`Ink`** — a trait with `fill` / `stroke` (checked: that is the entire paint
+  surface the fisherman uses) and a defaulted `begin` (§2.3).
+- **`Scene` / `scene_at` / `paint`** — the clock half separated from the drawing
+  half. `paint` is pure: same `Scene`, same ink calls, forever.
+- **`crates/smithy-fisherman`** — UI-free, `kurbo`/`peniko` pinned to floem's
+  resolved versions. The editor keeps `fisherman_view`, the `Aesthetic` gate and
+  `impl Ink for FloemInk`.
+- `longitude_from_timezone` deleted — a rejected approach, not unfinished work
+  (`todays_sun` documents that the timezone meridian left the frame sun and the
+  backdrop sky an hour apart).
 
-1. **`overview_grid_width`** — use the real pane (≈480–1800), not the Focus
-   strip.
-2. **Fill width** — `pick_overview_columns` takes as many columns as
-   `OV_MIN_COL` (135) allows; column widths **stretch** so the grid spans
-   the pane (no empty side gutters).
-3. **Every symbol** — no 8-chip cap / no `+N` markers. Degree-sort hubs
-   first inside each file box.
-4. **Zoom LOD** — below `OV_LABEL_ZOOM` (0.55), chips draw as canvas dots;
-   labels appear when zoomed in. File titles stay.
-5. **Glyphs** — status / hop chrome uses ASCII (`N callers / M callees`),
-   not `↑`/`↓`/middots (Menlo was tofu-boxing them).
+Measured drift once the preview rendered the real code: the replica had been
+drawing him **facing right always** (it hardcoded `came_from = Garden`), and
+**standing on the rail during Reading and Sleeping** when he should have been
+inside the hut.
 
-User feedback after the first Overview pass: good, but go wider and include
-the truncated symbols — both done and reinstalled.
+### 2.3 The harness — PR #2, **OPEN, ready to merge** (`9d928cc`)
 
-### 2.3 Focus (earlier this session; still true)
+`cargo run -p smithy-fisherman --example sheets --features harness` →
+`target/fisherman/`.
 
-Wrap/columnize high fan-out; `fit_camera`; opaque `BG_BASE` ground; bus
-edges; moderate `default_focus` (not global max degree); two-line chips
-with `file:line`; jump / hubs / Back.
+- `report.json` — every check with measurement, threshold, pass/fail.
+  **Read this before opening any PNG.** Currently 9 pass / 1 fail / 1 report-only.
+- `day.png` — 96 tiles, one simulated day at 15-minute steps, cropped to
+  content and laid out as a 12×8 grid (~992×540, legible in one look).
+- `scenes.png` — all twelve `Doing` states in place, with props and lighting.
+  **The blessed golden.** `scenes_3x.png` is the eyes-only companion.
+- `build.png`, `walk.png`.
+- Labels are baked into the image via a 5×7 bitmap font — no dependency.
 
-### 2.4 Plumbing (earlier; still true)
+**`Part` tagging.** Colour cannot separate the figure from the hut: `IRON`
+(17,20,27) lies almost exactly on the line between `HUT_ROOF` (15,17,23) and
+`HUT_WALL` (23,26,34), and their midpoint is distance 2 from `IRON`. Every
+roof/wall AA edge read as figure ink — which contaminated `hidden_indoors` and
+framed every indoor day-tile on a stray pixel. Fixed by tagging the draw
+instead: `Ink::begin(Part)`, defaulted to a no-op so `FloemInk` and the live
+paint path are untouched. The harness keeps a per-pixel mask keyed on the tag.
 
-- Build/load via `poll_once` (menu `Effect` was disposed → silent no-op).
-- Hang fixes: do not `size.set` every paint; cache `Staleness` off the paint
-  path (`CallGraphUi.stale`).
-- Explicit build only; never auto-index on open.
+**Mask stamps must not antialias.** The tag is a channel value (Hut=1 …
+Smoke=6), so coverage blending interpolates *between tags* — Hut under Smoke at
+cov≈0.2 writes 2, which is `Figure`. `anti_alias: false` on the mask; the colour
+path keeps AA.
 
-### 2.5 Tests
+---
 
-```bash
-cargo test -p smithy --bin smithy call_graph::
+## 3. Two production bugs, found by the harness, **not fixed**
+
+Both are in shipping code. Both belong to the next branch.
+
+### 3.1 Moonwalk at plank-trip boundaries — `does_not_moonwalk`, red, 29 frames
+
+`face_for` subtracts 0.004 completion and can see the *previous* trip, so at
+each trip boundary he walks one way while facing the other. Pre-existing:
+`build_position((completion - 0.004).max(0.0))` is in `ad36a3a`, before any of
+this work. Completions: `0.1115, 0.1125, 0.2225, 0.2235, … 0.8895, 0.8905,
+0.9000`. Note the last one is `HANDOVER`, not a trip — a second, distinct case.
+
+**Left red deliberately. Do not widen the threshold.**
+
+### 3.2 Midnight lamp flare — no check catches it yet
+
+Sleep spans midnight, but `routine::at` works in hours-since-local-midnight, so
+at 00:00 the block rebuilds with `start = 0.0` and progress resets `0.900 → 0`.
+`window_light` reads that as "just went to bed" and lights the lamp:
+
+```
+23.75  Sleeping  start 21.500  prog 0.900  lamp 0.000
+ 0.00  Sleeping  start  0.000  prog 0.000  lamp 0.450   <-- flare
+ 0.25  Sleeping  start  0.000  prog 0.042  lamp 0.000
 ```
 
-Includes `overview_includes_every_node_and_packs_wide` (24×20 synthetic:
-every chip present, grid spans `overview_grid_width`, ≥5 columns on
-~1100px).
+Found by eye on `day.png`, then confirmed by probe. The harness could not have
+caught it: **the day sweep never crosses midnight** — it renders 96 tiles of
+`DAY` 0, so the seam between one day and the next is the one seam it never
+looks at.
 
 ---
 
-## 3. What the user saw / accepted
+## 4. Next branch — `fisherman/tuning`
 
-| Moment | Verdict |
-|---|---|
-| First Focus strip (hub + `cmd_*` row) | **Rejected** — unreadable star/strip; hang followed (fixed) |
-| Focus rewrite (wrap, fit, bus, opaque) | Landed; not re-litigated after Overview work |
-| Overview v1 (file boxes, still narrow / `+N`) | “pretty stinkin good” but go wider + include everything |
-| Overview v2 (wide fill + all chips) | Installed; awaiting a quick relaunch confirm |
+In order. Everything here came out of the harness rather than out of guessing.
 
-Screenshots live in the Cursor chat assets for this thread
-(`03757441-07e3-4158-869c-b7a863c271eb`).
-
-§2.2 C–G (attachments, write-review, budgets, LSP stop/start, live
-`web_search` / `explore`) were not the focus of this stretch.
-
----
-
-## 4. Keychain (unchanged; still open)
-
-macOS prompts **per Keychain item**, and ad-hoc `cargo install --force`
-invalidates ACLs. App-side: provider key at connect; Brave deferred via
-`WebSearch::deferred` + `secrets::is_stored`. Presence sidecar at
-`~/.local/share/smithy/key_presence.json`.
-
-**Better options (pick one next):**  
-A single vault item · prefer env · real code signing · stop reinstalling
-while iterating (`target/release/smithy`). Details were in the prior
-handoff §4; recommendation remains **vault + don’t churn the binary**
-short-term, **signing if shipping**.
+1. **Fix §3.1** (both cases: trip boundaries *and* the handover at 0.9000).
+2. **Fix §3.2.**
+3. **Day strip across midnight** — sample ~21:00 to ~03:00 with the day seed
+   rolling, as its own artifact.
+4. **Lighting-continuity check** — same shape as `does_not_teleport`, but for
+   `window_light` and `door_open`: flag any 1-second step where either jumps
+   more than a threshold. §3.2 would have been caught by a number instead of an
+   eye.
+5. **Promote Tier A/B into `cargo test`** behind the `harness` feature, so a
+   regression cannot land silently. **Not before 1 and 2** — CI would go red on
+   a scheduled fix. The note is already in `harness/mod.rs`.
+6. **Then tune.** This is the first stretch where "does it look good" is the
+   only open question, because everything a number can answer now has a number.
 
 ---
 
-## 5. Remaining work
+## 5. Untouched: the context audit
 
-### Call graph — polish / M5 closeout
-- [ ] Quick relaunch confirm: Overview fills the pane, all symbols visible
-      (zoom/pan as needed), no pillar / no `+N`.
-- [ ] Focus hub case still readable on kernelos
-      (`Terminal::execute_command` or Jump → that symbol).
-- [ ] Double-click chip → open `file:line` in the editor; Editor tab
-      returns to buffer.
-- [ ] Optional: hover signature (schema has no signature field yet —
-      qualified name + location only).
+`docs/CONTEXT_AUDIT.md` was written this session and **none of it is
+implemented**. Measured: ~8k tokens before the user types. Ranked by value:
 
-### Milestone 6 — live linking (not started)
-- `touched` highlights from tool events; highlight-only; follow-agent off
-  by default.
-
-### §2.2 still open (C–G)
-Attachments, write-review gate, budgets/reasoning, LSP stop/start,
-`web_search` / `explore` against a live model.
-
-### Keychain
-- Implement chosen approach (A/B/C); verify **one** dialog on cold launch
-  after a fresh install.
+1. **Cached tokens are dropped.** `providers/sse.rs` reads `prompt_tokens`,
+   `completion_tokens`, `reasoning_tokens` and nothing else. Six design
+   decisions pay rent to prefix caching and nothing measures whether it works;
+   the cost meter overstates cost as a result.
+2. **The context ceiling lets the expensive call through.** `Budget::new` is
+   inside `run_turn_inner`, so `last_prompt_tokens` resets every turn and the
+   ceiling can never stop a turn's *first* request. A long session pays for one
+   full prefill per turn and then stops.
+3. `context_warn` is a flat 32k — useless on large-window models.
+4. **The Context Usage panel** (per-segment attribution, Cursor-style) —
+   designed in §4 of the audit, not built. `Session` already holds everything;
+   attribute locally in chars and scale by the endpoint's reported total so the
+   breakdown always sums to the billed number.
+5. Per-turn tool-result budget; rank the API layer by call-graph degree.
 
 ---
 
-## 6. Landmines (still true)
+## 6. Still open from before this session
 
-- Do not name-match calls; SCIP `local N` is document-scoped; no enum
-  variants in context map; reasoning never in `History`; write-review gate
-  blocks; `SMITHY_LSP_LIGHT=1` OK with call graph.
-- **floem:** Effects created outside a long-lived owner (menu clicks) die.
-  Use `poll_once` / `exec_after` (settings pattern).
-- **floem:** Never unconditional `signal.set` from a paint/canvas path.
-- **`CallGraph::staleness`:** never on the UI/paint path — use
-  `CallGraphUi.stale`.
-- **`cargo install --force`:** re-triggers Keychain ACL prompts for ad-hoc
-  binaries.
-- **Overview vs Focus width:** Focus still uses `row_width_for_pane`
-  (capped ~720). Overview must keep `overview_grid_width` — do not reunify
-  them casually or the pillar returns.
+- **Call graph:** double-click chip → editor at `file:line`; optional hover
+  signature; Milestone 6 (live `touched` highlights).
+- **Keychain:** one dialog on cold launch. Recommendation stands — single vault
+  item, prefer env, stop churning the binary; sign if shipping.
+- **§2.2 C–G:** attachments, write-review gate, budgets/reasoning, LSP
+  stop/start, `web_search` / `explore` against a live model.
+- **`DEFAULT_LOCATION` is San Francisco** "until a setting exists for it", and
+  that setting still does not exist — so the fisherman's daylight is SF's for
+  everyone. Deliberately out of scope all session.
 
 ---
 
-## 7. File map
+## 7. Landmines added this session
 
-| Path | Role |
-|---|---|
-| `apps/smithy/src/call_graph.rs` | Overview + Focus UI, layout, build/load |
-| `apps/smithy/src/main.rs` | Center-pane switch, menus |
-| `apps/smithy/src/app_state.rs` | `CallGraphUi` on agent state |
-| `apps/smithy/src/agent.rs` | Deferred Brave registration |
-| `crates/smithy-agent/src/config.rs` | `secrets::{get,set,is_stored}` |
-| `crates/smithy-project/src/callgraph.rs` | Library graph / staleness |
-| `docs/CALLGRAPH_PLAN.md` | Architecture + milestone checklist |
-| `docs/HANDOFF.md` | This file |
+Everything else is in `AGENTS.md`. New:
+
+- **Tag masks must not antialias.** Coverage blending interpolates between tag
+  values and invents parts that were never drawn.
+- **Do not classify fisherman parts by colour.** `IRON` sits on the
+  `HUT_ROOF`→`HUT_WALL` line; no radius separates them. Use `Ink::begin`.
+- **`Ink::begin` is defaulted on purpose.** Keep it that way — the live paint
+  path must stay free of harness concerns.
+- **Goldens live under `tests/golden/`** and nowhere else; `.gitignore`
+  un-ignores exactly that path and blanket-ignores every other PNG.
+- **`does_not_teleport`'s bound is analytical**, not fitted:
+  `1.5 × (1 / (ARRIVAL × WALK_SECONDS))`, where 1.5 is smoothstep's maximum
+  derivative. It runs at ~99% utilisation *by construction*. If it fires,
+  the easing changed — fix the easing or re-derive the bound, do not raise it.
 
 ---
 
-## 8. Suggested next-agent first moves
+## 8. Commands
 
-1. Relaunch smithy on kernelos, open Call Graph — confirm Overview fills
-   width and includes every symbol; click into Focus on a hub and Back.
-2. Wire double-click → editor at `file:line` if that is the next UX ask.
-3. Otherwise: keychain vault (§4) or §2.2 write-review gate — user pick.
-4. Do **not** reopen “is Overview a pillar?” unless a regression shows;
-   the layout math and tests cover the failure mode.
+```bash
+cargo test --workspace                                          # 947, ~10s
+cargo build --workspace --all-targets                           # 0 warnings
+cargo run -p smithy-fisherman --example sheets --features harness
+cargo run -p smithy --release
+```
