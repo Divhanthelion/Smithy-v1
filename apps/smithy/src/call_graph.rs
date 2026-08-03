@@ -23,6 +23,10 @@ use crate::runtime;
 pub struct CallGraphUi {
     pub graph: RwSignal<Option<Arc<CallGraph>>>,
     pub focus: RwSignal<Option<u32>>,
+    /// Prior foci — Back pops. Not pushed on the initial default focus.
+    pub history: RwSignal<Vec<u32>>,
+    /// Jump-to-symbol filter. Non-empty opens the results strip.
+    pub query: RwSignal<String>,
     /// 1 = direct neighbors, 2 = one more hop.
     pub hops: RwSignal<u8>,
     pub building: RwSignal<bool>,
@@ -43,6 +47,8 @@ impl CallGraphUi {
         Self {
             graph: RwSignal::new(None),
             focus: RwSignal::new(None),
+            history: RwSignal::new(Vec::new()),
+            query: RwSignal::new(String::new()),
             hops: RwSignal::new(1),
             building: RwSignal::new(false),
             status: RwSignal::new(String::new()),
@@ -53,6 +59,33 @@ impl CallGraphUi {
             root: RwSignal::new(PathBuf::new()),
             stale: RwSignal::new(Staleness::default()),
         }
+    }
+}
+
+/// Refocus, remembering where we came from so Back works.
+fn focus_on(ui: CallGraphUi, next: u32) {
+    let cur = ui.focus.get_untracked();
+    if cur == Some(next) {
+        return;
+    }
+    if let Some(cur) = cur {
+        ui.history.update(|h| {
+            if h.last() != Some(&cur) {
+                h.push(cur);
+            }
+            if h.len() > 64 {
+                h.remove(0);
+            }
+        });
+    }
+    ui.focus.set(Some(next));
+    ui.query.set(String::new());
+}
+
+fn go_back(ui: CallGraphUi) {
+    let prev = ui.history.try_update(|h| h.pop()).flatten();
+    if let Some(prev) = prev {
+        ui.focus.set(Some(prev));
     }
 }
 
@@ -85,12 +118,16 @@ pub fn load_for_project(agent: &AgentState) {
         Ok((graph, stale)) => {
             ui.status.set(stale.describe());
             ui.stale.set(stale);
+            ui.history.set(Vec::new());
+            ui.query.set(String::new());
             ui.focus.set(default_focus(&graph));
             ui.graph.set(Some(Arc::new(graph)));
         }
         Err(e) if e == "none" => {
             ui.graph.set(None);
             ui.focus.set(None);
+            ui.history.set(Vec::new());
+            ui.query.set(String::new());
             ui.status.set(String::new());
             ui.stale.set(Staleness::default());
         }
@@ -153,6 +190,8 @@ pub fn build(agent: &AgentState) {
                 };
                 ui.status.set(summary.clone());
                 ui.stale.set(stale);
+                ui.history.set(Vec::new());
+                ui.query.set(String::new());
                 ui.focus.set(default_focus(&graph));
                 ui.graph.set(Some(Arc::new(graph)));
                 ui.pan.set((0.0, 0.0));
@@ -226,6 +265,8 @@ fn default_focus(graph: &CallGraph) -> Option<u32> {
 pub fn clear(ui: CallGraphUi) {
     ui.graph.set(None);
     ui.focus.set(None);
+    ui.history.set(Vec::new());
+    ui.query.set(String::new());
     ui.status.set(String::new());
     ui.building.set(false);
     ui.pan.set((0.0, 0.0));
@@ -563,6 +604,7 @@ pub fn call_graph_view(
 
     Stack::vertical((
         toolbar(ui, on_build),
+        nav_bar(ui),
         dyn_container(
             move || (ui.graph.get().is_some(), ui.building.get()),
             move |(has, building)| {
@@ -619,7 +661,7 @@ fn toolbar(ui: CallGraphUi, on_build: impl Fn() + 'static) -> impl IntoView {
             };
             let callers = graph.callers(focus).len();
             let callees = graph.callees(focus).len();
-            format!("{callers} callers · {callees} callees · click to walk")
+            format!("{callers}↑ · {callees}↓")
         })
         .style(move |s| {
             s.font_size(design::TEXT_XS)
@@ -693,6 +735,160 @@ fn toolbar(ui: CallGraphUi, on_build: impl Fn() + 'static) -> impl IntoView {
             .border_color(design::BORDER)
             .background(design::BG_BASE)
     })
+}
+
+/// Back + jump search + quick hubs. This is how you leave a local pocket.
+fn nav_bar(ui: CallGraphUi) -> impl IntoView {
+    let jump = TextInput::new(ui.query)
+        .placeholder("Jump to symbol or file…")
+        .style(|s| {
+            s.flex_grow(1.0)
+                .min_width(0.0)
+                .height(28.0)
+                .font_size(design::TEXT_SM)
+                .font_family(design::MONO.to_string())
+                .color(design::FG)
+                .background(design::BG_RAISED)
+                .border(1.0)
+                .border_color(design::BORDER)
+                .border_radius(4.0)
+                .padding_horiz(design::SPACE_2)
+        });
+
+    let back = Label::derived(move || {
+        if ui.history.get().is_empty() {
+            "Back".to_string()
+        } else {
+            format!("Back ({})", ui.history.get().len())
+        }
+    })
+    .on_event_stop(floem::event::listener::Click, move |_, _| go_back(ui))
+    .style(move |s| {
+        let empty = ui.history.get().is_empty();
+        s.font_size(design::TEXT_XS)
+            .color(if empty {
+                design::FG_GHOST
+            } else {
+                design::ACCENT
+            })
+            .padding_horiz(design::SPACE_2)
+            .padding_vert(2.0)
+            .margin_right(design::SPACE_2)
+            .cursor(if empty {
+                floem::style::CursorStyle::Default
+            } else {
+                floem::style::CursorStyle::Pointer
+            })
+    });
+
+    let row = Stack::horizontal((back, jump)).style(|s| {
+        s.width_full()
+            .items_center()
+            .padding_horiz(design::SPACE_3)
+            .padding_vert(design::SPACE_2)
+            .background(design::BG_BASE)
+    });
+
+    let results = dyn_container(
+        move || {
+            (
+                ui.query.get(),
+                ui.graph.get().as_ref().map(|g| g.nodes.len()),
+            )
+        },
+        move |(query, _)| {
+            let Some(graph) = ui.graph.get_untracked() else {
+                return Empty::new().into_any();
+            };
+            let hits = jump_hits(&graph, &query);
+            if hits.is_empty() {
+                return Empty::new().into_any();
+            }
+            let chips: Vec<_> = hits
+                .into_iter()
+                .map(|(idx, label)| {
+                    Label::derived(move || label.clone())
+                        .on_event_stop(floem::event::listener::Click, move |_, _| {
+                            focus_on(ui, idx);
+                        })
+                        .style(|s| {
+                            s.font_size(design::TEXT_XS)
+                                .font_family(design::MONO.to_string())
+                                .color(design::FG_MUTED)
+                                .background(design::BG_RAISED)
+                                .border(1.0)
+                                .border_color(design::BORDER)
+                                .border_radius(4.0)
+                                .padding_horiz(design::SPACE_2)
+                                .padding_vert(2.0)
+                                .margin_right(design::SPACE_2)
+                                .margin_bottom(design::SPACE_1)
+                                .cursor(floem::style::CursorStyle::Pointer)
+                        })
+                        .into_any()
+                })
+                .collect();
+            Stack::new(chips)
+                .style(|s| {
+                    s.width_full()
+                        .flex_row()
+                        .flex_wrap(floem::taffy::FlexWrap::Wrap)
+                        .padding_horiz(design::SPACE_3)
+                        .padding_bottom(design::SPACE_2)
+                        .background(design::BG_BASE)
+                        .border_bottom(1.0)
+                        .border_color(design::BORDER)
+                })
+                .into_any()
+        },
+    );
+
+    Stack::vertical((row, results)).style(move |s| {
+        s.width_full().apply_if(ui.graph.get().is_none(), |s| {
+            s.display(floem::taffy::Display::None)
+        })
+    })
+}
+
+/// Matches for the jump box. Empty query → a handful of hubs so you can leave
+/// a local pocket without knowing a name.
+fn jump_hits(graph: &CallGraph, query: &str) -> Vec<(u32, String)> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        let mut scored: Vec<(u32, usize)> = (0..graph.nodes.len() as u32)
+            .map(|i| {
+                let d = graph.callers(i).len() + graph.callees(i).len();
+                (i, d)
+            })
+            .filter(|(_, d)| *d >= 4)
+            .collect();
+        scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        return scored
+            .into_iter()
+            .take(8)
+            .map(|(i, d)| {
+                let n = &graph.nodes[i as usize];
+                (i, format!("{} · {d}", n.qualified()))
+            })
+            .collect();
+    }
+    if q.chars().count() < 2 {
+        return Vec::new();
+    }
+    let mut hits = Vec::new();
+    for (i, n) in graph.nodes.iter().enumerate() {
+        let qual = n.qualified();
+        let file = n.file.to_lowercase();
+        if qual.to_lowercase().contains(&q)
+            || n.name.to_lowercase().contains(&q)
+            || file.contains(&q)
+        {
+            hits.push((i as u32, format!("{}  {}", qual, short_location(n))));
+        }
+    }
+    hits.sort_by(|a, b| a.1.cmp(&b.1));
+    hits.truncate(12);
+    hits
 }
 
 fn empty_pane(on_build: impl Fn() + 'static) -> impl IntoView {
@@ -965,7 +1161,7 @@ fn graph_pane(
                                     }
                                 }
                             } else {
-                                ui.focus.set(Some(idx));
+                                focus_on(ui, idx);
                             }
                         })
                         .style(move |s| {
