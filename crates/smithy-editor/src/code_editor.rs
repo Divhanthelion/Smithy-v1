@@ -629,47 +629,60 @@ pub fn external_change_bar(
 }
 
 /// Placeholder shown when no file is open.
-/// The empty-editor view, with the project map behind the shortcuts.
+/// The empty-editor view, with the project outline behind the shortcuts.
 ///
-/// `map` is the same text the agent is given as its project context — crate
-/// layout, dependencies, module paths, public API. Showing it here costs nothing
-/// (it is already built for the session) and answers the question an empty
-/// editor otherwise leaves hanging: *what is in this repository?*
-///
-/// It is set as a backdrop rather than the content: dimmed, monospaced,
-/// scrollable, and behind the shortcut list, so the pane still reads as "nothing
-/// open" at a glance while being useful if you look.
+/// Crates and modules — not the agent context dump, and not the call graph.
+/// Showing the public API here made the pane look like a paste of `cargo doc`
+/// output; the navigable map (Benzi-style) is a separate piece of work.
 pub fn empty_editor_with_map(map: RwSignal<String>) -> impl IntoView {
-    Stack::new((
-        // The map, filling the pane behind everything.
-        floem::views::scroll::Scroll::new(
-            Label::derived(move || map.get()).style(|s| {
-                s.font_family(design::MONO.to_string())
-                    .font_size(design::TEXT_XS)
-                    .line_height(1.5)
-                    .color(design::FG_GHOST)
-                    .padding(design::SPACE_5)
+    // The outer container, not the stack, owns size and the opaque fill.
+    //
+    // Both children are `absolute`, so they contribute nothing to intrinsic
+    // size. A stack that is *only* absolute children collapses to empty under
+    // percentage sizing — its `background` paints a zero rect, the circuit
+    // backdrop shows through, and the map text (when it arrives) sits on that
+    // busy field in ghost colour and reads as missing. Stretching a real
+    // container first, then layering inside it, is what makes the pane a pane.
+    Container::new(
+        Stack::new((
+            floem::views::scroll::Scroll::new(
+                Label::derived(move || map.get()).style(|s| {
+                    s.font_family(design::MONO.to_string())
+                        .font_size(design::TEXT_XS)
+                        .line_height(1.5)
+                        // Faint, not ghost: ghost on the forged backdrop was
+                        // indistinguishable from "not there" even after the
+                        // opaque fill landed.
+                        .color(design::FG_FAINT)
+                        .padding(design::SPACE_5)
+                        .width_full()
+                }),
+            )
+            .style(move |s| {
+                s.absolute()
+                    .inset(0.0)
                     .width_full()
+                    .height_full()
+                    .min_width(0.0)
+                    .apply_if(map.get().trim().is_empty(), |s| {
+                        s.display(floem::taffy::Display::None)
+                    })
             }),
-        )
-        .style(move |s| {
-            s.absolute()
-                .inset(0.0)
-                .width_full()
-                .height_full()
-                .min_width(0.0)
-                .apply_if(map.get().trim().is_empty(), |s| {
-                    s.display(floem::taffy::Display::None)
-                })
-        }),
-        // The shortcuts, floating over it. `shortcut_list` rather than
-        // `empty_editor`, because that one paints an opaque background and
-        // would hide the very thing this function exists to show.
-        Container::new(shortcut_list()).style(|s| {
-            s.absolute().inset(0.0).items_center().justify_center()
-        }),
-    ))
-    .style(|s| s.width_full().height_full().background(design::BG_BASE))
+            // Shortcuts float over the map. `shortcut_list` rather than
+            // `empty_editor`, because that one paints an opaque background and
+            // would hide the very thing this function exists to show.
+            Container::new(shortcut_list()).style(|s| {
+                s.absolute().inset(0.0).items_center().justify_center()
+            }),
+        ))
+        .style(|s| s.width_full().height_full()),
+    )
+    .style(|s| {
+        s.width_full()
+            .height_full()
+            .min_height(0.0)
+            .background(design::BG_BASE)
+    })
 }
 
 /// Just the shortcut list, with no background of its own.

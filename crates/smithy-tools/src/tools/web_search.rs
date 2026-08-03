@@ -27,6 +27,7 @@
 
 use async_trait::async_trait;
 use serde_json::Value;
+use std::sync::Arc;
 
 use crate::registry::{Tool, ToolCtx};
 use crate::schema::{arg_i64, arg_str, ToolDefinition, ToolOutput, ToolParameter};
@@ -41,21 +42,52 @@ const MAX_COUNT: i64 = 20;
 /// the occasional one that is a whole paragraph.
 const MAX_DESCRIPTION_CHARS: usize = 300;
 
+/// How the tool obtains its API key.
+///
+/// [`KeySource::Deferred`] exists so session construction can register the tool
+/// when a key is *known to be stored*, without unlocking the OS keychain yet —
+/// unlocking every configured key at launch was prompting for the password once
+/// per key. The keychain is touched on the first search instead.
+pub enum KeySource {
+    Ready(String),
+    Deferred(Arc<dyn Fn() -> Option<String> + Send + Sync>),
+}
+
 pub struct WebSearch {
     http: reqwest::Client,
-    api_key: String,
+    key: KeySource,
 }
 
 impl WebSearch {
-    /// Build the tool around a key. The app is responsible for only doing this
-    /// when it has one — see the module docs.
+    /// Build the tool around a key already in hand.
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             http: reqwest::Client::builder()
                 .timeout(TIMEOUT)
                 .build()
                 .unwrap_or_default(),
-            api_key: api_key.into(),
+            key: KeySource::Ready(api_key.into()),
+        }
+    }
+
+    /// Register the tool now; unlock the key on the first call.
+    pub fn deferred(lookup: impl Fn() -> Option<String> + Send + Sync + 'static) -> Self {
+        Self {
+            http: reqwest::Client::builder()
+                .timeout(TIMEOUT)
+                .build()
+                .unwrap_or_default(),
+            key: KeySource::Deferred(Arc::new(lookup)),
+        }
+    }
+
+    fn resolve_key(&self) -> Result<String, String> {
+        match &self.key {
+            KeySource::Ready(k) => Ok(k.clone()),
+            KeySource::Deferred(lookup) => lookup().ok_or_else(|| {
+                "Brave Search key is no longer available. Add it under Settings → Agent."
+                    .to_string()
+            }),
         }
     }
 }
@@ -100,6 +132,10 @@ impl Tool for WebSearch {
         if query.is_empty() {
             return ToolOutput::err("the query is empty");
         }
+        let api_key = match self.resolve_key() {
+            Ok(k) => k,
+            Err(e) => return ToolOutput::err(e),
+        };
         let count = arg_i64(args, "count")
             .unwrap_or(DEFAULT_COUNT)
             .clamp(1, MAX_COUNT);
@@ -109,7 +145,7 @@ impl Tool for WebSearch {
         let response = match self
             .http
             .get(ENDPOINT)
-            .header("X-Subscription-Token", &self.api_key)
+            .header("X-Subscription-Token", &api_key)
             .header("Accept", "application/json")
             .query(&[("q", query), ("count", count_param.as_str())])
             .send()

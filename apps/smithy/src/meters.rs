@@ -6,12 +6,14 @@
 //!
 //! ## Memory
 //!
-//! Smithy's own resident set, plus every `rust-analyzer` on the machine
-//! summed. The language server is the interesting number: a single instance on a
-//! large workspace was measured at **5.12 GB**, with a second at 724 MB
-//! alongside it — more than everything else on the desktop combined, and
-//! invisible unless you go looking in Activity Monitor. `SMITHY_LSP_LIGHT=1`
-//! exists precisely for that and nobody would know to set it.
+//! Smithy's own resident set, plus the `rust-analyzer` **we** spawned, and —
+//! separately — every other `rust-analyzer` on the machine. The language server
+//! is the interesting number: a single instance on a large workspace was
+//! measured at **5.12 GB**. Other editors' analyzers used to be summed into the
+//! same figure, which made Smithy look responsible for nine gigabytes that
+//! belonged to Claude Code. Ours and theirs are named apart now.
+//! `SMITHY_LSP_LIGHT=1` exists for the case that *is* ours, and nobody would
+//! know to set it.
 //!
 //! Sampled rather than watched: reading the process table is cheap but not free,
 //! and a meter that updated faster than you can read it would only cost battery.
@@ -28,6 +30,7 @@
 //! costs more at turn forty than at turn four. Balance is "how much runway is
 //! left", which is what you want when you have put ten dollars on an account.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -57,15 +60,22 @@ const BALANCE_WARN: f64 = 1.0;
 pub struct MemorySample {
     /// Smithy's own resident set.
     pub own_bytes: u64,
-    /// Every `rust-analyzer` process summed.
+    /// `rust-analyzer` processes descended from this smithy.
     pub analyzer_bytes: u64,
     pub analyzer_count: usize,
+    /// Everyone else's `rust-analyzer` — Cursor, Claude Code, VS Code, a
+    /// previous smithy that did not exit cleanly.
+    pub other_analyzer_bytes: u64,
+    pub other_analyzer_count: usize,
 }
 
 impl MemorySample {
     /// The menu-bar string, or empty when there is nothing worth saying.
     pub fn render(&self) -> String {
-        if self.own_bytes == 0 && self.analyzer_bytes == 0 {
+        if self.own_bytes == 0
+            && self.analyzer_bytes == 0
+            && self.other_analyzer_bytes == 0
+        {
             return String::new();
         }
         let mut parts = Vec::new();
@@ -80,10 +90,19 @@ impl MemorySample {
             };
             parts.push(format!("{label} {}", human_bytes(self.analyzer_bytes)));
         }
+        if self.other_analyzer_count > 0 {
+            parts.push(format!(
+                "+{} elsewhere",
+                human_bytes(self.other_analyzer_bytes)
+            ));
+        }
         parts.join(" · ")
     }
 
     /// Whether anything here is worth colouring.
+    ///
+    /// Only *our* analyzer and our own RSS trip the warn — someone else's
+    /// nine-gigabyte instance is worth naming, not blaming on this window.
     pub fn is_heavy(&self) -> bool {
         self.analyzer_bytes >= MEMORY_WARN_BYTES || self.own_bytes >= MEMORY_WARN_BYTES
     }
@@ -95,7 +114,7 @@ impl MemorySample {
 /// disks, networks and components, none of which are wanted here and all of
 /// which cost.
 pub fn sample_memory() -> MemorySample {
-    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
     let mut system = System::new();
     system.refresh_processes_specifics(
@@ -107,6 +126,30 @@ pub fn sample_memory() -> MemorySample {
     let own_pid = sysinfo::get_current_pid().ok();
     let mut sample = MemorySample::default();
 
+    // Parent map so we can tell a rust-analyzer we spawned from one Cursor or
+    // Claude Code is keeping around. Walk is bounded; process trees here are
+    // shallow.
+    let parents: HashMap<Pid, Option<Pid>> = system
+        .processes()
+        .iter()
+        .map(|(pid, process)| (*pid, process.parent()))
+        .collect();
+
+    let descended_from_us = |pid: Pid| -> bool {
+        let Some(own) = own_pid else {
+            return false;
+        };
+        let mut current = Some(pid);
+        for _ in 0..16 {
+            match current {
+                Some(p) if p == own => return true,
+                Some(p) => current = parents.get(&p).copied().flatten(),
+                None => return false,
+            }
+        }
+        false
+    };
+
     for (pid, process) in system.processes() {
         let memory = process.memory();
         if Some(*pid) == own_pid {
@@ -114,12 +157,16 @@ pub fn sample_memory() -> MemorySample {
             continue;
         }
         // Match on the executable name, not the full command line: the analyzer
-        // is spawned by us and by any editor the user has open, and all of them
-        // count against the same machine.
+        // is spawned by us and by any editor the user has open.
         let name = process.name().to_string_lossy();
         if name.contains("rust-analyzer") && !name.contains("proc-macro") {
-            sample.analyzer_bytes += memory;
-            sample.analyzer_count += 1;
+            if descended_from_us(*pid) {
+                sample.analyzer_bytes += memory;
+                sample.analyzer_count += 1;
+            } else {
+                sample.other_analyzer_bytes += memory;
+                sample.other_analyzer_count += 1;
+            }
         }
     }
     sample
@@ -349,6 +396,7 @@ mod tests {
             own_bytes: 536 * 1024 * 1024,
             analyzer_bytes: 5_497_558_138,
             analyzer_count: 1,
+            ..Default::default()
         };
         assert_eq!(sample.render(), "smithy 536 MB · rust-analyzer 5.1 GB");
     }
@@ -361,9 +409,27 @@ mod tests {
             own_bytes: 100 * 1024 * 1024,
             analyzer_bytes: 6 * 1024 * 1024 * 1024,
             analyzer_count: 3,
+            ..Default::default()
         };
         assert!(sample.render().contains("rust-analyzer ×3"), "{}", sample.render());
         assert!(sample.is_heavy());
+    }
+
+    /// Someone else's nine-gigabyte instance must not look like ours.
+    #[test]
+    fn other_editors_analyzers_are_named_apart() {
+        let sample = MemorySample {
+            own_bytes: 137 * 1024 * 1024,
+            analyzer_bytes: 205 * 1024 * 1024,
+            analyzer_count: 1,
+            other_analyzer_bytes: 9 * 1024 * 1024 * 1024,
+            other_analyzer_count: 1,
+        };
+        assert_eq!(
+            sample.render(),
+            "smithy 137 MB · rust-analyzer 205 MB · +9.0 GB elsewhere"
+        );
+        assert!(!sample.is_heavy());
     }
 
     #[test]
@@ -372,6 +438,7 @@ mod tests {
             own_bytes: 300 * 1024 * 1024,
             analyzer_bytes: 800 * 1024 * 1024,
             analyzer_count: 1,
+            ..Default::default()
         };
         assert!(!sample.is_heavy());
     }

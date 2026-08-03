@@ -258,20 +258,22 @@ pub async fn build_session(
     review: ReviewGate,
     resume_from: Option<smithy_agent::persist::StoredSession>,
 ) -> Result<AgentHandle, String> {
-    // Both of these read the OS credential store, which is synchronous and can
-    // block on an authorization prompt — so they share one hop onto a worker
-    // rather than each stalling the executor.
-    let (provider, brave_key) = tokio::task::spawn_blocking(move || {
-        let provider = config.build_provider();
-        let brave = smithy_agent::config::api_key(
-            smithy_agent::config::BRAVE_KEY,
-            "BRAVE_API_KEY",
-        );
-        (provider, brave)
-    })
-    .await
-    .map_err(|e| format!("provider setup failed: {e}"))?;
-    let provider = provider.map_err(|e| e.to_string())?;
+    // Provider key only. Brave used to be unlocked in the same hop, which meant
+    // every launch asked for the keychain password twice — once per item. Brave
+    // is deferred: we register `web_search` when a key is known to exist
+    // (sidecar / env), and unlock it on the first search.
+    let provider = tokio::task::spawn_blocking(move || config.build_provider())
+        .await
+        .map_err(|e| format!("provider setup failed: {e}"))?
+        .map_err(|e| e.to_string())?;
+
+    let brave_configured = {
+        use smithy_agent::config::{secrets, BRAVE_KEY};
+        std::env::var("BRAVE_API_KEY")
+            .ok()
+            .is_some_and(|k| !k.trim().is_empty())
+            || secrets::is_stored(BRAVE_KEY)
+    };
 
     // Read the model's real parameters rather than assuming them: whether it is
     // loaded, and the context window it was loaded with.
@@ -330,9 +332,17 @@ pub async fn build_session(
     // worse than one that is absent: the model spends a call finding out. The
     // tool block still cannot change *within* a session — see `Registry::core`
     // on prefix caching — because this is decided once, here, at construction.
-    if let Some(key) = &brave_key {
-        registry.push(Box::new(smithy_tools::tools::web_search::WebSearch::new(
-            key.clone(),
+    //
+    // Presence is decided without unlocking; the key itself is resolved on the
+    // first call so launch only prompts for the provider key.
+    if brave_configured {
+        registry.push(Box::new(smithy_tools::tools::web_search::WebSearch::deferred(
+            || {
+                smithy_agent::config::api_key(
+                    smithy_agent::config::BRAVE_KEY,
+                    "BRAVE_API_KEY",
+                )
+            },
         )));
     }
 
@@ -365,11 +375,17 @@ pub async fn build_session(
     registry.push(Box::new(smithy_agent::Explore::new(
         provider.clone(),
         &project.root,
-        match &brave_key {
-            Some(key) => vec![Box::new(smithy_tools::tools::web_search::WebSearch::new(
-                key.clone(),
-            )) as Box<dyn smithy_tools::Tool>],
-            None => Vec::new(),
+        if brave_configured {
+            vec![Box::new(smithy_tools::tools::web_search::WebSearch::deferred(
+                || {
+                    smithy_agent::config::api_key(
+                        smithy_agent::config::BRAVE_KEY,
+                        "BRAVE_API_KEY",
+                    )
+                },
+            )) as Box<dyn smithy_tools::Tool>]
+        } else {
+            Vec::new()
         },
     )));
 

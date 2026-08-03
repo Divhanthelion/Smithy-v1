@@ -166,6 +166,65 @@ pub fn extract(project: &Project, budget: ContextBudget) -> ProjectContext {
     }
 }
 
+/// Crates and modules only — the empty-editor backdrop, not the agent prompt.
+///
+/// The agent context includes the public API and is sized for a model. Putting
+/// that wall of `pub struct` / `pub enum` behind the shortcuts made the pane
+/// look like a dump and nothing like the navigable call map this project is
+/// aiming at. Keep this short and structural.
+pub fn outline(project: &Project) -> String {
+    match project.kind {
+        ProjectKind::Rust { .. } => outline_rust(project),
+        ProjectKind::Generic => {
+            let mut out = extract(project, ContextBudget { max_chars: 1_200 }).rendered;
+            if let Some(idx) = out.find("\n## Public API") {
+                out.truncate(idx);
+            }
+            out.push_str(
+                "\n\n— project outline —\nThe navigable call map (who calls whom) is not in this pane yet.",
+            );
+            out
+        }
+    }
+}
+
+fn outline_rust(project: &Project) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let crates = match rust::crates(&project.root) {
+        Ok(c) => c,
+        Err(_) => {
+            return format!(
+                "# {}\n\n(could not read cargo metadata)\n\n— project outline —\nThe navigable call map is not in this pane yet.",
+                project.name
+            );
+        }
+    };
+
+    let _ = writeln!(out, "# {} ({})", project.name, project.kind.label());
+    let _ = writeln!(out, "\n## Crates");
+    for c in &crates {
+        let path = if c.path.as_os_str().is_empty() {
+            ".".to_string()
+        } else {
+            c.path.display().to_string()
+        };
+        let _ = writeln!(
+            out,
+            "- {} v{} ({}) — {}",
+            c.name,
+            c.version,
+            c.targets.join("+"),
+            path
+        );
+    }
+    out.push_str(&render_modules(&crates));
+    out.push_str(
+        "\n— project outline —\nCall map: Agent → Build Call Graph (~10 s, ~2 GB).",
+    );
+    out
+}
+
 fn extract_rust(project: &Project, budget: ContextBudget) -> ProjectContext {
     let mut warnings = Vec::new();
     let crates = match rust::crates(&project.root) {
@@ -551,6 +610,21 @@ mod tests {
         assert!(context.includes(Layer::Layout));
         assert!(!context.includes(Layer::Api));
         assert!(context.rendered.contains("## Crates"));
+    }
+
+    /// The empty-editor outline must not dump the public API — that is what
+    /// made the pane look like a paste rather than a map.
+    #[test]
+    fn the_outline_skips_the_public_api() {
+        let text = our_workspace().outline();
+        assert!(text.contains("## Crates"), "{text}");
+        assert!(text.contains("## Modules"), "{text}");
+        assert!(
+            !text.contains("## Public API"),
+            "outline leaked the API wall:\n{text}"
+        );
+        assert!(text.contains("Call map"), "{text}");
+        assert!(text.contains("Build Call Graph"), "{text}");
     }
 
     /// Layers drop from the bottom, so a smaller budget is a subset.

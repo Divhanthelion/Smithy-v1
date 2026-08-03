@@ -13,6 +13,7 @@ use smithy_editor::{
 
 mod agent;
 mod app_state;
+mod call_graph;
 mod editor;
 mod meters;
 mod runtime;
@@ -121,6 +122,9 @@ fn app_view() -> impl IntoView {
     // UI thread because it shells out to `cargo metadata` and parses the tree.
     let project_map = agent_state.project_map;
     refresh_project_map(&agent_state, project_map);
+    // A previously built graph for this project, if one is on disk. Never builds
+    // here — that is an explicit menu action because of the cost.
+    call_graph::load_for_project(&agent_state);
 
     // The open editor, declared before the file watcher because the watcher's
     // effect needs it: an external change is only interesting for the file
@@ -344,30 +348,80 @@ fn app_view() -> impl IntoView {
         });
     }
 
-    // The editor, with the external-change bar above it. Above rather than
-    // floating over, so it cannot cover the text it is asking about.
-    let editor_view = Stack::vertical((
-        smithy_editor::external_change_bar(
-            external_change,
-            move || {
-                if let Some(handle) = open_editor.get_untracked() {
-                    if let Err(e) = handle.reload_from_disk() {
-                        eprintln!("{e}");
-                    }
-                }
-                external_change.set(None);
-            },
-            move || external_change.set(None),
-        ),
-        Container::new(editor_component.view(
-            project_map,
-            signals.active_buffer,
-            app_state.buffer_manager.clone(),
-            open_editor,
-        ))
-        .style(|s| s.flex_grow(1.0).width_full().min_height(0.0)),
-    ))
-    .style(|s| s.width_full().height_full());
+    // Center pane: editor, or the call graph. A mode switch rather than a fourth
+    // splitter — the layout is already at three panes.
+    let cg_ui = agent_state.call_graph;
+    let project_root_sig =
+        floem::reactive::RwSignal::new(agent_state.project.borrow().root.clone());
+    {
+        let project = agent_state.project.clone();
+        floem::reactive::Effect::new(move |_| {
+            let _ = cg_ui.visible.get();
+            project_root_sig.set(project.borrow().root.clone());
+        });
+    }
+    let for_build = agent_state.clone();
+    let open_from_graph = {
+        let buffer_manager = app_state.buffer_manager.clone();
+        let lsp_handle = app_state.lsp_handle.clone();
+        let active_buffer = signals.active_buffer;
+        let buffer_states = signals.buffer_states;
+        let editor_version = signals.editor_version;
+        move |path: std::path::PathBuf, line: usize| {
+            handle_file_open(
+                path,
+                &buffer_manager,
+                active_buffer,
+                buffer_states,
+                editor_version,
+                &lsp_handle,
+            );
+            pending_jump.set(Some(line as u32));
+        }
+    };
+    let buffer_manager_for_editor = app_state.buffer_manager.clone();
+    let editor_view = dyn_container(
+        move || cg_ui.visible.get(),
+        move |show_graph| {
+            if show_graph {
+                let for_build = for_build.clone();
+                call_graph::call_graph_view(
+                    cg_ui,
+                    project_root_sig,
+                    open_from_graph.clone(),
+                    move || call_graph::build(&for_build),
+                )
+                .into_any()
+            } else {
+                // Rebuilt when returning from the graph — same as opening a
+                // file, which already constructs a fresh editor pane.
+                Stack::vertical((
+                    smithy_editor::external_change_bar(
+                        external_change,
+                        move || {
+                            if let Some(handle) = open_editor.get_untracked() {
+                                if let Err(e) = handle.reload_from_disk() {
+                                    eprintln!("{e}");
+                                }
+                            }
+                            external_change.set(None);
+                        },
+                        move || external_change.set(None),
+                    ),
+                    Container::new(editor_component.view(
+                        project_map,
+                        signals.active_buffer,
+                        buffer_manager_for_editor.clone(),
+                        open_editor,
+                    ))
+                    .style(|s| s.flex_grow(1.0).width_full().min_height(0.0)),
+                ))
+                .style(|s| s.width_full().height_full())
+                .into_any()
+            }
+        },
+    )
+    .style(|s| s.width_full().height_full().min_height(0.0));
 
     // Create multi-terminal component
     let terminal_component =
@@ -785,6 +839,14 @@ fn app_view() -> impl IntoView {
                     let dir = settings_dir.clone();
                     move || settings::open(settings_state, &dir)
                 }),
+                smithy_editor::MenuItem::action("Build Call Graph", {
+                    let agent_state = agent_state.clone();
+                    move || call_graph::build(&agent_state)
+                }),
+                smithy_editor::MenuItem::action("Show Call Graph", {
+                    let ui = agent_state.call_graph;
+                    move || ui.visible.set(true)
+                }),
                 smithy_editor::MenuItem::Separator,
                 smithy_editor::MenuItem::action("New Session", {
                     let agent_state = agent_state.clone();
@@ -816,6 +878,7 @@ fn app_view() -> impl IntoView {
                 smithy_editor::MenuItem::toggle_with("Terminal", "⌃`", signals.terminal_visible),
                 smithy_editor::MenuItem::Separator,
                 smithy_editor::MenuItem::toggle("Problems", problems_visible),
+                smithy_editor::MenuItem::toggle("Call Graph", agent_state.call_graph.visible),
                 // No shortcut, deliberately: a clock is a preference somebody
                 // sets once, not something worth a key.
                 smithy_editor::MenuItem::toggle("Clock", clock_visible),
@@ -1257,22 +1320,38 @@ fn app_view() -> impl IntoView {
             settings_state,
             {
                 // Saving reconnects, because a backend you selected and did not
-                // connect to is not a setting that has taken effect. The session
-                // is rebuilt from the store the same way the header's Reconnect
-                // rebuilds it — there is no second path for this.
+                // connect to is not a setting that has taken effect.
+                //
+                // A *different* provider, model, or URL starts a fresh session —
+                // replaying the previous model's transcript into a new one left
+                // the chat looking unchanged aside from a "Connected · …" notice,
+                // which is how a model switch used to look like it did nothing.
+                // Same endpoint → reconnect and resume, the way the header's
+                // Reconnect does.
                 let agent_state = agent_state.clone();
                 let dir = settings_dir.clone();
-                move || match settings::save(settings_state, &dir) {
-                    Ok(warnings) => {
-                        settings_state.close();
-                        agent_state.panel.connected.set(false);
-                        agent_state.panel.model_label.set("connecting…".into());
-                        for warning in &warnings {
-                            eprintln!("[settings] {warning}");
+                move || {
+                    let previous = smithy_agent::AgentConfig::load(&dir);
+                    match settings::save(settings_state, &dir) {
+                        Ok(warnings) => {
+                            settings_state.close();
+                            for warning in &warnings {
+                                eprintln!("[settings] {warning}");
+                            }
+                            let next = smithy_agent::AgentConfig::load(&dir);
+                            let switched = previous.provider != next.provider
+                                || previous.active().model != next.active().model
+                                || previous.active().base_url != next.active().base_url;
+                            if switched {
+                                app_state::clear_context(&agent_state);
+                            } else {
+                                agent_state.panel.connected.set(false);
+                                agent_state.panel.model_label.set("connecting…".into());
+                                connect_agent(&agent_state);
+                            }
                         }
-                        connect_agent(&agent_state);
+                        Err(e) => settings_state.report(e, true),
                     }
-                    Err(e) => settings_state.report(e, true),
                 }
             },
             move |account: &str| settings::clear_key(settings_state, account),
@@ -1393,38 +1472,32 @@ fn shell_approval_modal(
     })
 }
 
-/// Rebuild the project map shown behind an empty editor.
+/// Rebuild the project outline shown behind an empty editor.
 ///
 /// On a worker: the extraction shells out to `cargo metadata` and parses every
 /// source file with tree-sitter, which is not something to do between a click
 /// and a repaint. The result crosses back through a channel because floem's
 /// signals are not `Send`.
 ///
-/// Sized generously — this is read by a person on a screen, not prefilled into a
-/// prompt, so the token budget that governs the agent's copy does not apply.
+/// This is deliberately **not** the agent context block. That one includes the
+/// public API and is sized for a model; dumping it behind the shortcuts looked
+/// like a wall of `pub struct` and nothing like the Benzi-style call map.
 fn refresh_project_map(agent: &app_state::AgentState, map: floem::reactive::RwSignal<String>) {
     let project = agent.project.borrow().clone();
     let (tx, rx) = crossbeam_channel::bounded::<String>(1);
 
     runtime::tokio_runtime().spawn(async move {
-        let rendered = tokio::task::spawn_blocking(move || {
-            project
-                .context(smithy_project::ContextBudget::from_tokens(24_000))
-                .rendered
-        })
-        .await
-        .unwrap_or_default();
+        let rendered = tokio::task::spawn_blocking(move || project.outline())
+            .await
+            .unwrap_or_default();
         let _ = tx.send(rendered);
     });
 
-    // The bridge delivers `Option<T>`, so it lands in a staging signal and an
-    // effect copies the value across. One value, delivered once — the coalescing
-    // that makes `update_signal_from_channel` unsafe for streams is harmless
-    // here.
-    let staged = floem::reactive::RwSignal::new(None::<String>);
-    floem::ext_event::update_signal_from_channel(staged.write_only(), rx);
+    // Same bridge every other payload uses.
+    let (tick, inbox) = app_state::bridge(rx);
     floem::reactive::Effect::new(move |_| {
-        if let Some(rendered) = staged.get() {
+        tick.get();
+        for rendered in app_state::drain(&inbox) {
             map.set(rendered);
         }
     });
@@ -1519,6 +1592,10 @@ fn switch_project(agent: &app_state::AgentState, root: std::path::PathBuf) {
     // The map behind an empty editor belongs to the project, so it moves too.
     agent.project_map.set(String::new());
     refresh_project_map(agent, agent.project_map);
+    // Same for the call graph — a previous project's map would be a lie.
+    call_graph::clear(agent.call_graph);
+    agent.call_graph.visible.set(false);
+    call_graph::load_for_project(agent);
     agent
         .panel
         .model_label

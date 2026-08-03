@@ -376,17 +376,106 @@ pub fn api_key(account: &str, env_var: &str) -> Option<String> {
 /// keychain, a headless session, or a platform with no credential store at all
 /// must leave you with a usable editor and a legible message — the same posture
 /// [`crate::providers`] takes toward an unreachable endpoint.
+///
+/// ## Why a cache and a presence file
+///
+/// macOS prompts once **per keychain item** the first time a binary path reads
+/// it. Opening Settings used to call [`get`] three times (OpenRouter, DeepSeek,
+/// Brave) just to learn whether a key existed, and refreshing the model list
+/// called it again — so a single visit could ask for the login password three
+/// or four times. [`is_stored`] answers presence from a non-secret sidecar;
+/// [`get`] caches the value for the life of the process after the first
+/// successful read. `cargo install --force` still re-prompts once per item
+/// (new binary, new ACL), but never more than once per process after that.
 pub mod secrets {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
+
     use super::SERVICE;
+
+    /// Process-lifetime cache of secrets we have already unlocked.
+    fn cache() -> &'static Mutex<HashMap<String, String>> {
+        static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+        CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn presence_path() -> Option<PathBuf> {
+        let home = std::env::var_os("HOME").map(PathBuf::from)?;
+        Some(home.join(".local/share/smithy/key_presence.json"))
+    }
+
+    fn read_presence() -> HashMap<String, bool> {
+        let Some(path) = presence_path() else {
+            return HashMap::new();
+        };
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    fn write_presence(map: &HashMap<String, bool>) {
+        let Some(path) = presence_path() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let Ok(json) = serde_json::to_string_pretty(map) else {
+            return;
+        };
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, json).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+
+    fn mark_present(account: &str, present: bool) {
+        let mut map = read_presence();
+        if present {
+            map.insert(account.to_string(), true);
+        } else {
+            map.remove(account);
+        }
+        write_presence(&map);
+    }
+
+    /// Whether a key is stored — without unlocking the keychain.
+    ///
+    /// Backed by a sidecar written whenever a key is saved, cleared, or
+    /// successfully read. The settings dialog uses this so opening it does not
+    /// cost a password prompt.
+    pub fn is_stored(account: &str) -> bool {
+        if cache()
+            .lock()
+            .ok()
+            .is_some_and(|c| c.contains_key(account))
+        {
+            return true;
+        }
+        read_presence().get(account).copied().unwrap_or(false)
+    }
 
     /// Fetch a secret. `None` when it is unset, empty, or unreachable.
     pub fn get(account: &str) -> Option<String> {
+        if let Ok(cache) = cache().lock() {
+            if let Some(secret) = cache.get(account) {
+                return Some(secret.clone());
+            }
+        }
+
         let entry = keyring::Entry::new(SERVICE, account).ok()?;
         let secret = entry.get_password().ok()?;
         let secret = secret.trim().to_string();
         if secret.is_empty() {
+            mark_present(account, false);
             None
         } else {
+            if let Ok(mut cache) = cache().lock() {
+                cache.insert(account.to_string(), secret.clone());
+            }
+            mark_present(account, true);
             Some(secret)
         }
     }
@@ -402,7 +491,12 @@ pub mod secrets {
             .map_err(|e| format!("cannot reach the credential store: {e}"))?;
         entry
             .set_password(secret.trim())
-            .map_err(|e| format!("cannot save the key: {e}"))
+            .map_err(|e| format!("cannot save the key: {e}"))?;
+        if let Ok(mut cache) = cache().lock() {
+            cache.insert(account.to_string(), secret.trim().to_string());
+        }
+        mark_present(account, true);
+        Ok(())
     }
 
     /// Remove a secret. Succeeds when there was nothing there.
@@ -410,10 +504,15 @@ pub mod secrets {
         let entry = keyring::Entry::new(SERVICE, account)
             .map_err(|e| format!("cannot reach the credential store: {e}"))?;
         match entry.delete_credential() {
-            Ok(()) => Ok(()),
-            Err(keyring::Error::NoEntry) => Ok(()),
-            Err(e) => Err(format!("cannot remove the key: {e}")),
+            Ok(()) => {}
+            Err(keyring::Error::NoEntry) => {}
+            Err(e) => return Err(format!("cannot remove the key: {e}")),
         }
+        if let Ok(mut cache) = cache().lock() {
+            cache.remove(account);
+        }
+        mark_present(account, false);
+        Ok(())
     }
 
     /// Whether the credential store can be reached at all.

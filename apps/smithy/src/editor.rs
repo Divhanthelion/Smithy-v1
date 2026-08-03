@@ -11,6 +11,7 @@ use floem::reactive::RwSignal;
 use smithy_editor::{buffer::BufferId, BufferManager, BufferState, LspHandle};
 
 /// Builds the editor pane.
+#[derive(Clone, Copy)]
 pub struct EditorComponent;
 
 impl EditorComponent {
@@ -56,16 +57,20 @@ impl EditorComponent {
                                     .style(|s| s.width_full().height_full().min_height(0.0)),
                             ) as Box<dyn View>
                         }
-                        None => {
-                            Box::new(Container::new(smithy_editor::empty_editor_with_map(project_map)))
-                        as Box<dyn View>
-                        }
+                        None => Box::new(
+                            Container::new(smithy_editor::empty_editor_with_map(project_map)).style(
+                                |s| s.width_full().height_full().min_height(0.0),
+                            ),
+                        )
+                            as Box<dyn View>,
                     }
                 }
                 None => {
                     open_editor.set(None);
-                    Box::new(Container::new(smithy_editor::empty_editor_with_map(project_map)))
-                        as Box<dyn View>
+                    Box::new(
+                        Container::new(smithy_editor::empty_editor_with_map(project_map))
+                            .style(|s| s.width_full().height_full().min_height(0.0)),
+                    ) as Box<dyn View>
                 }
             },
         )

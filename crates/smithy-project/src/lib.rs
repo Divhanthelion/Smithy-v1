@@ -128,6 +128,16 @@ impl Project {
     pub fn context(&self, budget: ContextBudget) -> ProjectContext {
         context::extract(self, budget)
     }
+
+    /// A short structural outline for the empty-editor backdrop.
+    ///
+    /// Not the agent context (that dumps the public API) and not the call graph
+    /// (that is the Benzi-style map, still library-only). Just crates and
+    /// modules — enough to answer "what is in this tree?" without filling the
+    /// pane with every `pub struct`.
+    pub fn outline(&self) -> String {
+        context::outline(self)
+    }
 }
 
 /// Whether a manifest declares a workspace with members.

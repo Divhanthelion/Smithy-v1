@@ -354,6 +354,8 @@ pub struct AgentState {
     /// the previous repository behind the new one's empty pane would be worse
     /// than no map at all.
     pub project_map: RwSignal<String>,
+    /// The call graph shown in the center pane (Benzi-style map).
+    pub call_graph: crate::call_graph::CallGraphUi,
     /// So switching project can re-root the language server too. Without this,
     /// the servers kept analysing whichever project was opened first — see
     /// `LspRegistry::current_client_for`.
@@ -530,6 +532,7 @@ pub fn init_state() -> (AppState, AppSignals, AgentState) {
         diagnostics: DiagnosticsState::new(),
         balance: crate::meters::BalanceCache::new(),
         project_map: RwSignal::new(String::new()),
+        call_graph: crate::call_graph::CallGraphUi::new(),
     };
 
     let app_state = AppState {
@@ -818,6 +821,12 @@ pub fn setup_agent_effect(agent: AgentState) {
                             "Resumed this project's last conversation.".into(),
                         ));
                     }
+                    // Always say so in the transcript. The header label changes
+                    // quietly enough that a Save & reconnect can look like it
+                    // did nothing — this is the receipt.
+                    panel.push(smithy_editor::AgentEntry::Notice(format!(
+                        "Connected · {model_label}"
+                    )));
                     panel.model_label.set(model_label);
                     panel.context_limit.set(context_limit);
                     panel.context_label.set(context_summary);

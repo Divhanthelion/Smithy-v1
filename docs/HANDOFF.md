@@ -1,235 +1,251 @@
-# Handoff
+# Handoff — 2026-08-03 session
 
-Everything built in one session, what is actually proven, what to test, and how
-to finish the call graph.
+Continuation of the prior handoff (`03c7e13`). This document is for the next
+model/session: what was done, what the user verified by eye, what is still
+broken, and the open design questions.
 
-**Read the verification table first.** 938 tests pass, and that is a weaker claim
-than it sounds: a large amount of this is floem view code, and this repository
-has **no view-level test harness at all**. A passing suite here means the logic
-under the UI is right. It says nothing about whether anything renders.
+**Manual test project:** `~/Desktop/kernelos-master`  
+**Install:** `cargo install --path apps/smithy --force` → `~/.cargo/bin/smithy`  
+**Data dir:** `~/.local/share/smithy/`
 
 ---
 
-## 1. State of play
+## 1. Verdict in one paragraph
 
-Fourteen commits, `ba036dd` → `f2e14b8`. Grouped by how much they can be trusted.
+§2.1 automated floor passed (938 tests). Milestone 5 call-graph UI is wired and
+**has rendered successfully** on kernelos (278 nodes · 355 edges · focus on
+`Terminal::execute_command`). Immediately after, smithy went **Not Responding**
+(~563 MB) — two paint-path bugs were then fixed in this commit (reactive size
+loop + hashing the whole tree every frame); that hang fix is **compiled and
+unit-tested but not yet re-verified in the GUI**. Keychain still prompted the
+user **three times** despite deferring Brave; root cause is macOS per-item ACL
++ ad-hoc signed `cargo install` binaries, not “one password for the whole
+keychain.” Better architectures are sketched in §5.
 
-### Proven against live external systems
+---
 
-| What | Evidence |
+## 2. What this session changed (by theme)
+
+### 2.1 Automated floor (§2.1) — PASSED
+
+| Check | Result |
 |---|---|
-| DeepSeek backend | Real API. Catalogue lists 2 models; balance endpoint returned $9.93 of $10. |
-| LM Studio catalogue + load | Real server. 13 models listed, `liquid/lfm2.5-1.2b` loaded in 4.7 s and unloaded. |
-| OpenRouter catalogue | Real API. 337 models, 17 free, 14 of those tool-capable. |
-| Symbol index + enclosure | Checked by eye: `desktop.rs:400` → `Desktop::restore_session` (392–428); `:31`, in an enum, correctly nothing. |
-| SCIP reader | Cross-checked against an independent Python parse written *first*: 25 docs / 14,027 occurrences / 2,445 roles, identical. |
-| Call graph | `Desktop::restore_session`'s five callees confirmed by reading lines 392–428. Pointed at itself, `CallGraph::assemble` correctly reports its own three callees, ×2 each. |
-| Persistence + staleness | Appended a line to `scip.rs` → `1 changed`, named it; reverted → `current`. |
-| Reasoning capture | **37 reasoning blocks** stored in the kernelos session. Previously always 0. |
-| Attachments | User attached `TRIAGE.md` in a real run; the panel showed *"Attached 1 file"*. |
-| DeepSeek doing real work | 27 build errors → 0 on kernelos, verified independently by `cargo check`. |
+| `cargo test --workspace` | 938 passed |
+| `cargo build --workspace` | OK (known warning: unused `longitude_from_timezone`) |
+| CLI harnesses (symbols, scip, callgraph, models, transcript) | OK on this repo / kernelos as applicable |
 
-### Unit-tested, never seen running
+### 2.2 GUI work done this session
 
-Everything here compiles, has tests, and **has never been looked at in the GUI**.
-This is the real risk surface.
+**Meters / rust-analyzer attribution**
+- Was summing *all* `rust-analyzer` processes on the machine (Claude Code’s ~9 GB
+  + smithy’s). Fixed: attribute by PPID; show `+N elsewhere`; amber only on
+  smithy’s analyzer.
 
-- Settings dialog: rendering, model picker, filters, save-and-reconnect
-- Blocking write-review gate against a real model
-- `⚠ edits land directly` auto-approve toggle
-- Explorer `+` attach button
-- Menu-bar meters (spend, memory)
-- Project map behind an empty editor
-- `Code → Stop / Start Language Server`
-- Panel chrome fixes — the user saw the *broken* version; the fix is installed but unseen
-- `explore` sub-agent driven by a real model
-- `web_search` — the Brave key is in the keychain and the tool has never been called
-- The step wrap-up warning at 4/5 of budget
+**Empty-editor project map**
+- Absolute-only stack collapsed; circuit showed through; ghost text invisible.
+  Fixed layout + `FG_FAINT` + delivery via `app_state::bridge`.
+- Clarified: this outline is *not* the Benzi map. Real map = Milestone 5 call
+  graph. Outline uses `Project::outline()` (crates + modules only).
 
-### Not started
+**Reconnect / model switch**
+- Transcript notice: `Connected · {model}`.
+- **Save & reconnect:** if provider/model/URL changed → `clear_context` (fresh
+  session); else resume. Header Reconnect still resumes.
+- User confirmed connection to `google/gemma-2-27b-it:free` (OpenRouter).
 
-- Call graph milestones 5 (rendering) and 6 (live linking)
-- Nothing in the app writes a `callgraph.json` yet — the module is library-only
+**Keyring spam (partial)**
+- Settings open used to call `secrets::get` 3× (presence). Fixed:
+  `secrets::is_stored` via `~/.local/share/smithy/key_presence.json` + process
+  cache. Current presence file marks `openrouter-api-key` and `brave-api-key`.
+- Launch used to unlock provider **and** Brave in one `spawn_blocking`. Brave
+  is now deferred: register `WebSearch::deferred` when `is_stored`/`env` says a
+  key exists; unlock only on first `web_search`.
+- **User still got three password prompts.** See §5.
 
----
+### 2.3 Milestone 5 — call graph UI (DONE, hang fixed in same commit)
 
-## 2. Test plan
+**New file:** `apps/smithy/src/call_graph.rs` (~800 lines)
 
-Ordered by *risk × cheapness*. Roughly 40 minutes to get through §2.1 and §2.2.
+**Wiring**
+- `AgentState.call_graph: CallGraphUi`
+- Center pane `dyn_container` swaps editor ↔ graph when `visible`
+- Menus: `Agent → Build Call Graph`, `Agent → Show Call Graph`,
+  `View → Call Graph` toggle
+- Load from `registry.callgraph_path` on project open; clear on project switch
+- Explicit build only (`CallGraph::build` ~10 s / ~2 GB); never auto
 
-### 2.1 Automated — the floor
+**Behavior (verified by user screenshot)**
+- Focus-relative layered layout (callers above, callees below)
+- Header: `278 nodes · 355 edges · 2 added since indexing`
+- Hop toggle, Rebuild, Editor
+- Click to refocus; double-click → open file:line
+- Persisted at
+  `~/.local/share/smithy/projects/kernelos-master-ebfea94305350e37/callgraph.json`
+  (~44 KB)
 
-```bash
-cargo test --workspace          # expect 938 passing, 0 failing
-cargo build --workspace         # expect 1 pre-existing warning (longitude_from_timezone)
-cargo install --path apps/smithy --force
-```
+**Bug that made Build look like a no-op (fixed)**
+- Menu actions created `Effect::new` with **no reactive owner** → disposed
+  before the worker replied. Switched to settings-style `poll_once`
+  (`exec_after` polling). Progress/errors also push `AgentEntry::Notice/Error`.
 
-Then the CLI harnesses, which cover the parts with no UI:
-
-```bash
-cargo run -p smithy-project --example symbols   -- . 
-cargo run -p smithy-project --example symbols   -- . --at crates/smithy-project/src/symbols.rs:300
-cargo run -p smithy-project --example scip      -- /tmp/x.scip
-cargo run -p smithy-project --example callgraph -- . --scip /tmp/x.scip restore_session
-cargo run -p smithy-agent   --example models    -- deepseek
-cargo run -p smithy-agent   --example transcript -- list
-```
-
-### 2.2 Manual — the GUI, in dependency order
-
-Each step should be done before the one below it, because a failure early
-invalidates what follows.
-
-**A. It starts and the chrome is intact.**
-1. `smithy ~/Desktop/kernelos-master`
-2. The agent panel header reads `Agent` — **not `A ge nt`**. Tool rows read
-   `bash`, not `bas h`. This is the fix the user has not yet seen.
-3. Top-right of the menu bar shows memory, and spend if DeepSeek is selected.
-4. With no file open, the editor area shows the project map behind the shortcut
-   list.
-
-**B. Settings.** `Agent → Backend Settings…`
-1. The model list populates on open. Free-only is on for OpenRouter.
-2. `Tool-capable` filter: unchecking it should reveal ~4 more models on
-   DeepSeek/LM Studio.
-3. Change the model, **Save & reconnect**. Header shows the new model.
-4. Reopen: the setting persisted. Check `~/.local/share/smithy/provider.json`.
-5. The key field must be **empty** on open and say a key is saved.
-
-**C. Attachments.**
-1. Click `+` on a file in the Explorer. The agent panel opens; a chip appears.
-2. Click the chip → it dims (excluded). Click again → included.
-3. Drag a file from Finder onto the panel; the drop outline appears.
-4. Send a message. Transcript shows `Attached 1 file: …`; chips clear.
-
-**D. The review gate — the highest-value test.** This is the fix for the
-failure that started all of this.
-1. Ensure the header reads `✓ edits reviewed`.
-2. Ask for a small edit: *"add a doc comment to the top of src/lib.rs"*.
-3. The diff modal opens **and the agent visibly waits** — the step row stays
-   spinning. That waiting is the entire point.
-4. Accept. The tool result must read **accepted in full**, as a *success*.
-   If you see `waiting for the user to approve`, the blocking gate did not take.
-5. Reject on a second edit → the model should stop, not retry.
-6. Toggle to `⚠ edits land directly` and repeat: no modal, edit lands.
-
-**E. Budgets and traces.**
-1. Run a long task. Around step 144 of 180 the agent should be told how many
-   calls remain and asked to wrap up.
-2. Afterwards: `transcript list` shows a non-zero reasoning count;
-   `transcript show <FILE> --reasoning` renders it.
-
-**F. Memory.** `Code → Stop Language Server` → the meter says
-`analyzer stopped` and RSS drops in Activity Monitor. `Start Language Server`
-brings it back.
-
-**G. Tools.** Ask *"search the web for the yew 0.23 changelog"* (needs the Brave
-key, which is stored) and *"use explore to find where plugin instantiation
-happens"*.
-
-### 2.3 Known-untested edge paths
-
-Worth a look if time allows; none are blocking.
-
-- Project switch while a review modal is open (`review.abandon` answers the
-  blocked call — the path exists and has never fired).
-- Turn hitting `max_seconds` while blocked on a review.
-- Settings dialog when the keychain is unavailable.
-- A project with no Rust at all (the `symbol` tool should say "use grep").
+**Hang after graph appeared (fixed in this commit, GUI retest pending)**
+1. Canvas paint did `ui.size.set(...)` every frame; `dyn_container` depended on
+   `size` → infinite reactive rebuild → **Not Responding**.
+2. `layout()` called `CallGraph::staleness(root)` every paint — full
+   `ignore::Walk` + content-hash of every `.rs` file. Cached on
+   `CallGraphUi.stale` at build/load instead.
 
 ---
 
-## 3. Remaining work
+## 3. What the user saw
 
-### Milestone 5 — rendering
+1. Call graph **did** appear (Benzi-style focus map on `Terminal::execute_command`
+   with `cmd_*` callees). Success for M5 rendering.
+2. App then froze; Activity Monitor showed `smithy (Not Responding)`, ~563 MB,
+   41 threads, low system memory pressure (64 GB machine, ~14 GB used). Not an
+   OOM — a UI-thread / reactive hang.
+3. Keychain: **three** password entries despite “ask once” work.
 
-The largest single piece, deliberately last so everything beneath it is proven.
-
-**Prerequisite, and it is small:** nothing in the app builds or loads a graph
-yet. Add to `apps/smithy`:
-- `CallGraph::build(root)` on a worker, triggered by an explicit menu action
-  (`Agent → Build Call Graph`), never automatically — it costs ~10 s and 2.3 GB.
-- Load `registry.callgraph_path(root)` at startup; hold it in `AgentState`.
-- Show `staleness(root).describe()` in the header when non-empty.
-
-**The view.** floem `canvas`; precedent for drawing in this codebase is
-`squiggle.rs` (overlay geometry) and `celestial.rs` (projection).
-
-- **Always focus-relative.** 2,221 nodes cannot be laid out usefully. Render the
-  focus node, its callers above, its callees below, one hop by default, two on
-  request. Cap at ~60 visible with `+N more`.
-- **Layered, not force-directed.** Callers → focus → callees is a DAG-ish
-  layering; a physics simulation would move nodes between frames and make the
-  map unreadable as a *reference*. Deterministic layout matters more than
-  prettiness here.
-- Node width from the label; edge thickness from `Edge::sites`.
-- **Stale nodes dim and dash**, driven by `node_is_stale`. This is the honesty
-  requirement: the map must never present a snapshot as current.
-- Interactions: click a node to re-focus; double-click to open `file:line` in
-  the editor (`handle_file_open` already exists); hover for the signature;
-  scroll to pan, ⌘-scroll to zoom.
-- Empty state: no graph yet → a Build button and the cost, stated plainly.
-
-**Where it lives.** A new panel, sharing the editor area — probably a tab
-alongside the editor rather than a fourth resizable pane, since the layout is
-already at three.
-
-### Milestone 6 — live linking
-
-What makes it verification rather than decoration.
-
-- `AgentPanelState` (or a sibling) gains `touched: RwSignal<Vec<String>>` —
-  `file:line` or qualified names the agent has read, edited, or looked up.
-- Fill it from the existing `TurnEvent::ToolStarted`/`ToolFinished` stream in
-  `app_state::setup_agent_effect`: `read`/`edit`/`write` give a path, `symbol`
-  gives a name.
-- The canvas highlights matching nodes, brightest most-recent, fading over ~30 s.
-- Clicking a highlighted node re-focuses the graph there.
-
-**The one design question left open:** whether the graph should auto-focus to
-follow the agent, or stay where you put it and only highlight. Following is
-impressive and makes the view useless for checking anything, because it moves
-while you read. Recommend highlight-only, with a "follow agent" toggle default
-off.
+§2.2 checklist items C–G (attachments, review gate, budgets, LSP stop/start,
+web_search/explore) were **not** completed this session.
 
 ---
 
-## 4. Landmines
+## 4. Keychain deep dive — why three prompts, and can we do better?
 
-Decisions already made that will look wrong without their reason.
+### 4.1 Facts on this machine
 
-**Do not put enum variants in the context map.** The map is prefilled on every
-request; one 20-variant enum is ~150 tokens per turn for a fact the `symbol`
-tool answers in one call. This was asked for and deliberately declined.
+Three Keychain items under service `smithy`:
 
-**Do not resolve calls by name.** Measured at 55% unambiguous on this workspace,
-failing hardest on `new`, `default`, `run`. A name-matched graph draws confident
-wrong edges — the exact disease the feature cures.
+| Account | In `key_presence.json` |
+|---|---|
+| `openrouter-api-key` | yes |
+| `brave-api-key` | yes |
+| `deepseek-api-key` | present in keychain, **not** in presence sidecar |
 
-**SCIP `local N` symbols are document-scoped.** `local 0` in two files are
-different things. Keying them globally produced an edge claiming one function
-called another 38 times, and 449 fictional self-edges. They are excluded.
+Binary: ad-hoc / linker-signed (`Signature=adhoc`, no Team ID). Every
+`cargo install --force` replaces `~/.cargo/bin/smithy` and **invalidates**
+Keychain ACLs that trusted the previous code directory hash.
 
-**`sources` must come from the indexer's document list, never from nodes.**
-Files of `pub mod` declarations produce no nodes and would silently drop out,
-then report as newly added forever.
+### 4.2 What the code unlocks today
 
-**Reasoning must never enter `History`.** The endpoint does not replay it, and
-putting it there changes the cached prefix every turn — a full cold prefill,
-minutes at real context sizes. It lives in a sidecar; `into_history` still
-round-trips byte-exactly.
+| When | What calls `secrets::get` |
+|---|---|
+| Agent connect | **Only** the active provider key (`build_provider`) |
+| First `web_search` | Brave (deferred) |
+| Settings → refresh models | That provider’s `api_key()` |
+| DeepSeek balance meter | DeepSeek key, only if DeepSeek is selected |
 
-**The write-review gate blocks.** A turn waiting on a review burns `max_seconds`
-(900). That is a real cost, accepted deliberately, because the alternative was
-the model spending a third of its turn guessing whether its edits landed.
+`is_stored` does **not** unlock. So at a clean OpenRouter launch after deferral,
+the *app* should only touch OpenRouter once — **one** Keychain Access dialog
+*if* the ACL still trusts this binary.
 
-**`SMITHY_LSP_LIGHT=1` and the call graph are compatible.** Light mode disables
-`checkOnSave`; call-graph indexing needs the analyzer's inference, not its
-cargo-check process. Stopping the server entirely is what would take the map
-with it.
+### 4.3 Why the user still saw three
 
-**Two bugs this session were caught by numbers looking implausible, not by
-failing tests** — `rename ×38`, and seven files reporting as newly added. For
-this feature, sanity-checking output against real data has been worth more than
-the unit tests. Keep doing it.
+macOS prompts **per keychain item**, not once per app session. Typical causes
+stacked during this session:
+
+1. **Ad-hoc binary churn.** Repeated `cargo install --force` = each new binary
+   is a stranger to every item’s ACL. “Always Allow” for the previous build
+   does not carry over.
+2. **Three separate items.** OpenRouter, Brave, DeepSeek are three credentials.
+   Touching each (launch + settings browse + any residual Brave path before
+   deferral landed, or an older install) = three dialogs.
+3. **Not “login password once for all keys.”** Unlocking the login keychain is
+   separate from granting *this app* access to *this item*. The dialog the user
+   sees is usually the ACL grant (“smithy wants to use …”), which is
+   item-scoped.
+
+So: yes, today it effectively wants an individual grant per API key (and again
+after every reinstall of an unsigned binary). Deferring Brave only removes *one*
+launch-time touch; it does not merge items or stabilize the binary identity.
+
+### 4.4 Better options (for the next session to choose)
+
+Ordered from “smallest change” to “real product.”
+
+| Option | Pros | Cons |
+|---|---|---|
+| **A. Single vault item** — one Keychain account `smithy-secrets` holding JSON `{openrouter, brave, deepseek}` | One ACL grant forever (until binary changes) | Migration; one unlock exposes all keys to the process (already true once cached) |
+| **B. Prefer env / `.env` for day-to-day** | Zero Keychain prompts | Secrets on disk; already supported as fallback |
+| **C. Stable code signature** — Developer ID or even a stable ad-hoc identity with a fixed designated requirement, install via a fixed app bundle path | ACL survives rebuilds | Signing infrastructure; `cargo install` path is hostile to this |
+| **D. Data Protection keychain** (`kSecUseDataProtectionKeychain`) | iOS-like; fewer ACL surprises | Needs `keyring`/Security API work; migration |
+| **E. Stop reinstalling during test** — run `target/release/smithy` without replacing `~/.cargo/bin` | Immediate relief while iterating | Easy to forget; doesn’t help end users |
+| **F. On first grant UI** — document “Always Allow”; open Keychain Access and set “Allow all applications” on the three items | Zero code | Weakens isolation; manual |
+
+**Recommendation for consult:** **A + E short-term**, **C if shipping**. Deferral
+(B-style presence checks) should stay. Do **not** call `get` for unused
+providers on launch.
+
+---
+
+## 5. Remaining work
+
+### Milestone 5 polish
+- [ ] Reinstall, reopen kernelos, confirm graph still builds and **does not hang**
+      after pan/zoom/click (hang fix unverified in GUI).
+- [ ] Staleness refresh only on Rebuild / project focus — not continuously (now
+      cached; may want a manual “Recheck freshness”).
+- [ ] Confirm double-click opens editor at line; Editor button returns to buffer.
+
+### Milestone 6 — live linking (not started)
+- `touched` highlights from tool events; highlight-only; follow-agent off by
+  default. See prior handoff §3 for the full sketch.
+
+### §2.2 still open (C–G)
+Attachments, write-review gate, budgets/reasoning, LSP stop/start,
+`web_search` / `explore` against a live model.
+
+### Keychain
+- Decide A/B/C above; implement chosen approach; verify **one** dialog on a
+  cold launch after a fresh install.
+
+---
+
+## 6. Landmines (still true)
+
+- Do not name-match calls; SCIP `local N` is document-scoped; no enum variants
+  in context map; reasoning never in `History`; write-review gate blocks;
+  `SMITHY_LSP_LIGHT=1` OK with call graph.
+- **floem:** Effects created outside a long-lived owner (menu clicks) die.
+  Use `poll_once` / `exec_after` (settings pattern) or an effect owned by
+  `app_view`.
+- **floem:** Never `signal.set` from a paint/canvas path that another view
+  tracks, unless guarded (“only if changed”). That is how this graph froze.
+- **`CallGraph::staleness`:** tree walk + hash — never on the UI/paint path.
+- **`cargo install --force`:** re-triggers macOS Keychain ACL prompts for
+  ad-hoc binaries. Prefer running the build tree binary while iterating.
+
+---
+
+## 7. File map (this session’s touch surface)
+
+| Path | Role |
+|---|---|
+| `apps/smithy/src/call_graph.rs` | **New** — UI, layout, build/load, hang fixes |
+| `apps/smithy/src/main.rs` | Center-pane switch, menus |
+| `apps/smithy/src/app_state.rs` | `CallGraphUi` on agent state |
+| `apps/smithy/src/agent.rs` | Deferred Brave registration |
+| `apps/smithy/src/settings.rs` | `is_stored` presence, no unlock on open |
+| `apps/smithy/src/meters.rs` | PPID-scoped analyzer RSS |
+| `apps/smithy/src/editor.rs` | Project map / empty editor |
+| `crates/smithy-agent/src/config.rs` | `secrets::{get,set,is_stored}` + presence sidecar |
+| `crates/smithy-tools/src/tools/web_search.rs` | `WebSearch::deferred` |
+| `crates/smithy-project/src/context.rs` | `Project::outline` |
+| `crates/smithy-editor/src/code_editor.rs` | Empty-editor map visibility |
+
+Library call-graph / SCIP code from prior commits is unchanged in spirit;
+this session was almost entirely app wiring + keyring UX + map rendering.
+
+---
+
+## 8. Suggested next-agent first moves
+
+1. `cargo install --path apps/smithy --force` once; launch
+   `smithy ~/Desktop/kernelos-master`.
+2. Expect possibly **one** Keychain dialog (OpenRouter) if ACL was reset by
+   install — note count carefully.
+3. `Agent → Build Call Graph` (or Show if `callgraph.json` exists). Pan, zoom,
+   click a callee, double-click open. Confirm no hang.
+4. Then either implement **single vault keychain item (§4.4 A)** or resume
+   §2.2 D (review gate) — highest product value after map stability.

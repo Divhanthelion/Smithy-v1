@@ -9,8 +9,10 @@
 //! Reading and writing the settings file is a few hundred bytes and happens
 //! inline. The credential store is the exception: `keyring` is synchronous and
 //! the OS may put an authorization prompt in front of the first read from a new
-//! binary. So [`open`] probes availability but never *reads* a key — it only
-//! asks whether one exists — and [`save`] does its writes on a worker.
+//! binary. So [`open`] answers "is a key stored?" from a non-secret sidecar
+//! ([`secrets::is_stored`]) and never unlocks the keychain just to populate the
+//! dialog. The key itself is read only when a backend actually needs it
+//! (catalogue refresh, connect), and then cached for the process.
 //!
 //! Nothing here ever reads a stored key back for display. The only path a secret
 //! takes is *into* the store; see [`smithy_editor::SettingsState`].
@@ -38,17 +40,17 @@ pub fn open(state: SettingsState, data_dir: &Path) {
     state.deepseek_url.set(config.deepseek.base_url.clone());
     state.deepseek_model.set(config.deepseek.model.clone());
 
-    // Presence, not value. `secrets::get` does read the secret, and that is
-    // unavoidable to answer the question at all — but it is dropped here and
-    // never reaches a signal, so it cannot reach the screen.
+    // Presence from the sidecar, never from the keychain. Reading a stored key
+    // just to learn that it exists is what used to cost three password prompts
+    // every time this dialog opened.
     state.keychain_available.set(secrets::available());
     state
         .openrouter_key_stored
-        .set(secrets::get(OPENROUTER_KEY).is_some());
+        .set(secrets::is_stored(OPENROUTER_KEY));
     state
         .deepseek_key_stored
-        .set(secrets::get(DEEPSEEK_KEY).is_some());
-    state.brave_key_stored.set(secrets::get(BRAVE_KEY).is_some());
+        .set(secrets::is_stored(DEEPSEEK_KEY));
+    state.brave_key_stored.set(secrets::is_stored(BRAVE_KEY));
 
     state.forget_typed_secrets();
     state.status.set(String::new());
@@ -290,6 +292,7 @@ pub fn clear_key(state: SettingsState, account: &str) {
         Ok(()) => {
             match account {
                 OPENROUTER_KEY => state.openrouter_key_stored.set(false),
+                DEEPSEEK_KEY => state.deepseek_key_stored.set(false),
                 BRAVE_KEY => state.brave_key_stored.set(false),
                 _ => {}
             }
