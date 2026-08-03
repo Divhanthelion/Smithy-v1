@@ -274,17 +274,24 @@ says in as many words that files with no functions must be recorded too. Sources
 now come from the documents the **indexer** saw, never from the nodes: 107 files
 → 114.
 
-### 5. Rendering — *not started; see `HANDOFF.md` §3 for the executable plan*
-floem `canvas` — precedent exists in `celestial.rs` and `squiggle.rs`.
-Layered layout (callers above, callee below, breadth-first from a focus node),
-bounded to ~60 visible nodes with "+N more" expansion. Click to re-focus, hover
-for the signature, click-through to `file:line`.
-**Done when:** you can start at a symbol and walk the graph without reading any
-text.
-*Largest single piece. Deliberately last, so everything under it is already
-proven.*
+### 5. Rendering — **done (Overview + Focus); polish open — see `HANDOFF.md`**
+floem canvas in `apps/smithy/src/call_graph.rs`. Two modes:
 
-### 6. Live linking — *not started; see `HANDOFF.md` §3*
+- **Overview** (default): Benzi-style whole map — one box per source file,
+  every symbol as a chip, columns fill the center pane, zoom LOD (dots when
+  zoomed out). Click a chip → Focus.
+- **Focus**: layered callers / focus / callees, wrap for high fan-out, fit
+  camera, bus edges, jump search, hubs, Back history.
+
+Build/load is explicit (`Agent → Build Call Graph`); never auto. Hang hazards
+(paint-path `set`, staleness on paint) are documented in `HANDOFF.md` §6.
+
+**Acceptance (human):** Overview fills the pane and shows every symbol;
+Focus on a hub (e.g. kernelos `Terminal::execute_command`) is readable —
+no overflow strip, no forged grid as map ground. Double-click → `file:line`
+still open.
+
+### 6. Live linking — *not started; see `HANDOFF.md` §5*
 Nodes highlight as the agent reads files, edits them, and calls `symbol`.
 **Done when:** running a turn visibly lights the path the agent walked.
 *This is the part that makes it verification rather than decoration.*
@@ -323,8 +330,9 @@ reported, not hidden.
 
 ## Explicitly out of scope
 
-- **Whole-program layout.** 1,840 nodes cannot be drawn usefully at once. The
-  graph is always viewed from a focus node.
+- **Force-directed whole-program soup.** 1,840 naked nodes cannot be drawn as
+  one hairball. Overview is file-clustered (Benzi-style boxes); Focus is always
+  from a symbol. Do not replace either with a global force layout.
 - **Data-flow, inheritance chains, runtime tracing.** Benzi's other features.
   The first needs analysis we do not have; the third is Python-only there and
   meaningless for a compiled binary.

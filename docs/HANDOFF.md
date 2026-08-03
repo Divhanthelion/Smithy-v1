@@ -1,297 +1,189 @@
-# Handoff — 2026-08-03 session
+# Handoff — 2026-08-03 (evening)
 
-Continuation of the prior handoff (`03c7e13`). This document is for the next
-model/session: what was done, what the user verified by eye, what is still
-broken, and the open design questions.
+Continuation after the call-graph Overview pass. For the next model
+(Claude): what landed, what the user accepted by eye, what is still open.
 
 **Manual test project:** `~/Desktop/kernelos-master`  
 **Install:** `cargo install --path apps/smithy --force` → `~/.cargo/bin/smithy`  
-**Data dir:** `~/.local/share/smithy/`
+**Prefer while iterating:** `cargo run -p smithy --release` (or
+`target/release/smithy`) so ad-hoc reinstalls do not re-prompt Keychain.  
+**Data dir:** `~/.local/share/smithy/`  
+**Graph for kernelos:**
+`~/.local/share/smithy/projects/kernelos-master-ebfea94305350e37/callgraph.json`
+(~278 nodes, ~355–366 edges, 24 files)
+
+Inspiration: [Benzi](https://github.com/shobhitx64/Benzi) / CodeMap — file-
+clustered whole map + click-into neighborhood.
 
 ---
 
 ## 1. Verdict in one paragraph
 
-§2.1 automated floor passed. Call graph has **Overview** (Benzi-style file
-clusters of the whole graph) and **Focus** (1-hop neighborhood). Overview is
-the default on open so you are not trapped in one pocket; click a chip to
-drill into Focus, Overview button to return. Keychain still prompts per item
-after adhoc reinstalls.
+§2.1 automated floor passed earlier. Call graph UI has **Overview** (whole
+map, one box per source file, every symbol as a chip) and **Focus** (1-hop
+neighborhood with wrap, fit camera, bus edges, jump/Back/hubs). Overview is
+the default on load/build. User accepted Overview as “pretty stinkin good”
+after a wider fill-the-pane pack and dropping the 8-chip/`+N` cap. Focus
+fan-out rewrite from earlier is in place; double-click → editor is still
+open. Keychain still prompts per item after ad-hoc reinstalls.
 
 ---
 
-## 2. What this session changed (by theme)
+## 2. What changed this stretch (call graph)
 
-### 2.1 Automated floor (§2.1) — PASSED
+All of this lives in `apps/smithy/src/call_graph.rs` (~2.1k lines).
 
-| Check | Result |
+### 2.1 Modes
+
+| Mode | Behavior |
 |---|---|
-| `cargo test --workspace` | 938 passed |
-| `cargo build --workspace` | OK (known warning: unused `longitude_from_timezone`) |
-| CLI harnesses (symbols, scip, callgraph, models, transcript) | OK on this repo / kernelos as applicable |
+| **Overview** (default) | File clusters across the full center pane; chips = symbols; edges between chips; click chip → Focus |
+| **Focus** | Callers above / focus / callees below; wrap; fit camera; bus edges for high fan-out |
 
-### 2.2 GUI work done this session
+Toolbar: Overview / Focus / Rebuild / Editor. Jump search + hub pills + Back
+history work in Focus.
 
-**Meters / rust-analyzer attribution**
-- Was summing *all* `rust-analyzer` processes on the machine (Claude Code’s ~9 GB
-  + smithy’s). Fixed: attribute by PPID; show `+N elsewhere`; amber only on
-  smithy’s analyzer.
+### 2.2 Overview layout (accepted direction)
 
-**Empty-editor project map**
-- Absolute-only stack collapsed; circuit showed through; ghost text invisible.
-  Fixed layout + `FG_FAINT` + delivery via `app_state::bridge`.
-- Clarified: this outline is *not* the Benzi map. Real map = Milestone 5 call
-  graph. Outline uses `Project::outline()` (crates + modules only).
+Earlier Overview was a **tall pillar**: it reused the Focus strip width
+(~720px) → ~2 columns → fit-zoom crushed it. Fixes that landed:
 
-**Reconnect / model switch**
-- Transcript notice: `Connected · {model}`.
-- **Save & reconnect:** if provider/model/URL changed → `clear_context` (fresh
-  session); else resume. Header Reconnect still resumes.
-- User confirmed connection to `google/gemma-2-27b-it:free` (OpenRouter).
+1. **`overview_grid_width`** — use the real pane (≈480–1800), not the Focus
+   strip.
+2. **Fill width** — `pick_overview_columns` takes as many columns as
+   `OV_MIN_COL` (135) allows; column widths **stretch** so the grid spans
+   the pane (no empty side gutters).
+3. **Every symbol** — no 8-chip cap / no `+N` markers. Degree-sort hubs
+   first inside each file box.
+4. **Zoom LOD** — below `OV_LABEL_ZOOM` (0.55), chips draw as canvas dots;
+   labels appear when zoomed in. File titles stay.
+5. **Glyphs** — status / hop chrome uses ASCII (`N callers / M callees`),
+   not `↑`/`↓`/middots (Menlo was tofu-boxing them).
 
-**Keyring spam (partial)**
-- Settings open used to call `secrets::get` 3× (presence). Fixed:
-  `secrets::is_stored` via `~/.local/share/smithy/key_presence.json` + process
-  cache. Current presence file marks `openrouter-api-key` and `brave-api-key`.
-- Launch used to unlock provider **and** Brave in one `spawn_blocking`. Brave
-  is now deferred: register `WebSearch::deferred` when `is_stored`/`env` says a
-  key exists; unlock only on first `web_search`.
-- **User still got three password prompts.** See §5.
+User feedback after the first Overview pass: good, but go wider and include
+the truncated symbols — both done and reinstalled.
 
-### 2.3 Milestone 5 — call graph UI (plumbing DONE, rendering REJECTED)
+### 2.3 Focus (earlier this session; still true)
 
-**New file:** `apps/smithy/src/call_graph.rs` (~800 lines)
+Wrap/columnize high fan-out; `fit_camera`; opaque `BG_BASE` ground; bus
+edges; moderate `default_focus` (not global max degree); two-line chips
+with `file:line`; jump / hubs / Back.
 
-**Wiring (OK)**
-- `AgentState.call_graph: CallGraphUi`
-- Center pane `dyn_container` swaps editor ↔ graph when `visible`
-- Menus: `Agent → Build Call Graph`, `Agent → Show Call Graph`,
-  `View → Call Graph` toggle
-- Load from `registry.callgraph_path` on project open; clear on project switch
-- Explicit build only (`CallGraph::build` ~10 s / ~2 GB); never auto
+### 2.4 Plumbing (earlier; still true)
 
-**First live render (kernelos)** — data OK, presentation not:
-- Header: `278 nodes · 355 edges · 2 added since indexing`
-- Focused `Terminal::execute_command` with `cmd_*` callees
-- Persisted at
-  `~/.local/share/smithy/projects/kernelos-master-ebfea94305350e37/callgraph.json`
-- **User rejected the look** — see §3b. Treat as failed acceptance, not polish.
+- Build/load via `poll_once` (menu `Effect` was disposed → silent no-op).
+- Hang fixes: do not `size.set` every paint; cache `Staleness` off the paint
+  path (`CallGraphUi.stale`).
+- Explicit build only; never auto-index on open.
 
-**Bug that made Build look like a no-op (fixed)**
-- Menu actions created `Effect::new` with **no reactive owner** → disposed
-  before the worker replied. Switched to settings-style `poll_once`.
+### 2.5 Tests
 
-**Hang after graph appeared (fixed in `b7f525d`, GUI retest pending)**
-1. Canvas paint did `ui.size.set(...)` every frame → reactive loop.
-2. `layout()` called `staleness()` every paint — now cached on `CallGraphUi.stale`.
+```bash
+cargo test -p smithy --bin smithy call_graph::
+```
+
+Includes `overview_includes_every_node_and_packs_wide` (24×20 synthetic:
+every chip present, grid spans `overview_grid_width`, ≥5 columns on
+~1100px).
 
 ---
 
-## 3. What the user saw
+## 3. What the user saw / accepted
 
-Screenshot (saved in the Cursor assets for this chat):
-`Screenshot_2026-08-03_at_1.54.28_AM-…png` — center pane titled Call graph,
-focus `Terminal::execute_command`, one caller above (`Terminal::update`), a
-horizontal strip of `cmd_*` callees below, forged perspective-grid backdrop
-visible in the pane.
+| Moment | Verdict |
+|---|---|
+| First Focus strip (hub + `cmd_*` row) | **Rejected** — unreadable star/strip; hang followed (fixed) |
+| Focus rewrite (wrap, fit, bus, opaque) | Landed; not re-litigated after Overview work |
+| Overview v1 (file boxes, still narrow / `+N`) | “pretty stinkin good” but go wider + include everything |
+| Overview v2 (wide fill + all chips) | Installed; awaiting a quick relaunch confirm |
 
-1. Graph **appeared** (data + wiring OK).
-2. User: rendering is **totally unacceptable** — not a polish nit; the map fails
-   as a readable reference. Prior handoff wrongly called this “Benzi-style
-   success.” Correct that.
-3. App then froze; Activity Monitor `smithy (Not Responding)`, ~563 MB. Hang
-   fixes in `b7f525d`, GUI retest pending.
-4. Keychain: **three** password entries despite “ask once” work.
+Screenshots live in the Cursor chat assets for this thread
+(`03757441-07e3-4158-869c-b7a863c271eb`).
 
-§2.2 C–G not done this session.
+§2.2 C–G (attachments, write-review, budgets, LSP stop/start, live
+`web_search` / `explore`) were not the focus of this stretch.
 
 ---
 
-## 3b. Why the graph looks bad — root causes (not “wrong data”)
+## 4. Keychain (unchanged; still open)
 
-The SCIP graph for that focus is plausible (a command dispatcher with many
-`cmd_*` callees). The failure is **layout + presentation**, concentrated in
-`apps/smithy/src/call_graph.rs` `layout` / `graph_pane`.
+macOS prompts **per Keychain item**, and ad-hoc `cargo install --force`
+invalidates ACLs. App-side: provider key at connect; Brave deferred via
+`WebSearch::deferred` + `secrets::is_stored`. Presence sidecar at
+`~/.local/share/smithy/key_presence.json`.
 
-### What the screenshot shows going wrong
-
-| Symptom | Cause in code |
-|---|---|
-| Callees crushed into one long horizontal strip; labels truncated / clipped at pane edges | `place_row` puts **every** neighbor on a **single Y**; no wrap, no column layout, no viewport width budget |
-| Bottom row cut off by the panel | Layout is abstract (±`ROW_GAP`); no fit-to-pane / initial camera; high fan-out just spills |
-| Unreadable fan of edges (comb) | All edges drawn focus-center → sibling centers; with 8–30 siblings this is noise, not a path you can follow |
-| Lands on the worst case first | `default_focus` picks the **busiest** node → `execute_command`-style hubs by design |
-| Perspective grid behind the nodes | Forged aesthetic shell is transparent; grid shows through / around the map. A reference diagram needs an opaque, quiet ground — not the celestial backdrop |
-| “Walk without reading text” fails | Plan’s done criterion. Near-identical `cmd_*` pills in a strip force reading; nothing hierarchical or spatial distinguishes them |
-
-### What is *not* wrong
-
-- Edge correctness for this focus (caller/callee set matches a dispatcher).
-- Layered-not-force-directed decision (still right; Benzi-ish verification map).
-- Cap of ~60 / `+N more` (present, but we show too many in one row before hiding).
-
-### What “tweaking” must mean (concrete)
-
-Not cosmetics. The layout function has to become **viewport-aware** and
-**degree-aware**:
-
-1. **Wrap or columnize high-degree layers.** If callees won’t fit in ~pane width
-   at readable label size, use multiple rows (or a vertical stack under the
-   focus) and raise `+N more` earlier — never a single overflowing strip.
-2. **Fit camera to content on focus change.** After layout, set pan/zoom so the
-   focus + one hop are inside the pane with margin. Clipping the bottom row is a
-   bug.
-3. **Opaque map chrome.** Force `BG_BASE` (or a dedicated map ground) for the
-   whole center pane; do not let the forged grid read as part of the graph.
-4. **Smarter default focus.** Prefer a node with moderate degree (e.g. 3–12
-   neighbors), or the last-edited / agent-touched symbol — not global max degree.
-5. **Edge routing for wide layers.** Orthogonal or bundled stubs, or draw only
-   to the nearest edge of each node, so a dispatcher doesn’t become a black fan.
-6. **Hover = signature**, not only `file:line` (plan already required this).
-
-Inspiration remains [Benzi](https://github.com/shobhitx64/Benzi) / CodeMap: a map
-you **click through** to verify a path. Current UI is a star diagram of labels.
-
-**Status:** items 1–5 implemented in `call_graph.rs` (wrap + `fit_camera` + bus
-edges + opaque fill + moderate `default_focus`); hover shows qualified name +
-location (no separate signature field in the graph schema yet). Awaiting user
-acceptance on the kernelos hub case.
-
----
-
-## 4. Keychain deep dive — why three prompts, and can we do better?
-
-### 4.1 Facts on this machine
-
-Three Keychain items under service `smithy`:
-
-| Account | In `key_presence.json` |
-|---|---|
-| `openrouter-api-key` | yes |
-| `brave-api-key` | yes |
-| `deepseek-api-key` | present in keychain, **not** in presence sidecar |
-
-Binary: ad-hoc / linker-signed (`Signature=adhoc`, no Team ID). Every
-`cargo install --force` replaces `~/.cargo/bin/smithy` and **invalidates**
-Keychain ACLs that trusted the previous code directory hash.
-
-### 4.2 What the code unlocks today
-
-| When | What calls `secrets::get` |
-|---|---|
-| Agent connect | **Only** the active provider key (`build_provider`) |
-| First `web_search` | Brave (deferred) |
-| Settings → refresh models | That provider’s `api_key()` |
-| DeepSeek balance meter | DeepSeek key, only if DeepSeek is selected |
-
-`is_stored` does **not** unlock. So at a clean OpenRouter launch after deferral,
-the *app* should only touch OpenRouter once — **one** Keychain Access dialog
-*if* the ACL still trusts this binary.
-
-### 4.3 Why the user still saw three
-
-macOS prompts **per keychain item**, not once per app session. Typical causes
-stacked during this session:
-
-1. **Ad-hoc binary churn.** Repeated `cargo install --force` = each new binary
-   is a stranger to every item’s ACL. “Always Allow” for the previous build
-   does not carry over.
-2. **Three separate items.** OpenRouter, Brave, DeepSeek are three credentials.
-   Touching each (launch + settings browse + any residual Brave path before
-   deferral landed, or an older install) = three dialogs.
-3. **Not “login password once for all keys.”** Unlocking the login keychain is
-   separate from granting *this app* access to *this item*. The dialog the user
-   sees is usually the ACL grant (“smithy wants to use …”), which is
-   item-scoped.
-
-So: yes, today it effectively wants an individual grant per API key (and again
-after every reinstall of an unsigned binary). Deferring Brave only removes *one*
-launch-time touch; it does not merge items or stabilize the binary identity.
-
-### 4.4 Better options (for the next session to choose)
-
-Ordered from “smallest change” to “real product.”
-
-| Option | Pros | Cons |
-|---|---|---|
-| **A. Single vault item** — one Keychain account `smithy-secrets` holding JSON `{openrouter, brave, deepseek}` | One ACL grant forever (until binary changes) | Migration; one unlock exposes all keys to the process (already true once cached) |
-| **B. Prefer env / `.env` for day-to-day** | Zero Keychain prompts | Secrets on disk; already supported as fallback |
-| **C. Stable code signature** — Developer ID or even a stable ad-hoc identity with a fixed designated requirement, install via a fixed app bundle path | ACL survives rebuilds | Signing infrastructure; `cargo install` path is hostile to this |
-| **D. Data Protection keychain** (`kSecUseDataProtectionKeychain`) | iOS-like; fewer ACL surprises | Needs `keyring`/Security API work; migration |
-| **E. Stop reinstalling during test** — run `target/release/smithy` without replacing `~/.cargo/bin` | Immediate relief while iterating | Easy to forget; doesn’t help end users |
-| **F. On first grant UI** — document “Always Allow”; open Keychain Access and set “Allow all applications” on the three items | Zero code | Weakens isolation; manual |
-
-**Recommendation for consult:** **A + E short-term**, **C if shipping**. Deferral
-(B-style presence checks) should stay. Do **not** call `get` for unused
-providers on launch.
+**Better options (pick one next):**  
+A single vault item · prefer env · real code signing · stop reinstalling
+while iterating (`target/release/smithy`). Details were in the prior
+handoff §4; recommendation remains **vault + don’t churn the binary**
+short-term, **signing if shipping**.
 
 ---
 
 ## 5. Remaining work
 
-### Milestone 5 — rendering (rewrite landed; human acceptance pending)
-- [x] Wrap/columnize high fan-out; fit camera; opaque ground; bus edges;
-      moderate default focus; hover shows qualified + `file:line`.
-- [ ] **User eyes:** reopen kernelos, focus `Terminal::execute_command` (or let
-      default land elsewhere), confirm readable — no overflow strip, no forged
-      grid as backdrop, no hang on pan/zoom/click.
-- [ ] Double-click → file:line; Editor returns to buffer.
+### Call graph — polish / M5 closeout
+- [ ] Quick relaunch confirm: Overview fills the pane, all symbols visible
+      (zoom/pan as needed), no pillar / no `+N`.
+- [ ] Focus hub case still readable on kernelos
+      (`Terminal::execute_command` or Jump → that symbol).
+- [ ] Double-click chip → open `file:line` in the editor; Editor tab
+      returns to buffer.
+- [ ] Optional: hover signature (schema has no signature field yet —
+      qualified name + location only).
 
 ### Milestone 6 — live linking (not started)
-- `touched` highlights from tool events; highlight-only; follow-agent off by
-  default. See prior handoff §3 for the full sketch.
+- `touched` highlights from tool events; highlight-only; follow-agent off
+  by default.
 
 ### §2.2 still open (C–G)
 Attachments, write-review gate, budgets/reasoning, LSP stop/start,
 `web_search` / `explore` against a live model.
 
 ### Keychain
-- Decide A/B/C above; implement chosen approach; verify **one** dialog on a
-  cold launch after a fresh install.
+- Implement chosen approach (A/B/C); verify **one** dialog on cold launch
+  after a fresh install.
 
 ---
 
 ## 6. Landmines (still true)
 
-- Do not name-match calls; SCIP `local N` is document-scoped; no enum variants
-  in context map; reasoning never in `History`; write-review gate blocks;
-  `SMITHY_LSP_LIGHT=1` OK with call graph.
+- Do not name-match calls; SCIP `local N` is document-scoped; no enum
+  variants in context map; reasoning never in `History`; write-review gate
+  blocks; `SMITHY_LSP_LIGHT=1` OK with call graph.
 - **floem:** Effects created outside a long-lived owner (menu clicks) die.
-  Use `poll_once` / `exec_after` (settings pattern) or an effect owned by
-  `app_view`.
-- **floem:** Never `signal.set` from a paint/canvas path that another view
-  tracks, unless guarded (“only if changed”). That is how this graph froze.
-- **`CallGraph::staleness`:** tree walk + hash — never on the UI/paint path.
-- **`cargo install --force`:** re-triggers macOS Keychain ACL prompts for
-  ad-hoc binaries. Prefer running the build tree binary while iterating.
+  Use `poll_once` / `exec_after` (settings pattern).
+- **floem:** Never unconditional `signal.set` from a paint/canvas path.
+- **`CallGraph::staleness`:** never on the UI/paint path — use
+  `CallGraphUi.stale`.
+- **`cargo install --force`:** re-triggers Keychain ACL prompts for ad-hoc
+  binaries.
+- **Overview vs Focus width:** Focus still uses `row_width_for_pane`
+  (capped ~720). Overview must keep `overview_grid_width` — do not reunify
+  them casually or the pillar returns.
 
 ---
 
-## 7. File map (this session’s touch surface)
+## 7. File map
 
 | Path | Role |
 |---|---|
-| `apps/smithy/src/call_graph.rs` | **New** — UI, layout, build/load, hang fixes |
+| `apps/smithy/src/call_graph.rs` | Overview + Focus UI, layout, build/load |
 | `apps/smithy/src/main.rs` | Center-pane switch, menus |
 | `apps/smithy/src/app_state.rs` | `CallGraphUi` on agent state |
 | `apps/smithy/src/agent.rs` | Deferred Brave registration |
-| `apps/smithy/src/settings.rs` | `is_stored` presence, no unlock on open |
-| `apps/smithy/src/meters.rs` | PPID-scoped analyzer RSS |
-| `apps/smithy/src/editor.rs` | Project map / empty editor |
-| `crates/smithy-agent/src/config.rs` | `secrets::{get,set,is_stored}` + presence sidecar |
-| `crates/smithy-tools/src/tools/web_search.rs` | `WebSearch::deferred` |
-| `crates/smithy-project/src/context.rs` | `Project::outline` |
-| `crates/smithy-editor/src/code_editor.rs` | Empty-editor map visibility |
-
-Library call-graph / SCIP code from prior commits is unchanged in spirit;
-this session was almost entirely app wiring + keyring UX + map rendering.
+| `crates/smithy-agent/src/config.rs` | `secrets::{get,set,is_stored}` |
+| `crates/smithy-project/src/callgraph.rs` | Library graph / staleness |
+| `docs/CALLGRAPH_PLAN.md` | Architecture + milestone checklist |
+| `docs/HANDOFF.md` | This file |
 
 ---
 
 ## 8. Suggested next-agent first moves
 
-1. **Read §3b first.** Do not celebrate that a graph appeared.
-2. Rewrite `layout` / camera / map chrome for high fan-out; acceptance case is
-   kernelos focus `Terminal::execute_command` (or any hub with ≥8 callees) —
-   labels fully visible, no overflow strip, no forged grid as backdrop.
-3. Then: hang retest, then either keychain vault (§5) or §2.2 D (review gate).
+1. Relaunch smithy on kernelos, open Call Graph — confirm Overview fills
+   width and includes every symbol; click into Focus on a hub and Back.
+2. Wire double-click → editor at `file:line` if that is the next UX ask.
+3. Otherwise: keychain vault (§4) or §2.2 write-review gate — user pick.
+4. Do **not** reopen “is Overview a pillar?” unless a regression shows;
+   the layout math and tests cover the failure mode.

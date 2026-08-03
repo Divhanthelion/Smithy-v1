@@ -634,14 +634,17 @@ fn row_width_for_pane(pane_w: f64) -> f64 {
 
 // --- overview layout (file clusters) ----------------------------------------
 
-const OV_CHIP_H: f64 = 22.0;
-const OV_CHIP_PAD_X: f64 = 8.0;
-const OV_COL_GAP: f64 = 6.0;
-const OV_ROW_STEP: f64 = 26.0;
-const OV_CLUSTER_PAD: f64 = 10.0;
-const OV_TITLE_H: f64 = 18.0;
-const OV_CLUSTER_GAP: f64 = 28.0;
-const OV_INNER_WIDTH: f64 = 220.0;
+const OV_CHIP_H: f64 = 18.0;
+const OV_CHIP_PAD_X: f64 = 6.0;
+const OV_COL_GAP: f64 = 4.0;
+const OV_ROW_STEP: f64 = 21.0;
+const OV_CLUSTER_PAD: f64 = 6.0;
+const OV_TITLE_H: f64 = 16.0;
+const OV_CLUSTER_GAP: f64 = 14.0;
+/// Narrowest cluster column — packs more columns across the pane.
+const OV_MIN_COL: f64 = 135.0;
+/// Below this zoom, chips render as dots (labels only on titles).
+const OV_LABEL_ZOOM: f64 = 0.55;
 
 #[derive(Debug, Clone)]
 struct ClusterBox {
@@ -675,95 +678,169 @@ fn file_basename(path: &str) -> String {
 }
 
 fn overview_chip_width(label: &str) -> f64 {
-    (label.chars().count() as f64 * 6.4 + OV_CHIP_PAD_X * 2.0).clamp(40.0, 160.0)
+    (label.chars().count() as f64 * 5.8 + OV_CHIP_PAD_X * 2.0).clamp(32.0, 120.0)
 }
 
-/// Benzi-style whole-map layout: one box per source file, chips inside.
+/// Pane width available for the overview grid (uses the real center pane).
+fn overview_grid_width(pane_w: f64) -> f64 {
+    if pane_w < 40.0 {
+        900.0
+    } else {
+        // Leave a little margin but use nearly the full center pane.
+        (pane_w - 2.0 * FIT_MARGIN).clamp(480.0, 1800.0)
+    }
+}
+
+fn measure_cluster_body(items: &[(u32, String, f64)], inner_w: f64) -> (f64, f64) {
+    if items.is_empty() {
+        let cw = inner_w + OV_CLUSTER_PAD * 2.0;
+        let ch = OV_TITLE_H + OV_CLUSTER_PAD * 2.0;
+        return (cw, ch);
+    }
+    let mut rows = 1usize;
+    let mut row_w = 0.0;
+    for &(_, _, w) in items {
+        let next = if row_w == 0.0 {
+            w
+        } else {
+            row_w + OV_COL_GAP + w
+        };
+        if row_w > 0.0 && next > inner_w {
+            rows += 1;
+            row_w = w;
+        } else {
+            row_w = next;
+        }
+    }
+    let content_h = rows as f64 * OV_ROW_STEP;
+    let cw = inner_w + OV_CLUSTER_PAD * 2.0;
+    let ch = OV_TITLE_H + OV_CLUSTER_PAD + content_h + OV_CLUSTER_PAD;
+    (cw, ch)
+}
+
+/// Fill the pane: as many columns as `OV_MIN_COL` allows, up to file count.
+fn pick_overview_columns(n_files: usize, grid_w: f64) -> usize {
+    if n_files == 0 {
+        return 1;
+    }
+    let max_by_width =
+        ((grid_w + OV_CLUSTER_GAP) / (OV_MIN_COL + OV_CLUSTER_GAP)).floor() as usize;
+    max_by_width.clamp(1, n_files).min(12)
+}
+
+/// Benzi-style whole-map layout: one box per source file, every symbol as a chip.
+///
+/// Packs into as many columns as the pane can hold (fills width), masonry-
+/// balances column heights, and degree-sorts chips so hubs lead each cluster.
 fn overview_layout(
     graph: &CallGraph,
     stale: &Staleness,
-    max_row_width: f64,
+    grid_w: f64,
 ) -> (Vec<ClusterBox>, Vec<OverviewChip>) {
-    let mut by_file: std::collections::BTreeMap<&str, Vec<u32>> = std::collections::BTreeMap::new();
+    let mut by_file: std::collections::BTreeMap<&str, Vec<u32>> =
+        std::collections::BTreeMap::new();
     for (i, n) in graph.nodes.iter().enumerate() {
         by_file.entry(n.file.as_str()).or_default().push(i as u32);
     }
-    let mut files: Vec<(&str, Vec<u32>)> = by_file.into_iter().map(|(f, v)| (f, v)).collect();
+    let mut files: Vec<(&str, Vec<u32>)> = by_file.into_iter().collect();
     files.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(b.0)));
 
-    let mut clusters = Vec::new();
-    let mut chips = Vec::new();
-    // First pass: measure each cluster's content size.
-    let mut measured: Vec<(String, String, Vec<(u32, String, f64)>, f64, f64)> = Vec::new();
+    let n_files = files.len();
+    let cols = pick_overview_columns(n_files, grid_w).max(1);
+    // Stretch columns so the packed grid spans the full grid width.
+    let col_w = if cols == 1 {
+        grid_w.max(OV_MIN_COL)
+    } else {
+        ((grid_w - (cols as f64 - 1.0) * OV_CLUSTER_GAP) / cols as f64).max(OV_MIN_COL)
+    };
+    let inner_w = (col_w - OV_CLUSTER_PAD * 2.0).max(80.0);
+
+    struct Measured {
+        title: String,
+        items: Vec<(u32, String, f64)>,
+        ch: f64,
+    }
+    let mut measured: Vec<Measured> = Vec::with_capacity(n_files);
     for (file, indices) in &files {
-        let title = file_basename(file);
-        let mut items: Vec<(u32, String, f64)> = indices
+        let mut ranked: Vec<(u32, usize)> = indices
             .iter()
             .map(|&i| {
+                let d = graph.callers(i).len() + graph.callees(i).len();
+                (i, d)
+            })
+            .collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let items: Vec<(u32, String, f64)> = ranked
+            .iter()
+            .map(|&(i, _)| {
                 let n = &graph.nodes[i as usize];
                 let label = n.name.clone();
                 let w = overview_chip_width(&label);
                 (i, label, w)
             })
             .collect();
-        items.sort_by(|a, b| a.1.cmp(&b.1));
-
-        let inner_w = OV_INNER_WIDTH;
-        let mut rows = 1usize;
-        let mut row_w = 0.0;
-        for &(_, _, w) in &items {
-            let next = if row_w == 0.0 {
-                w
-            } else {
-                row_w + OV_COL_GAP + w
-            };
-            if row_w > 0.0 && next > inner_w {
-                rows += 1;
-                row_w = w;
-            } else {
-                row_w = next;
-            }
-        }
-        let content_h = rows as f64 * OV_ROW_STEP;
-        let cw = inner_w + OV_CLUSTER_PAD * 2.0;
-        let ch = OV_TITLE_H + OV_CLUSTER_PAD + content_h + OV_CLUSTER_PAD;
-        measured.push(((*file).to_string(), title, items, cw, ch));
+        let (_cw, ch) = measure_cluster_body(&items, inner_w);
+        let title = format!("{} ({})", file_basename(file), indices.len());
+        measured.push(Measured { title, items, ch });
     }
 
-    // Grid placement across max_row_width.
-    let grid_w = max_row_width.max(OV_INNER_WIDTH + OV_CLUSTER_PAD * 2.0);
-    let mut cursor_x = 0.0;
-    let mut cursor_y = 0.0;
-    let mut row_h = 0.0;
+    // Column pack: place heaviest clusters into the shortest column.
+    let mut col_heights = vec![0.0_f64; cols];
+    let mut col_stacks: Vec<Vec<usize>> = vec![Vec::new(); cols];
+    let mut order: Vec<usize> = (0..measured.len()).collect();
+    order.sort_by(|&a, &b| {
+        measured[b]
+            .ch
+            .partial_cmp(&measured[a].ch)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for idx in order {
+        let j = (0..cols)
+            .min_by(|a, b| {
+                col_heights[*a]
+                    .partial_cmp(&col_heights[*b])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .unwrap_or(0);
+        col_heights[j] += measured[idx].ch + OV_CLUSTER_GAP;
+        col_stacks[j].push(idx);
+    }
 
-    for (_file, title, items, cw, ch) in &measured {
-        if cursor_x > 0.0 && cursor_x + cw > grid_w {
-            cursor_x = 0.0;
-            cursor_y += row_h + OV_CLUSTER_GAP;
-            row_h = 0.0;
+    let mut clusters = Vec::new();
+    let mut chips = Vec::new();
+    let mut placed_at = vec![(0.0_f64, 0.0_f64); measured.len()];
+
+    for (col, stack) in col_stacks.iter().enumerate() {
+        let mut y = 0.0;
+        let x = col as f64 * (col_w + OV_CLUSTER_GAP);
+        for &mi in stack {
+            placed_at[mi] = (x, y);
+            y += measured[mi].ch + OV_CLUSTER_GAP;
         }
-        let cx = cursor_x;
-        let cy = cursor_y;
+    }
+
+    for (mi, m) in measured.iter().enumerate() {
+        let (cx, cy) = placed_at[mi];
         let cluster_idx = clusters.len();
         clusters.push(ClusterBox {
-            title: title.clone(),
+            title: m.title.clone(),
             x: cx,
             y: cy,
-            w: *cw,
-            h: *ch,
+            w: col_w,
+            h: m.ch,
         });
 
-        let inner_w = OV_INNER_WIDTH;
         let mut x = cx + OV_CLUSTER_PAD;
         let mut y = cy + OV_TITLE_H + OV_CLUSTER_PAD;
         let mut row_w = 0.0;
-        for &(idx, ref label, w) in items {
+        let body_w = col_w - OV_CLUSTER_PAD * 2.0;
+        for &(idx, ref label, w) in &m.items {
             let next = if row_w == 0.0 {
                 w
             } else {
                 row_w + OV_COL_GAP + w
             };
-            if row_w > 0.0 && next > inner_w {
+            if row_w > 0.0 && next > body_w {
                 x = cx + OV_CLUSTER_PAD;
                 y += OV_ROW_STEP;
                 row_w = 0.0;
@@ -786,12 +863,9 @@ fn overview_layout(
                 row_w + OV_COL_GAP + w
             };
         }
-
-        cursor_x += cw + OV_CLUSTER_GAP;
-        row_h = row_h.max(*ch);
     }
 
-    // Center the whole grid around the origin for fit_camera.
+    // Center around origin for the camera.
     if !clusters.is_empty() {
         let min_x = clusters.iter().map(|c| c.x).fold(f64::INFINITY, f64::min);
         let max_x = clusters
@@ -836,8 +910,8 @@ fn fit_overview(
         .iter()
         .map(|c| c.y + c.h)
         .fold(f64::NEG_INFINITY, f64::max);
-    // Overview is wide — allow zooming further out than Focus.
-    fit_bounds(min_x, max_x, min_y, max_y, pane_w, pane_h, 0.22, 1.0)
+    // Prefer fitting the whole map readable; allow a bit lower so wide grids fill.
+    fit_bounds(min_x, max_x, min_y, max_y, pane_w, pane_h, 0.28, 1.2)
 }
 
 // --- view -------------------------------------------------------------------
@@ -1256,7 +1330,7 @@ fn overview_pane(ui: CallGraphUi) -> impl IntoView {
             return;
         }
         let stale = ui.stale.get_untracked();
-        let (clusters, _) = overview_layout(&graph, &stale, row_width_for_pane(pw.max(900.0)));
+        let (clusters, _) = overview_layout(&graph, &stale, overview_grid_width(pw));
         let (pan, zoom) = fit_overview(&clusters, pw, ph);
         let cur = ui.pan.get_untracked();
         let cz = ui.zoom.get_untracked();
@@ -1284,16 +1358,16 @@ fn overview_pane(ui: CallGraphUi) -> impl IntoView {
             return;
         };
         let stale = ui.stale.get();
-        let (clusters, chips) =
-            overview_layout(&graph, &stale, row_width_for_pane(w.max(900.0)));
+        let (clusters, chips) = overview_layout(&graph, &stale, overview_grid_width(w));
         let (pan_x, pan_y) = ui.pan.get();
-        let zoom = ui.zoom.get().clamp(0.15, 2.0);
+        let zoom = ui.zoom.get().clamp(0.2, 2.5);
         let ox = w / 2.0 + pan_x;
         let oy = h / 2.0 + pan_y;
         let to_screen = |x: f64, y: f64| Point::new(ox + x * zoom, oy + y * zoom);
+        let show_labels = zoom >= OV_LABEL_ZOOM;
 
         // Cluster frames.
-        let frame = Stroke::new(1.0 * zoom.max(0.6));
+        let frame = Stroke::new((1.0 * zoom).clamp(0.7, 1.5));
         for c in &clusters {
             let r = Rect::new(
                 ox + c.x * zoom,
@@ -1301,19 +1375,33 @@ fn overview_pane(ui: CallGraphUi) -> impl IntoView {
                 ox + (c.x + c.w) * zoom,
                 oy + (c.y + c.h) * zoom,
             );
-            cx.fill(&r, design::BG_RAISED.with_alpha(0.35), 0.0);
-            cx.stroke(&r, design::BORDER.with_alpha(0.55), &frame);
+            cx.fill(&r, design::BG_RAISED.with_alpha(0.4), 0.0);
+            cx.stroke(&r, design::BORDER.with_alpha(0.6), &frame);
         }
 
-        // Call edges between chip centers.
+        // When zoomed out, draw chips as dots in the canvas (labels would smear).
+        if !show_labels {
+            for chip in &chips {
+                if chip.index == u32::MAX {
+                    continue;
+                }
+                let p = to_screen(chip.x + chip.w / 2.0, chip.y + chip.h / 2.0);
+                let r = 2.5 * zoom.max(0.5);
+                let dot = floem::kurbo::Circle::new(p, r);
+                let color = if chip.stale {
+                    design::FG_GHOST.with_alpha(0.6)
+                } else {
+                    design::FG_MUTED.with_alpha(0.85)
+                };
+                cx.fill(&dot, color, 0.0);
+            }
+        }
+
+        // Call edges between chip centers (skip +N markers).
         let pos: std::collections::HashMap<u32, Point> = chips
             .iter()
-            .map(|c| {
-                (
-                    c.index,
-                    to_screen(c.x + c.w / 2.0, c.y + c.h / 2.0),
-                )
-            })
+            .filter(|c| c.index != u32::MAX)
+            .map(|c| (c.index, to_screen(c.x + c.w / 2.0, c.y + c.h / 2.0)))
             .collect();
         for e in &graph.edges {
             let Some(&a) = pos.get(&e.from) else {
@@ -1324,11 +1412,11 @@ fn overview_pane(ui: CallGraphUi) -> impl IntoView {
             };
             let same_file = graph.nodes[e.from as usize].file == graph.nodes[e.to as usize].file;
             let color = if same_file {
-                design::BORDER.with_alpha(0.18)
+                design::BORDER.with_alpha(if show_labels { 0.15 } else { 0.08 })
             } else {
-                design::ACCENT.with_alpha(0.35)
+                design::ACCENT.with_alpha(if show_labels { 0.4 } else { 0.25 })
             };
-            let thickness = if same_file { 0.7 } else { 1.1 } * zoom.max(0.5);
+            let thickness = if same_file { 0.6 } else { 1.0 } * zoom.max(0.45);
             cx.stroke(&Line::new(a, b), color, &Stroke::new(thickness));
         }
     })
@@ -1349,13 +1437,14 @@ fn overview_pane(ui: CallGraphUi) -> impl IntoView {
                 return Empty::new().into_any();
             };
             let stale = ui.stale.get_untracked();
-            let (pw, _) = ui.size.get_untracked();
+            let (pw, ph) = ui.size.get_untracked();
             let (clusters, chips) =
-                overview_layout(&graph, &stale, row_width_for_pane(pw.max(900.0)));
+                overview_layout(&graph, &stale, overview_grid_width(pw));
             let (pan_x, pan_y) = ui.pan.get_untracked();
-            let zoom = ui.zoom.get_untracked().clamp(0.15, 2.0);
+            let zoom = ui.zoom.get_untracked().clamp(0.2, 2.5);
             let ox = pw / 2.0 + pan_x;
-            let oy = ui.size.get_untracked().1 / 2.0 + pan_y;
+            let oy = ph / 2.0 + pan_y;
+            let show_labels = zoom >= OV_LABEL_ZOOM;
 
             let mut children: Vec<_> = clusters
                 .iter()
@@ -1378,50 +1467,61 @@ fn overview_pane(ui: CallGraphUi) -> impl IntoView {
                 })
                 .collect();
 
-            for chip in chips {
-                let idx = chip.index;
-                let label = chip.label.clone();
-                let stale = chip.stale;
-                let left = ox + chip.x * zoom;
-                let top = oy + chip.y * zoom;
-                let width = chip.w * zoom;
-                let height = chip.h * zoom;
-                children.push(
-                    Label::derived(move || label.clone())
-                        .on_event_stop(floem::event::listener::Click, move |_, _| {
-                            focus_on(ui, idx);
-                        })
-                        .style(move |s| {
-                            s.absolute()
-                                .inset_left(left)
-                                .inset_top(top)
-                                .width(width)
-                                .height(height)
-                                .font_size((9.5 * zoom).clamp(7.5, 12.0) as f32)
-                                .font_family(design::MONO.to_string())
-                                .color(if stale {
-                                    design::FG_GHOST
-                                } else {
-                                    design::FG_MUTED
-                                })
-                                .items_center()
-                                .justify_center()
-                                .background(design::BG_FLOAT.with_alpha(if stale {
-                                    0.4
-                                } else {
-                                    0.9
-                                }))
-                                .border(1.0)
-                                .border_color(if stale {
-                                    design::FG_GHOST
-                                } else {
-                                    design::BORDER
-                                })
-                                .border_radius(3.0)
-                                .cursor(floem::style::CursorStyle::Pointer)
-                        })
-                        .into_any(),
-                );
+            if show_labels {
+                for chip in chips {
+                    let idx = chip.index;
+                    let label = chip.label.clone();
+                    let stale_chip = chip.stale;
+                    let left = ox + chip.x * zoom;
+                    let top = oy + chip.y * zoom;
+                    let width = chip.w * zoom;
+                    let height = chip.h * zoom;
+                    let is_more = idx == u32::MAX;
+                    children.push(
+                        Label::derived(move || label.clone())
+                            .on_event_stop(floem::event::listener::Click, move |_, _| {
+                                if !is_more {
+                                    focus_on(ui, idx);
+                                }
+                            })
+                            .style(move |s| {
+                                s.absolute()
+                                    .inset_left(left)
+                                    .inset_top(top)
+                                    .width(width)
+                                    .height(height)
+                                    .font_size((9.0 * zoom).clamp(7.5, 12.0) as f32)
+                                    .font_family(design::MONO.to_string())
+                                    .color(if is_more {
+                                        design::FG_FAINT
+                                    } else if stale_chip {
+                                        design::FG_GHOST
+                                    } else {
+                                        design::FG_MUTED
+                                    })
+                                    .items_center()
+                                    .justify_center()
+                                    .background(design::BG_FLOAT.with_alpha(if stale_chip {
+                                        0.4
+                                    } else {
+                                        0.9
+                                    }))
+                                    .border(1.0)
+                                    .border_color(if stale_chip {
+                                        design::FG_GHOST
+                                    } else {
+                                        design::BORDER
+                                    })
+                                    .border_radius(3.0)
+                                    .cursor(if is_more {
+                                        floem::style::CursorStyle::Default
+                                    } else {
+                                        floem::style::CursorStyle::Pointer
+                                    })
+                            })
+                            .into_any(),
+                    );
+                }
             }
 
             Stack::new(children)
@@ -1446,7 +1546,7 @@ fn overview_pane(ui: CallGraphUi) -> impl IntoView {
                 || mods.contains(floem::prelude::Modifiers::CONTROL)
             {
                 ui.zoom.update(|z| {
-                    *z = (*z * (1.0 - delta.y * 0.001)).clamp(0.15, 2.5);
+                    *z = (*z * (1.0 - delta.y * 0.001)).clamp(0.2, 2.5);
                 });
             } else {
                 ui.pan.update(|(x, y)| {
@@ -1949,6 +2049,73 @@ mod tests {
         let c0 = chips.iter().find(|c| c.index == 0).unwrap().cluster;
         let c1 = chips.iter().find(|c| c.index == 1).unwrap().cluster;
         assert_ne!(c0, c1);
+    }
+
+    #[test]
+    fn overview_includes_every_node_and_packs_wide() {
+        // 24 files × 20 symbols — must show every chip and fill horizontal space.
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        for f in 0..24u32 {
+            let file = format!("mod{f}.rs");
+            for s in 0..20u32 {
+                let i = nodes.len() as u32;
+                nodes.push(Node {
+                    name: format!("fn_{f}_{s}"),
+                    container: None,
+                    file: file.clone(),
+                    line: (s + 1) as usize,
+                    end_line: (s + 2) as usize,
+                });
+                if s > 0 {
+                    edges.push(Edge {
+                        from: i - 1,
+                        to: i,
+                        sites: 1,
+                    });
+                }
+            }
+        }
+        let g = CallGraph {
+            version: 1,
+            nodes,
+            edges,
+            stats: BuildStats::default(),
+            built_at: 0,
+            sources: Default::default(),
+        };
+        let grid_w = overview_grid_width(1100.0);
+        let (clusters, chips) = overview_layout(&g, &Staleness::default(), grid_w);
+        assert_eq!(clusters.len(), 24);
+        assert_eq!(chips.len(), g.nodes.len(), "every symbol should be a chip");
+
+        let min_x = clusters.iter().map(|c| c.x).fold(f64::INFINITY, f64::min);
+        let max_x = clusters
+            .iter()
+            .map(|c| c.x + c.w)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let min_y = clusters.iter().map(|c| c.y).fold(f64::INFINITY, f64::min);
+        let max_y = clusters
+            .iter()
+            .map(|c| c.y + c.h)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let bw = max_x - min_x;
+        let bh = max_y - min_y;
+        // Columns stretch to fill grid_w.
+        assert!(
+            (bw - grid_w).abs() < 2.0,
+            "grid should span pane width: bw={bw:.0} grid_w={grid_w:.0}"
+        );
+        let cols = pick_overview_columns(24, grid_w);
+        assert!(
+            cols >= 5,
+            "expected ≥5 columns for ~1100px pane, got {cols}"
+        );
+        let aspect = bh / bw.max(1.0);
+        assert!(
+            aspect < 2.5,
+            "overview still too tall: aspect={aspect:.2} ({bw:.0}x{bh:.0})"
+        );
     }
 
     #[test]
