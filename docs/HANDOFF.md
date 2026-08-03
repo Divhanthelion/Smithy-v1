@@ -166,6 +166,36 @@ In order. Everything here came out of the harness rather than out of guessing.
    `prompt_tokens`; frozen vs live; cached vs cold; reasoning as generated-not-
    sent. Snapshot stashed once per completion (never on the paint path).
 
+   **Calibration is captured on the first completion and held for the session**
+   (`0917d0e`). Recomputing it per turn multiplied every row by a ratio that
+   drifts with the conversation's chars-per-token mix, so rows labelled *fixed*
+   visibly moved — and a genuinely varying prefix would have looked identical to
+   ordinary growth, which is the one thing this panel exists to catch.
+   `frozen_ledger_rows_stay_put_across_completions` asserts frozen rows stay
+   byte-identical while the segments still sum to the billed total.
+
+### 5.1 Measured: prefix caching works
+
+First real number, `deepseek-v4-pro`, 850k window, three short turns:
+
+| | |
+|---|---|
+| Cache hit rate | **76% → 79%** across consecutive turns |
+| Prompt at turn 3 | 5.6k of 850k |
+| Frozen (system + project + tools) | ~4.7k, unchanged between turns |
+| Live (conversation) | 885 → 949 |
+
+Six decisions pay rent to prefix caching — fixed tool order (`registry.rs`),
+`Vec` not `HashMap` in the schema (`schema.rs`), the project block frozen into
+the system prompt (`session.rs`), tools never gated mid-session, reasoning kept
+out of `History`, the step warning appended at one point in the loop. **None of
+them had evidence behind them before this.** Three-quarters of every prompt is
+served from cache, and the cost meter was previously billing all of it cold.
+
+That rising hit rate is also what proved the frozen-row drift above was a
+display artifact rather than a broken prefix: a prefix that had actually changed
+would have driven the rate down, not up.
+
 Still open from the audit:
 
 4. Per-turn tool-result budget; rank the API layer by call-graph degree.
