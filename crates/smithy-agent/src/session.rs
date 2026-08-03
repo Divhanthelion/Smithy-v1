@@ -503,6 +503,12 @@ pub fn default_system_prompt(
          still exist. `read` and `ls` do not skip it. If the user names a file and `glob` finds \
          nothing, `read` the path directly before concluding it is missing — plans and design \
          notes are often in ignored paths.\n\
+         - Before you name an enum variant, call a method, or refer to any item you have not read \
+         in this conversation, look it up with `symbol`. It answers in one call with the file, \
+         line and exact signature, and lists an enum's variants or a type's methods. The project \
+         summary below is a *map*: it tells you what exists, not what shape it has. Guessing a \
+         variant name or an argument count from the map is the single commonest way to write code \
+         that does not compile.\n\
          - For a small change to an existing file use `edit`. Use `write` to create a new file or \
          fully rewrite one — always emit the COMPLETE contents, never a diff.\n\
          - For a multi-step job, call `todo` first to lay out the plan, and update it as you \

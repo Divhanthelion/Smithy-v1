@@ -49,10 +49,12 @@ pub mod persist;
 pub mod provider;
 pub mod providers;
 pub mod session;
+pub mod symbol_tool;
 
 pub use catalogue::{ModelEntry, ModelTier};
 pub use config::{AgentConfig, Endpoint, ProviderChoice};
 pub use explore::Explore;
+pub use symbol_tool::SymbolLookup;
 pub use limits::{Budget, Limits, Stop};
 pub use message::{History, Message, Role};
 pub use parse::{parse, Action};

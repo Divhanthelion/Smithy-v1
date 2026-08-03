@@ -149,6 +149,41 @@ the model still remembered everything. New Session throws away the history, the
 pending review bookkeeping, and rebuilds with a freshly extracted project
 context. The previous conversation stays on disk rather than being deleted.
 
+### Knowing the code
+
+Two layers, deliberately separate.
+
+**The map** goes in the system prompt: crate layout, dependencies with version
+requirements, every module path, and the public API. It is sized against the
+model's window (~5% of it) and is what stops the agent guessing at file paths.
+Inspect it with:
+
+```bash
+cargo run -p smithy-project --example dump .
+```
+
+**The index** is queried, not read. Every symbol in the project — structs, enums,
+**enum variants**, traits, functions, **methods inside `impl` blocks**, consts,
+type aliases — with file, line and exact signature, public and private alike.
+Built once per session (~460ms for 3,168 symbols across 109 files) and exposed as
+the `symbol` tool, so a lookup is one hash rather than a search of the tree.
+
+The split matters because the map is prefilled on *every* request while the index
+is paid for only when asked. That is also why enum variants live in the index and
+not the map: one 20-variant enum is ~150 tokens of preamble on every turn, for a
+fact that is one call away.
+
+This exists because of a specific failure. The map said `DesktopMsg` existed but
+not what was in it, so the agent wrote `DesktopMsg::PluginsChanged` — no such
+variant. It called `restore_session` with two arguments; the method took one, and
+being neither `pub` nor top-level it was in no map at all. Four of seven build
+errors were that one shape: **a name it could see existed, whose shape it could
+not.** `symbol DesktopMsg` answers that in a single call.
+
+```bash
+cargo run -p smithy-project --example symbols -- . DesktopMsg
+```
+
 ### Searching and research
 
 With a Brave Search API key set under Backend Settings, the agent gets

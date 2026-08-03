@@ -171,6 +171,37 @@ pub fn crates(root: &Path) -> Result<Vec<Crate>, String> {
     Ok(out)
 }
 
+/// The module path for one file, relative to a crate's `src/`.
+///
+/// `src/tools/edit.rs` → `tools::edit`; `src/tools/mod.rs` → `tools`;
+/// `src/lib.rs` and `src/main.rs` are the crate root and yield the empty string.
+///
+/// Extracted from [`module_paths`] so the symbol index applies exactly the same
+/// rule. Two implementations of "what module is this file" that disagreed would
+/// mean the map and the index naming the same item differently, which is worse
+/// than either being wrong on its own.
+pub fn module_path_of(file: &Path, src: &Path) -> String {
+    let Ok(relative) = file.strip_prefix(src) else {
+        return String::new();
+    };
+    let mut parts: Vec<String> = relative
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .collect();
+
+    let Some(name) = parts.pop() else {
+        return String::new();
+    };
+    let stem = name.trim_end_matches(".rs");
+
+    match stem {
+        "lib" | "main" if parts.is_empty() => return String::new(),
+        "mod" => {}
+        _ => parts.push(stem.to_string()),
+    }
+    parts.join("::")
+}
+
 /// Convert a crate's `src/` tree into Rust module paths.
 ///
 /// `src/tools/edit.rs` → `tools::edit`; `src/tools/mod.rs` → `tools`;

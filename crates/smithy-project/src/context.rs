@@ -36,8 +36,8 @@ use crate::{Project, ProjectKind};
 /// Silence here would teach the model that an item it cannot see does not
 /// exist, which is worse than telling it the list is partial.
 const TRUNCATION_NOTICE: &str =
-    "\n[Public API list truncated to fit. Items not shown still exist — use `grep` to find them \
-     rather than assuming absence.]\n";
+    "\n[Public API list truncated to fit. Items not shown still exist — look them up with \
+     `symbol`, or `grep`, rather than assuming absence.]\n";
 
 /// How much room the context block may take.
 #[derive(Debug, Clone, Copy, PartialEq)]

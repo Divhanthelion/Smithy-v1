@@ -336,6 +336,28 @@ pub async fn build_session(
         )));
     }
 
+    // The symbol index. Built on a worker because it parses every Rust file in
+    // the project with tree-sitter — a hundred milliseconds for a mid-sized
+    // workspace, which is nothing next to a model call but is not something to
+    // do on the executor.
+    //
+    // Built even when resuming, unlike the project context block. The context
+    // block is frozen into the system prompt and a fresh one would be discarded;
+    // the index is queried live, so a stale one would answer questions about
+    // code that has since changed — including code this very session edited.
+    let index_root = project.root.clone();
+    let symbol_index = tokio::task::spawn_blocking(move || {
+        std::sync::Arc::new(smithy_project::symbols::SymbolIndex::build(&index_root))
+    })
+    .await
+    .map_err(|e| format!("symbol index failed: {e}"))?;
+
+    if !symbol_index.is_empty() {
+        registry.push(Box::new(smithy_agent::SymbolLookup::new(
+            symbol_index.clone(),
+        )));
+    }
+
     // The research sub-agent, on the same provider as the main loop. It gets its
     // own copy of `web_search` rather than sharing one, because a `Tool` is
     // owned by the registry it is pushed into and the sub-agent's registry is a

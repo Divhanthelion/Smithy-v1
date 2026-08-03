@@ -8,6 +8,7 @@ description = "The Smithy agent loop: append-only history, resource budgets, and
 
 [dependencies]
 smithy-tools.workspace = true
+smithy-project.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
@@ -25,7 +26,6 @@ tempfile.workspace = true
 # enables no non-default features on its own, and the alternative — shipping the
 # scripted provider in release builds — is the thing the gate exists to prevent.
 smithy-agent = { path = ".", features = ["testing"] }
-smithy-project.workspace = true
 
 
 [[example]]
