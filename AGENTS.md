@@ -32,9 +32,22 @@ cargo build --workspace    # 0 warnings, and it stays 0
 cargo clippy --workspace --all-targets
 ```
 
+- **There is no GitHub CI, on purpose.** Checks run here, as a pre-push hook.
+  One-time setup per clone:
+
+  ```bash
+  git config core.hooksPath .githooks
+  ```
+
+  It builds with warnings-as-errors and runs the suite before anything leaves
+  the machine. `SKIP_CHECKS=1 git push` bypasses it deliberately. GitHub
+  Actions was tried and removed — the account is Actions-locked, so every run
+  failed in four seconds having executed nothing, and a permanently red check
+  is worse than none: it teaches you to ignore the colour. Do not re-add a
+  workflow without checking that Actions can actually start.
 - **macOS only.** `smithy-voice` uses `candle-core` with the `accelerate`
   feature, which is Apple's framework. The workspace does not build on Linux
-  as configured. CI runs on macOS for this reason.
+  as configured.
 - **The tree is not rustfmt-clean and that is not a bug to fix.** Doc comments
   are hand-wrapped throughout. Do not run `cargo fmt` across the workspace; the
   diff would be enormous, unreviewable, and would fight the formatting on

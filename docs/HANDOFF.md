@@ -27,20 +27,23 @@ The harness found two production bugs on its first runs. Neither is fixed.
 
 ### 2.1 Infrastructure (`ad36a3a`, on main)
 
-- `.github/workflows/ci.yml` — macOS runner (the workspace does not build on
-  Linux: `smithy-voice` uses `candle-core` with the `accelerate` feature).
-  Build gated at zero warnings; **clippy reports but does not gate**, with its
-  ten findings enumerated and instructions to flip the ratchet.
+- **Checks run locally, not on GitHub.** `.githooks/pre-push` builds with
+  warnings-as-errors and runs the suite before anything leaves the machine.
+  One-time per clone: `git config core.hooksPath .githooks`. Bypass with
+  `SKIP_CHECKS=1 git push`.
 
-  > **CI has never actually run.** Every workflow run since the first has
-  > failed in 4–6 seconds with *"the job was not started because your account
-  > is locked due to a billing issue"* — an account-level Actions lock, not
-  > anything in this repo (which is public, so runner minutes are free). The
-  > workflow itself is untested as a result. **Every "947 green, zero
-  > warnings" in this document was verified by running it locally, not by
-  > CI.** Until the lock is cleared at github.com/settings/billing, treat the
-  > red check on a PR as "CI could not start" and verify locally before
-  > merging.
+  A GitHub Actions workflow was added and then **removed**. Every run failed
+  in 4–6 seconds with *"the job was not started because your account is locked
+  due to a billing issue"* — an account-level lock, unrelated to this repo
+  (which is public, so minutes are free). It never executed a single step, so
+  the workflow was never tested, and the owner does not intend to pay GitHub.
+  A permanently red check is worse than no check: it teaches you to ignore the
+  colour. **Do not re-add a workflow** without first confirming Actions can
+  start.
+
+  Consequence worth carrying: every "947 green, zero warnings" in this
+  document was verified by running the commands, not by any automation that
+  ran on its own.
 - `AGENTS.md` — the entry point that did not exist. Crate map, build commands,
   house conventions, landmines.
 - `.gitignore` — blanket `*.png` was swallowing golden images. Now

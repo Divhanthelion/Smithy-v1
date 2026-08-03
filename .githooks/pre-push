@@ -1,0 +1,34 @@
+#!/bin/sh
+# The safety net, run here instead of on GitHub.
+#
+# GitHub Actions was tried and removed: the account is Actions-locked, so every
+# run failed in four seconds having executed nothing, and a check that is
+# permanently red is worse than no check — it trains you to ignore the colour.
+# This does the same two things, on the machine that already has the toolchain
+# warm, before anything leaves it.
+#
+# One-time setup (per clone):
+#
+#     git config core.hooksPath .githooks
+#
+# Deliberate bypass, when you know what you are doing:
+#
+#     SKIP_CHECKS=1 git push
+#
+# Warnings are errors because the README claims zero and that claim should
+# cost something to break.
+
+set -e
+
+if [ -n "$SKIP_CHECKS" ]; then
+    echo "pre-push: skipped (SKIP_CHECKS set)"
+    exit 0
+fi
+
+echo "pre-push: building (warnings are errors)..."
+RUSTFLAGS="-D warnings" cargo build --workspace --all-targets
+
+echo "pre-push: testing..."
+cargo test --workspace
+
+echo "pre-push: ok"
