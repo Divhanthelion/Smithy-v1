@@ -33,3 +33,15 @@ CODEBASE_DUMP.txt
 !**/tests/golden/**/*.png
 
 script.sh
+
+# Working notes: the agent brief, the plans, the handoff, the devlog.
+#
+# Untracked deliberately — they are how this repository is *worked on* rather
+# than what it is, and they carry session state (what is half-done, what was
+# withdrawn) that goes stale the moment it is published. They stay on disk and
+# stay useful; they are simply not part of what ships.
+#
+# Note for anyone reading this later: untracking does not remove them from the
+# history. They are readable at every commit before this one.
+AGENTS.md
+docs/
