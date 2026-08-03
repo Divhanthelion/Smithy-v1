@@ -27,7 +27,7 @@ be a new consumer, not a rewrite. Do not reach for floem inside them.
 ## Build and test
 
 ```bash
-cargo test --workspace     # 947 tests, ~10s, all green
+cargo test --workspace     # 946 tests, ~10s, all green
 cargo build --workspace    # 0 warnings, and it stays 0
 cargo clippy --workspace --all-targets
 ```
