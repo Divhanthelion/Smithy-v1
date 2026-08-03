@@ -365,7 +365,11 @@ where
     // Width/Height signals for resizable panels
     let sidebar_width = RwSignal::new(220.0f64);
     let terminal_height = RwSignal::new(200.0f64);
-    let chat_width = RwSignal::new(350.0f64);
+    // 420 rather than 350. At 350 the agent panel is the most cramped thing on
+    // screen and it is where the work actually happens: the header has eight
+    // controls in a row, tool rows carry a name plus an argument summary, and
+    // reasoning is prose. It is still draggable — this is only where it starts.
+    let chat_width = RwSignal::new(420.0f64);
 
     // Dragging state signals
     // One shared drag state: only one divider can be dragged at a time, and the
@@ -498,7 +502,10 @@ where
 
         let (pos, size_signal, min, max, invert) = match active.target {
             DragTarget::Sidebar => (ptr.x, sidebar_width, 150.0, 600.0, false),
-            DragTarget::Chat => (ptr.x, chat_width, 250.0, 800.0, true),
+            // The 1100 ceiling is deliberate: on a wide display the agent panel
+            // is often the thing you want most of the window given to, and 800
+            // stopped short of that.
+            DragTarget::Chat => (ptr.x, chat_width, 280.0, 1100.0, true),
             DragTarget::Terminal => (ptr.y, terminal_height, 80.0, 800.0, true),
         };
 

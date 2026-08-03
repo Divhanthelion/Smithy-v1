@@ -405,7 +405,8 @@ fn header(
 ) -> impl IntoView {
     Stack::horizontal((
         Label::derived(|| "Agent".to_string()).style(|s| {
-            s.color(catppuccin::TEXT)
+            nowrap(s)
+                .color(catppuccin::TEXT)
                 .font_size(13.0)
                 .font_bold()
                 .margin_right(8.0)
@@ -422,14 +423,15 @@ fn header(
                 .margin_right(5.0)
         }),
         Label::derived(move || state.model_label.get())
-            .style(|s| s.color(catppuccin::OVERLAY1).font_size(11.0)),
+            .style(|s| nowrap(s).color(catppuccin::OVERLAY1).font_size(11.0).min_width(0.0)),
         // Plain text, not a glyph: this appears exactly when something is
         // already wrong, which is the worst moment to discover a missing-glyph
         // box. See `design::glyph` on why that is a live hazard here.
         Label::derived(|| "Reconnect".to_string())
             .on_event_stop(floem::event::listener::Click, move |_, _| on_reconnect())
             .style(move |s| {
-                s.color(catppuccin::BLUE)
+                nowrap(s)
+                    .color(catppuccin::BLUE)
                     .font_size(11.0)
                     .margin_left(8.0)
                     .padding_horiz(6.0)
@@ -446,7 +448,8 @@ fn header(
         // Worth showing: a silently-degraded context (say, layout only because
         // `cargo metadata` failed) explains otherwise baffling answers.
         Label::derived(move || state.context_label.get()).style(move |s| {
-            s.color(catppuccin::SURFACE2)
+            nowrap(s)
+                .color(catppuccin::SURFACE2)
                 .font_size(10.0)
                 .margin_right(8.0)
                 .apply_if(state.context_label.get().is_empty(), |s| {
@@ -495,7 +498,8 @@ fn header(
         Label::derived(|| "New session".to_string())
             .on_event_stop(floem::event::listener::Click, move |_, _| on_clear_context())
             .style(move |s| {
-                s.color(catppuccin::OVERLAY1)
+                nowrap(s)
+                    .color(catppuccin::OVERLAY1)
                     .font_size(11.0)
                     .margin_right(4.0)
                     .padding_horiz(6.0)
@@ -525,6 +529,24 @@ fn header(
             .border_bottom(1.0)
             .border_color(catppuccin::SURFACE0)
     })
+}
+
+/// Stop a label breaking mid-word, and clip it if it still does not fit.
+///
+/// The panel root sets `TextOverflow::Wrap { BreakWord }` and — as the comment
+/// there says — the property is **inherited by every label in the panel**. That
+/// is exactly right for prose: model output is full of URLs and absolute paths
+/// with no spaces, and without it they run off the edge.
+///
+/// It is exactly wrong for chrome. `BreakWord` will break *inside* a word when
+/// the box is narrow, so at a 350px panel the header rendered the title as
+/// "A ge nt", the button as "New sessi on", and every tool row as "bas h". Chrome
+/// is fixed, known-length text that should shrink by clipping, never by being
+/// torn into syllables.
+fn nowrap(s: floem::style::Style) -> floem::style::Style {
+    s.text_overflow(floem::style::TextOverflow::NoWrap(
+        floem::style::NoWrapOverflow::Ellipsis,
+    ))
 }
 
 fn icon_button(
@@ -656,9 +678,10 @@ fn step_row(
                     .width(14.0)
             }),
             Label::derived(move || format!("{step}"))
-                .style(|s| s.color(catppuccin::SURFACE2).font_size(10.0).width(18.0)),
+                .style(|s| nowrap(s).color(catppuccin::SURFACE2).font_size(10.0).width(18.0)),
             Label::derived(move || name_for_row.clone()).style(|s| {
-                s.color(catppuccin::SAPPHIRE)
+                nowrap(s)
+                    .color(catppuccin::SAPPHIRE)
                     .font_size(12.0)
                     .font_family(crate::design::MONO.to_string())
                     .margin_right(7.0)
@@ -806,16 +829,52 @@ fn live_activity(state: AgentPanelState) -> impl IntoView {
                                     Empty::new().style(|s| s.display(floem::taffy::Display::None)),
                                 ) as Box<dyn View>;
                             }
+                            // Scrollable, and showing the *whole* trace rather
+                            // than a 240-character tail.
+                            //
+                            // The tail was the reason the thinking could not be
+                            // followed: by the time you looked, the sentence you
+                            // wanted had already scrolled out of a window you
+                            // could not scroll. A bounded height keeps it from
+                            // pushing the composer off screen; the scroll gives
+                            // the rest back. It stays dimmed and italic, because
+                            // it is still subordinate to the answer.
+                            //
+                            // Pinned to the bottom as it streams, so the live
+                            // edge is what you see without touching anything —
+                            // and scrolling up still works, which is the whole
+                            // point.
                             Box::new(
-                                Label::derived(move || {
-                                    format!("💭 {}", tail(&state.streaming_reasoning.get(), 240))
+                                floem::views::scroll::Scroll::new(
+                                    Label::derived(move || state.streaming_reasoning.get())
+                                        .style(|s| {
+                                            s.color(catppuccin::OVERLAY0)
+                                                .font_size(11.0)
+                                                .font_style(floem::text::FontStyle::Italic)
+                                                .line_height(1.45)
+                                                .width_full()
+                                                .padding_right(6.0)
+                                        }),
+                                )
+                                .scroll_to_percent(move || {
+                                    // Read the signal so this re-runs on every
+                                    // fragment; the value itself is always "the
+                                    // end".
+                                    let _ = state.streaming_reasoning.get();
+                                    100.0
+                                })
+                                .custom_style(|s: floem::views::scroll::ScrollCustomStyle| {
+                                    s.hide_bars(false)
+                                        .handle_background(catppuccin::SURFACE1)
+                                        .handle_border_radius(4.0)
                                 })
                                 .style(|s| {
-                                    s.color(catppuccin::OVERLAY0)
-                                        .font_size(11.0)
-                                        .font_style(floem::text::FontStyle::Italic)
-                                        .line_height(1.4)
-                                        .width_full()
+                                    s.width_full()
+                                        .min_width(0.0)
+                                        .max_height(150.0)
+                                        .border_left(2.0)
+                                        .border_color(catppuccin::SURFACE1)
+                                        .padding_left(8.0)
                                 }),
                             ) as Box<dyn View>
                         },
@@ -1055,15 +1114,6 @@ fn drop_overlay(state: AgentPanelState) -> impl IntoView {
     })
 }
 
-fn tail(s: &str, max: usize) -> String {
-    let count = s.chars().count();
-    if count <= max {
-        s.split_whitespace().collect::<Vec<_>>().join(" ")
-    } else {
-        let t: String = s.chars().skip(count - max).collect();
-        format!("…{}", t.split_whitespace().collect::<Vec<_>>().join(" "))
-    }
-}
 
 /// A thin context-usage bar. Prefill cost grows superlinearly with context, so
 /// this is the readout that explains a slow turn.
@@ -1502,17 +1552,19 @@ mod tests {
         assert_eq!(state.context_tokens.get_untracked(), 0);
     }
 
+    /// Chrome must never break mid-word.
+    ///
+    /// The panel root sets `Wrap { BreakWord }` and it is inherited, which at a
+    /// narrow panel rendered the header title as "A ge nt", the button as
+    /// "New sessi on" and every tool row as "bas h". Prose still wraps; fixed
+    /// labels clip instead.
     #[test]
-    fn reasoning_tail_keeps_the_most_recent_text() {
-        let long = "start ".to_string() + &"middle ".repeat(100) + "end";
-        let t = tail(&long, 40);
-        assert!(t.starts_with('…'));
-        assert!(t.ends_with("end"));
-        assert!(!t.contains("start"));
-    }
-
-    #[test]
-    fn short_reasoning_is_not_truncated() {
-        assert_eq!(tail("thinking about it", 240), "thinking about it");
+    fn chrome_labels_clip_rather_than_breaking_words() {
+        let style = nowrap(floem::style::Style::new());
+        let rendered = format!("{style:?}");
+        assert!(
+            rendered.contains("NoWrap"),
+            "chrome must opt out of the inherited BreakWord: {rendered}"
+        );
     }
 }
