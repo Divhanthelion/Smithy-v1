@@ -22,6 +22,7 @@
 //! iteration order, absolute paths that embed a temp directory — would change
 //! the prefix and defeat the point. There are tests for exactly that.
 
+pub mod callgraph;
 pub mod context;
 pub mod registry;
 pub mod rust;

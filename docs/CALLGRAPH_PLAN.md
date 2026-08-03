@@ -206,14 +206,45 @@ defined at `desktop.rs:392`, referenced at `desktop.rs:112`. Enclosure:
 real, compiler-resolved edge — `Desktop::create → Desktop::restore_session` —
 assembled from both halves.
 
-### 3. Graph builder
-Run `rust-analyzer scip`, parse, attribute each reference to its enclosing
-function, emit `CallGraph`.
-**Done when:** `restore_session` in kernelos shows its real callers, and the
-`unattributed` count is reported rather than hidden.
-*The first point at which the thing is real. Ship the CLI example here —
-`--example callgraph <project> <symbol>` — so it is verifiable before any pixel
-is drawn.*
+### 3. Graph builder — **done**
+`smithy_project::callgraph`. Joins SCIP definitions (node identity, resolved) to
+tree-sitter spans (caller attribution).
+
+```bash
+cargo run -p smithy-project --example callgraph -- <PROJECT> [--scip FILE] [SYMBOL]
+```
+
+kernelos: **278 nodes, 355 edges**, assembled in 0.1 s from an existing index.
+
+| of 11,582 references | | |
+|---|---:|---|
+| became edges | 489 | 4% |
+| external (`std`, `yew`, deps) | 7,792 | 67% |
+| locals (variables, closures) | 3,281 | 28% |
+| unattributed | **20** | **0.2%** |
+
+**The `unattributed` risk did not materialise.** The plan said that if it were
+large the interval approach needed rethinking; at 20 of 11,582 the tree-sitter
+spans account for essentially every reference that has a caller at all.
+
+Verified against source, not just self-consistent:
+`Desktop::restore_session` is called by `Desktop::create`, and calls
+`restore_plugin_window`, `take_z_index`, `WindowState::new`, `is_installed` and
+`find` — five edges across four files, all confirmed by reading lines 392–428.
+The other calls in that body (`borrow_mut`, `is_none`, `push`) are `std` and are
+correctly counted as external rather than drawn.
+
+**A bug caught by an implausible number.** The first run reported
+`restore_session` calling `FileSystem::rename` **38 times**, and 449 self-edges.
+SCIP `local N` symbols are *document-scoped* — `local 0` in two files are
+different things — and the index had 4,842 such occurrences sharing only 226
+distinct strings across 24 files. Keying them globally merged unrelated symbols.
+Locals are now excluded entirely: they are variables and closures, not callable
+functions. Self-edges fell 449 → 4, which is real recursion.
+
+That is exactly the failure mode this design exists to prevent, caught because a
+number looked wrong rather than because a test failed. The four buckets now sum
+to the reference count exactly, and a test enforces it.
 
 ### 4. Persistence
 Write, load, hash-check, refresh.
@@ -239,16 +270,21 @@ Nodes highlight as the agent reads files, edits them, and calls `symbol`.
 
 ## Risks, and what would falsify the approach
 
-**Indexing cost scales with the crate graph, not the project.** kernelos took
-9.9 s at 109 crates. This workspace has 834. If it takes minutes rather than
-seconds, indexing must move to an explicit, cancellable, progress-reporting
-action rather than anything automatic. *Measure this at milestone 3, before
-building any UI on top.*
+**Indexing cost scales with the crate graph — measured, and it is fine.**
+kernelos (109 crates): 9.9 s, 2.31 GB, 1.2 MB index → 278 nodes / 355 edges.
+This workspace (834 crates): 7.9 MB index → **2,240 nodes / 3,972 edges**,
+assembled in 0.6 s. Eight times the crates did not produce anything like eight
+times the wait. Indexing should still be an explicit action with progress, but it
+does not need to be cancellable-or-nothing.
 
-**`rust-analyzer scip` reported two `ERROR Bug:` lines** on kernelos —
-definitions it expected in a document and did not find. Two out of ~2,900, so
-noise rather than a blocker, but the builder must tolerate missing documents
-rather than assuming the index is complete.
+Attribution held at scale too: **137 unattributed out of 78,096 references
+(0.18%)** — the same ratio as kernelos, so the tree-sitter spans are not
+degrading as the tree grows.
+
+**`rust-analyzer scip` emits `ERROR Bug:` lines on real input** — 2 on kernelos,
+5 on this workspace, for definitions it expected in a document and did not find.
+Out of 2,445 and 13,778 definitions respectively, so noise rather than a blocker.
+The reader tolerates it: a truncated or partial index yields what parsed.
 
 **Attribution will not be total.** References in macro expansions, `const`
 initialisers and trait default bodies may fall outside any function span. The
