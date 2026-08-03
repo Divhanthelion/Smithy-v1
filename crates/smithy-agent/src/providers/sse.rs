@@ -12,6 +12,26 @@ pub struct PartialCall {
     pub arguments: String,
 }
 
+/// Cached prompt tokens from a usage object, tolerating the three field names
+/// providers actually emit.
+///
+/// Order is deliberate: the nested OpenAI-compatible shape is checked first,
+/// then DeepSeek's top-level hit count, then Anthropic's cache-read name.
+/// Returning the first present value (including zero) matters — a reported
+/// zero is "cache miss", not "field absent."
+pub fn cached_tokens_from_usage(usage: &Value) -> Option<i64> {
+    if let Some(n) = usage["prompt_tokens_details"]["cached_tokens"].as_i64() {
+        return Some(n);
+    }
+    if let Some(n) = usage["prompt_cache_hit_tokens"].as_i64() {
+        return Some(n);
+    }
+    if let Some(n) = usage["cache_read_input_tokens"].as_i64() {
+        return Some(n);
+    }
+    None
+}
+
 /// Apply one `data:` line. Returns true when the stream is finished.
 pub fn apply_sse_line(
     line: &str,
@@ -40,6 +60,14 @@ pub fn apply_sse_line(
         if let Some(r) = v["usage"]["completion_tokens_details"]["reasoning_tokens"].as_i64() {
             out.reasoning_tokens = r;
         }
+        // Providers disagree on the field name. First one present wins —
+        // measured shapes: OpenAI-compatible / OpenRouter
+        // (`prompt_tokens_details.cached_tokens`), DeepSeek
+        // (`prompt_cache_hit_tokens`), Anthropic-shaped
+        // (`cache_read_input_tokens`). Dropping all of them was why the cost
+        // meter billed cache hits at the cold rate and why a broken prefix
+        // never showed up as a collapsed hit rate.
+        out.cached_tokens = cached_tokens_from_usage(&v["usage"]).unwrap_or(out.cached_tokens);
     }
 
     let Some(choice) = v["choices"].get(0) else {

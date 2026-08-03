@@ -104,6 +104,13 @@ pub struct Completion {
     /// formula and its post-mortem calls that out — *"I had the real number and
     /// reported a guess."* It is right there in the response.
     pub reasoning_tokens: i64,
+    /// Prompt tokens served from the provider's prefix cache on this request.
+    ///
+    /// Parsed tolerantly — see [`crate::providers::sse::cached_tokens_from_usage`].
+    /// Zero means a reported miss; absence of any cache field leaves this at
+    /// the default zero and is indistinguishable from a miss until a later
+    /// frame reports a positive count.
+    pub cached_tokens: i64,
 }
 
 impl Completion {

@@ -70,11 +70,20 @@ pub struct Budget {
 
 impl Budget {
     pub fn new(limits: Limits) -> Self {
+        Self::seeded(limits, 0)
+    }
+
+    /// Start a turn already knowing the previous request's prompt size.
+    ///
+    /// Without this, `last_prompt_tokens` resets to 0 every turn and the
+    /// context ceiling can only fire *after* a doomed first call has already
+    /// been billed — exactly the failure at 130k against a 110k hard stop.
+    pub fn seeded(limits: Limits, last_prompt_tokens: i64) -> Self {
         Budget {
             limits,
             started: Instant::now(),
             steps: 0,
-            last_prompt_tokens: 0,
+            last_prompt_tokens,
             warned: false,
             warned_steps: false,
         }
@@ -228,10 +237,14 @@ mod tests {
     }
 
     #[test]
-    fn stops_when_context_exceeds_the_hard_ceiling() {
-        let mut b = Budget::new(limits());
-        b.tick().unwrap();
-        b.record_prompt_tokens(250);
+    fn seeded_budget_stops_before_the_first_tick_completes_a_doomed_turn() {
+        let mut b = Budget::seeded(
+            Limits {
+                context_hard: 100,
+                ..limits()
+            },
+            250,
+        );
         assert_eq!(b.tick(), Err(Stop::Context(250)));
     }
 

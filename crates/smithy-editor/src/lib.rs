@@ -57,7 +57,10 @@ pub mod tick;
 // highlighter entry point and a line-ending model that nothing had ever called.
 
 pub use aesthetic::Aesthetic;
-pub use agent_panel::{agent_panel, AgentPanelState, Entry as AgentEntry, StepStatus};
+pub use agent_panel::{
+    agent_panel, AgentPanelState, ContextUsageRow, ContextUsageSnapshot, Entry as AgentEntry,
+    StepStatus,
+};
 pub use attachment::{Attachment, AttachmentKind};
 pub use buffer_manager::{BufferManager, BufferState};
 pub use code_editor::{

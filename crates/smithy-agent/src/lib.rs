@@ -61,4 +61,7 @@ pub use parse::{parse, Action};
 pub use persist::{transcript, SessionStore, TranscriptEntry};
 pub use provider::{Completion, CompletionRequest, Delta, Provider, ProviderError, Sampling};
 pub use providers::{create_provider_from_env, LmStudio, ModelInfo, OpenRouter};
-pub use session::{Outcome, Session, SessionConfig, Stopper, TurnEvent, CANCELLED};
+pub use session::{
+    ContextLedger, ContextSegment, Outcome, Session, SessionConfig, Stopper, TurnEvent, Usage,
+    CANCELLED,
+};
