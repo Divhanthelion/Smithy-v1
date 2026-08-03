@@ -159,7 +159,8 @@ In order. Everything here came out of the harness rather than out of guessing.
 ## 5. Untouched: the context audit
 
 `docs/CONTEXT_AUDIT.md` was written this session and **none of it is
-implemented**. Measured: ~8k tokens before the user types. Ranked by value:
+implemented** (except where the audit itself was wrong — see below). Measured:
+~8k tokens before the user types. Ranked by value:
 
 1. **Cached tokens are dropped.** `providers/sse.rs` reads `prompt_tokens`,
    `completion_tokens`, `reasoning_tokens` and nothing else. Six design
@@ -169,12 +170,16 @@ implemented**. Measured: ~8k tokens before the user types. Ranked by value:
    inside `run_turn_inner`, so `last_prompt_tokens` resets every turn and the
    ceiling can never stop a turn's *first* request. A long session pays for one
    full prefill per turn and then stops.
-3. `context_warn` is a flat 32k — useless on large-window models.
-4. **The Context Usage panel** (per-segment attribution, Cursor-style) —
+3. **The Context Usage panel** (per-segment attribution, Cursor-style) —
    designed in §4 of the audit, not built. `Session` already holds everything;
    attribute locally in chars and scale by the endpoint's reported total so the
    breakdown always sums to the billed number.
-5. Per-turn tool-result budget; rank the API layer by call-graph degree.
+4. Per-turn tool-result budget; rank the API layer by call-graph degree.
+
+~~Former item 3 (`context_warn` is a flat 32k) withdrawn.~~
+`ModelInfo::suggested_limits()` already scales warn to 25% of the window and
+`agent.rs` applies it — the audit misread the Defaults table. Struck in
+`CONTEXT_AUDIT.md` §2E so it is not re-derived.
 
 ---
 

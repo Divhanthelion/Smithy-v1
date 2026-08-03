@@ -132,14 +132,14 @@ appending a line *to the tool result itself*: "results are being trimmed; narrow
 your query." This is append-only-safe, needs no history rewriting, and puts the
 signal where the model will act on it.
 
-### E. `context_warn` is flat and fires once
+### ~~E. `context_warn` is flat and fires once~~ — **withdrawn**
 
-`context_warn = 32_000` is a constant. `agent.rs:448` adjusts `context_hard`
-when the model reports a real window, but `warn` stays put. On a 1M-token model
-it trips almost immediately and — being warn-once by design, correctly — is then
-silent for the rest of the session. The one context signal the user gets is
-miscalibrated on exactly the models where context management matters most.
-Make it a fraction of the window, same as the hard ceiling.
+Struck 2026-08-03. The claim that `context_warn = 32_000` is a fixed constant
+that never scales was wrong: `ModelInfo::suggested_limits()` sets
+`context_warn` to 25 % of the reported window (`providers/lmstudio.rs`), and
+`apps/smithy/src/agent.rs` applies that when the endpoint reports a length.
+Defaults stay at 32k only when no window is known. Do not re-derive this item
+from the Defaults table alone.
 
 ### F. We built the whole thing for prefix caching and never measured whether it works
 
@@ -303,9 +303,11 @@ Ranked by value per unit of work.
 |---|---|---|
 | 1 | §2F cached tokens | Turns the central bet into a measurement. Fixes the cost meter. Small. |
 | 2 | §2A carry `last_prompt_tokens` across turns | Stops billing for calls that are guaranteed to be discarded. ~20 lines. |
-| 3 | §2E `context_warn` as a fraction of window | One line; the signal is currently useless on big models. |
-| 4 | §4 `Session::ledger()` + panel | Now everything above has somewhere to be seen. |
-| 5 | §2D per-turn tool-result budget | Closes the last uncapped inflow. |
-| 6 | §2C rank the API layer by call-graph degree | Best tokens-per-token improvement available; needs the graph, which exists. |
-| 7 | §2B re-derive the block ceiling, then **measure** | Do it after 4, so the panel can show the before/after. |
-| 8 | §2A compaction | Largest, and wants the panel first so the drop is visible. |
+| 3 | §4 `Session::ledger()` + panel | Now everything above has somewhere to be seen. |
+| 4 | §2D per-turn tool-result budget | Closes the last uncapped inflow. |
+| 5 | §2C rank the API layer by call-graph degree | Best tokens-per-token improvement available; needs the graph, which exists. |
+| 6 | §2B re-derive the block ceiling, then **measure** | Do it after the panel, so it can show the before/after. |
+| 7 | §2A compaction | Largest, and wants the panel first so the drop is visible. |
+
+~~Former #3 (`context_warn` as a fraction of window) withdrawn — already done via
+`suggested_limits`; see struck §2E.~~
