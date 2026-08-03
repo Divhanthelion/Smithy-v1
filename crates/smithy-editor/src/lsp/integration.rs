@@ -52,7 +52,17 @@ pub enum LspRequest {
         character: u32,
         request_id: u64,
     },
-    /// Shutdown all language servers
+    /// Stop the running servers but keep the worker alive.
+    ///
+    /// Distinct from [`LspRequest::Shutdown`], which also ends the request loop
+    /// and so cannot be recovered from — after it, nothing is reading the
+    /// channel and an `Initialize` would sit in the queue forever. This is the
+    /// one to send when the point is to reclaim memory and start again later:
+    /// rust-analyzer's footprint on a large dependency graph is measured in
+    /// gigabytes, and there is no reason to hold that while editing a file it
+    /// is not helping with.
+    StopServers,
+    /// Shutdown all language servers **and end the worker**. App exit only.
     Shutdown,
 }
 
@@ -343,6 +353,9 @@ impl LspManager {
                     });
                 });
             }
+            LspRequest::StopServers => {
+                self.handle_shutdown();
+            }
             LspRequest::Shutdown => {
                 // Handled in main loop
             }
@@ -508,6 +521,15 @@ impl LspHandle {
     /// Shutdown all language servers
     pub fn shutdown(&self) {
         let _ = self.request_tx.send(LspRequest::Shutdown);
+    }
+
+    /// Stop the language servers, keeping the worker ready for a restart.
+    ///
+    /// Reclaims the analyzer's memory — gigabytes, on a large dependency graph
+    /// — without ending the session. Call [`LspHandle::initialize`] to bring it
+    /// back.
+    pub fn stop_servers(&self) {
+        let _ = self.request_tx.send(LspRequest::StopServers);
     }
 }
 

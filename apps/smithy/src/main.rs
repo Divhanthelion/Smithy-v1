@@ -646,6 +646,10 @@ fn app_view() -> impl IntoView {
 
     // --- Menu bar ---
     let menu_state = smithy_editor::MenuBarState::new();
+    // Whether a language server is meant to be up. Drives the memory meter's
+    // wording, so "no analyzer running" reads as a choice you made rather than
+    // as a measurement that failed.
+    let lsp_running = floem::reactive::RwSignal::new(true);
     let menus = vec![
         smithy_editor::Menu::new("File", {
             let mut items = vec![
@@ -743,6 +747,31 @@ fn app_view() -> impl IntoView {
                     let ask = ask_definition_menu.clone();
                     move || ask()
                 }),
+                smithy_editor::MenuItem::Separator,
+                // rust-analyzer indexes your *dependencies*, not just your code,
+                // so its footprint tracks the size of the crate graph rather
+                // than the size of the project: 109 crates measured at 724 MB,
+                // 834 crates at 5.1 GB. That is normal and it is also a lot to
+                // hold while editing a file it is not helping with. Stopping is
+                // recoverable — `StopServers` leaves the worker alive, unlike
+                // the `Shutdown` used at exit.
+                smithy_editor::MenuItem::action("Stop Language Server (frees memory)", {
+                    let lsp = app_state.lsp_handle.clone();
+                    let running = lsp_running;
+                    move || {
+                        lsp.stop_servers();
+                        running.set(false);
+                    }
+                }),
+                smithy_editor::MenuItem::action("Start Language Server", {
+                    let lsp = app_state.lsp_handle.clone();
+                    let project = agent_state.project.clone();
+                    let running = lsp_running;
+                    move || {
+                        lsp.initialize(project.borrow().root.clone());
+                        running.set(true);
+                    }
+                }),
             ],
         ),
         // The agent's own menu. Both items also exist in the panel header, which
@@ -824,7 +853,14 @@ fn app_view() -> impl IntoView {
             meter_tick.get();
 
             let sample = meters::sample_memory();
-            status.memory.set(sample.render());
+            // When the server has been stopped deliberately, say so rather than
+            // silently dropping the figure — an absent number reads as a broken
+            // meter, not as reclaimed memory.
+            status.memory.set(if lsp_running.get() {
+                sample.render()
+            } else {
+                format!("{} · analyzer stopped", sample.render())
+            });
             status.memory_warn.set(sample.is_heavy());
 
             // Cost is derived from what the *panel* already knows about the

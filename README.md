@@ -386,11 +386,33 @@ than at turn four. Balance is the one that matters when you have put ten dollars
 on an account.
 
 **Memory** — Smithy's own resident set, and every `rust-analyzer` on the machine
-summed. The analyzer is the interesting number: one instance on a large workspace
-was measured at **5.12 GB**, with a second at 724 MB beside it, which is invisible
-unless you go looking in Activity Monitor. It turns amber past 4 GB. If it does,
-`SMITHY_LSP_LIGHT=1` trades real compiler diagnostics for the analyzer's largest
-memory saving.
+summed. Turns amber past 4 GB.
+
+### Why rust-analyzer is so large
+
+It indexes your **dependencies**, not just your code, so its footprint tracks the
+size of the crate graph rather than the size of the project. Measured:
+
+| Project | Crates in graph | rust-analyzer RSS |
+|---|---|---|
+| a small Yew app | 109 (1 yours) | 724 MB |
+| this workspace | 834 (7 yours) | 5.1 GB |
+
+7.6× the crates, ~7× the memory. That is normal, not a leak — 1–3 GB is typical
+and 5 GB is the high end for a graph this size. Smithy already re-roots and stops
+the old servers on a project switch, so they do not accumulate.
+
+Two levers:
+
+- **Code → Stop Language Server** reclaims it immediately, and **Start Language
+  Server** brings it back. Distinct from the shutdown at app exit, which also
+  ends the worker and cannot be recovered from.
+- `SMITHY_LSP_LIGHT=1` disables `checkOnSave`, which stops a *second* cargo
+  process holding a full build in memory. The largest single saving; the cost is
+  real compiler diagnostics, leaving rust-analyzer's own inference.
+
+Lower levers — disabling proc macros or build scripts — break serde derives and
+most of the build, and are not worth it.
 
 ## Budgets
 
