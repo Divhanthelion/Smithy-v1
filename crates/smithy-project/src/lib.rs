@@ -125,8 +125,22 @@ impl Project {
     }
 
     /// Build the context block for this project.
+    ///
+    /// Pass a loaded call graph when one exists; never build one here. See
+    /// [`context::extract`].
     pub fn context(&self, budget: ContextBudget) -> ProjectContext {
-        context::extract(self, budget)
+        context::extract(self, budget, None)
+    }
+
+    /// Like [`Self::context`], ranking the API layer by call-graph fan-in when
+    /// `graph` is `Some`. A stale graph is fine: it produces a stale ranking,
+    /// not a stale fact.
+    pub fn context_with_graph(
+        &self,
+        budget: ContextBudget,
+        graph: Option<&callgraph::CallGraph>,
+    ) -> ProjectContext {
+        context::extract(self, budget, graph)
     }
 
     /// A short structural outline for the empty-editor backdrop.

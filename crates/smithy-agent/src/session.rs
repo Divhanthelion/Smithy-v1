@@ -711,7 +711,10 @@ impl Session {
                             },
                         );
 
-                        let result: ToolResult = self.registry.execute(call, &self.ctx).await;
+                        let mut result: ToolResult = self.registry.execute(call, &self.ctx).await;
+                        // Shape the result before it enters history — past the
+                        // aggregate cap, a narrowing hint; never a rewrite later.
+                        budget.annotate_tool_result(&mut result.content);
 
                         emit(
                             events,

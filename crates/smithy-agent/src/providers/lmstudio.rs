@@ -355,6 +355,7 @@ impl ModelInfo {
             context_hard: (ctx as f64 * 0.85) as i64,
             context_warn: (ctx as f64 * 0.25) as i64,
             max_steps: steps_for_context(ctx),
+            tool_result_warn_chars: crate::limits::tool_result_warn_for_window(ctx),
             ..defaults
         }
     }

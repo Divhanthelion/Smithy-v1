@@ -150,7 +150,7 @@ Done, in order:
    Pose/timing feel still open — numbers cannot answer those.
 
 ```bash
-cargo test --workspace                                          # 950, ~10s
+cargo test --workspace                                          # 963, ~10s
 cargo build --workspace --all-targets                           # 0 warnings
 cargo run -p smithy-fisherman --example sheets --features harness
 cargo run -p smithy --release
@@ -202,9 +202,37 @@ That rising hit rate is also what proved the frozen-row drift above was a
 display artifact rather than a broken prefix: a prefix that had actually changed
 would have driven the rate down, not up.
 
-Still open from the audit:
+Still open from the audit: none of the ranked items. Compaction (§2A part 2)
+is deferred on purpose — see `CONTEXT_AUDIT.md` §6.
 
-4. Per-turn tool-result budget; rank the API layer by call-graph degree.
+### 5.2 `context/spend` — the audit closes
+
+Priorities flipped once §5.1 landed: the frozen half is cheap (cached); the
+conversation and tool results are the spend. This branch:
+
+1. **Withdrew §2B** — full-price-every-request was wrong by ~10× at 76–79%.
+2. **§2D per-turn tool-result budget** — cumulative chars on `Budget`; past a
+   window-derived threshold, append a narrowing hint to the result (warn, do
+   not truncate).
+3. **§2C rank API by call-graph fan-in** — load a persisted graph if present,
+   never build one at session open; degrade to source order without one; drop
+   `arg_*` helpers; top-50 by degree get the doc first-line.
+
+Measured on this workspace at the standard 6k-token budget, with the persisted
+graph (2370 nodes / 4221 edges):
+
+| | before (source order) | after (fan-in) |
+|---|---|---|
+| API lines in block | 340 | 219 |
+| `arg_str` / `arg_i64` / `arg_bool` | 4 | 0 |
+| Doc-line rows (`name — …`) | 0 | 47 |
+
+Into the block (sample): `julian_date`, `equatorial_to_horizontal`,
+`default_system_prompt`, `public_items_in`, `parse`, `apply_sse_line`,
+`clip_to_line`, `check_url`. Out: `arg_*` helpers, and a long tail of
+degree-zero structs/enums (`AgentHandle`, `ApiItem`, `Attachment`, …) that the
+`symbol` tool covers — truncation now cuts the least-central symbols rather
+than whatever sorted last in source order.
 
 ~~Former flat-`context_warn` claim withdrawn.~~ `ModelInfo::suggested_limits()`
 already scales warn to 25% of the window — struck in `CONTEXT_AUDIT.md` §2E.
@@ -247,7 +275,7 @@ Everything else is in `AGENTS.md`. New:
 ## 8. Commands
 
 ```bash
-cargo test --workspace                                          # 950, ~10s
+cargo test --workspace                                          # 963, ~10s
 cargo build --workspace --all-targets                           # 0 warnings
 cargo run -p smithy-fisherman --example sheets --features harness
 cargo run -p smithy --release

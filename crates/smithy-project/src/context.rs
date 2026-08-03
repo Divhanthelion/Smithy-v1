@@ -159,9 +159,20 @@ impl ProjectContext {
 }
 
 /// Build the context block for a project.
-pub fn extract(project: &Project, budget: ContextBudget) -> ProjectContext {
+///
+/// `graph` is optional and never built here. The call graph is an explicit,
+/// user-triggered index (AGENTS.md); opening a session must not pay for one.
+/// When present — even a stale one — public-API rows are ordered by fan-in so
+/// truncation cuts the least-central symbols. A stale graph yields a stale
+/// *ranking*, not a stale *fact*; wrong order is cheap, wrong signatures are
+/// not. Without a graph, behaviour is today's source-order round-robin.
+pub fn extract(
+    project: &Project,
+    budget: ContextBudget,
+    graph: Option<&crate::callgraph::CallGraph>,
+) -> ProjectContext {
     match project.kind {
-        ProjectKind::Rust { .. } => extract_rust(project, budget),
+        ProjectKind::Rust { .. } => extract_rust(project, budget, graph),
         ProjectKind::Generic => extract_generic(project, budget),
     }
 }
@@ -176,7 +187,7 @@ pub fn outline(project: &Project) -> String {
     match project.kind {
         ProjectKind::Rust { .. } => outline_rust(project),
         ProjectKind::Generic => {
-            let mut out = extract(project, ContextBudget { max_chars: 1_200 }).rendered;
+            let mut out = extract(project, ContextBudget { max_chars: 1_200 }, None).rendered;
             if let Some(idx) = out.find("\n## Public API") {
                 out.truncate(idx);
             }
@@ -225,7 +236,11 @@ fn outline_rust(project: &Project) -> String {
     out
 }
 
-fn extract_rust(project: &Project, budget: ContextBudget) -> ProjectContext {
+fn extract_rust(
+    project: &Project,
+    budget: ContextBudget,
+    graph: Option<&crate::callgraph::CallGraph>,
+) -> ProjectContext {
     let mut warnings = Vec::new();
     let crates = match rust::crates(&project.root) {
         Ok(c) => c,
@@ -294,7 +309,7 @@ fn extract_rust(project: &Project, budget: ContextBudget) -> ProjectContext {
     let remaining = budget.max_chars.saturating_sub(out.chars().count());
     if remaining > 200 + TRUNCATION_NOTICE.len() {
         let api_budget = remaining - TRUNCATION_NOTICE.len();
-        let (api_section, truncated) = render_api(&crates, api_budget);
+        let (api_section, truncated) = render_api(&crates, api_budget, graph);
         if !api_section.is_empty() {
             out.push_str(&api_section);
             layers.push(Layer::Api);
@@ -353,23 +368,174 @@ fn render_modules(crates: &[rust::Crate]) -> String {
     }
 }
 
+/// How many of the highest-degree items get a doc first-line instead of a
+/// full signature. Past this, signatures stay — the map needs *names* more
+/// than prose once you leave the centre.
+const TOP_DOC_BY_DEGREE: usize = 50;
+
+/// Argument-parsing helpers that used to sit in the API block at equal weight
+/// with `run_turn`. They are not a map of the project.
+fn is_api_noise(item: &rust::ApiItem) -> bool {
+    matches!(
+        rust::api_item_name(&item.signature),
+        Some("arg_str" | "arg_str_opt" | "arg_i64" | "arg_bool")
+    )
+}
+
+/// Fan-in of the best-matching call-graph node for this API item, or 0.
+///
+/// Matching is by bare name, preferring a node whose container equals the
+/// item's module. Unmatched items (structs, rarely-called free fns) sort to
+/// the bottom and are what truncation cuts first.
+fn fan_in(graph: &crate::callgraph::CallGraph, item: &rust::ApiItem) -> usize {
+    let Some(name) = rust::api_item_name(&item.signature) else {
+        return 0;
+    };
+    let candidates = graph.find(name);
+    if candidates.is_empty() {
+        return 0;
+    }
+    candidates
+        .into_iter()
+        .map(|id| {
+            let node = &graph.nodes[id as usize];
+            let container = node.container.as_deref().unwrap_or("");
+            let module_hit = item.module.is_empty() && container.is_empty()
+                || !item.module.is_empty()
+                    && (container == item.module
+                        || container.ends_with(&item.module)
+                        || item.module.ends_with(container));
+            (module_hit as usize, graph.callers(id).len())
+        })
+        .max()
+        .map(|(_, degree)| degree)
+        .unwrap_or(0)
+}
+
+fn format_api_line(item: &rust::ApiItem, use_doc: bool) -> String {
+    let prefix = if item.module.is_empty() {
+        String::new()
+    } else {
+        format!("{}::", item.module)
+    };
+    if use_doc {
+        if let (Some(name), Some(doc)) =
+            (rust::api_item_name(&item.signature), item.doc_line.as_deref())
+        {
+            return format!("  {prefix}{name} — {doc}\n");
+        }
+    }
+    format!("  {prefix}{}\n", item.signature)
+}
+
 /// Render public API signatures, stopping at `max_chars`.
 ///
-/// Round-robins across crates rather than filling one crate at a time, so a
-/// tight budget yields a shallow view of everything instead of a deep view of
-/// whichever crate happened to sort first.
-fn render_api(crates: &[rust::Crate], max_chars: usize) -> (String, bool) {
+/// With a call graph: order by fan-in (highest first), truncate from the
+/// bottom of that order, and give the top [`TOP_DOC_BY_DEGREE`] a doc line
+/// when one exists. Without a graph: round-robin across crates in source
+/// order — today's behaviour — so opening a session never requires an index.
+fn render_api(
+    crates: &[rust::Crate],
+    max_chars: usize,
+    graph: Option<&crate::callgraph::CallGraph>,
+) -> (String, bool) {
+    match graph {
+        Some(graph) => render_api_ranked(crates, max_chars, graph),
+        None => render_api_round_robin(crates, max_chars),
+    }
+}
+
+fn render_api_ranked(
+    crates: &[rust::Crate],
+    max_chars: usize,
+    graph: &crate::callgraph::CallGraph,
+) -> (String, bool) {
+    let mut ranked: Vec<(&str, &rust::ApiItem, usize)> = Vec::new();
+    for c in crates {
+        for item in &c.api {
+            if is_api_noise(item) {
+                continue;
+            }
+            let degree = fan_in(graph, item);
+            ranked.push((c.name.as_str(), item, degree));
+        }
+    }
+    // Highest fan-in first; stable ties on crate/module/signature so the
+    // prompt bytes do not flicker between identical graphs.
+    ranked.sort_by(|a, b| {
+        b.2.cmp(&a.2)
+            .then(a.0.cmp(b.0))
+            .then(a.1.module.cmp(&b.1.module))
+            .then(a.1.signature.cmp(&b.1.signature))
+    });
+
+    // Select in global rank order so truncation cuts the least-central
+    // symbols. Display later regroups under one ### per crate — putting the
+    // crate on every line burned ~750 tokens of the budget on prefixes.
+    let mut selected: Vec<(&str, &rust::ApiItem, bool)> = Vec::new();
+    let mut truncated = false;
+    let mut used = "\n## Public API\n".chars().count();
+    // Reserve a cheap upper bound for headers we will emit once per crate.
+    let mut header_budget: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+    for (i, (crate_name, item, _degree)) in ranked.iter().enumerate() {
+        let use_doc = i < TOP_DOC_BY_DEGREE;
+        let line = format_api_line(item, use_doc);
+        let header_cost = if header_budget.contains(crate_name) {
+            0
+        } else {
+            crate_name.len() + 6 // "### name\n"
+        };
+        if used + header_cost + line.chars().count() > max_chars {
+            truncated = true;
+            break;
+        }
+        used += header_cost + line.chars().count();
+        header_budget.insert(crate_name);
+        selected.push((crate_name, item, use_doc));
+    }
+
+    if selected.is_empty() {
+        return (String::new(), false);
+    }
+
+    // Crate order = first appearance in rank order (highest-degree item wins).
+    let mut crate_order: Vec<&str> = Vec::new();
+    for (crate_name, _, _) in &selected {
+        if !crate_order.contains(crate_name) {
+            crate_order.push(crate_name);
+        }
+    }
+
+    let mut out = String::from("\n## Public API\n");
+    for name in crate_order {
+        let _ = writeln!(out, "### {name}");
+        for (crate_name, item, use_doc) in &selected {
+            if crate_name == &name {
+                out.push_str(&format_api_line(item, *use_doc));
+            }
+        }
+    }
+
+    (out, truncated)
+}
+
+fn render_api_round_robin(crates: &[rust::Crate], max_chars: usize) -> (String, bool) {
     let mut out = String::from("\n## Public API\n");
     let mut truncated = false;
 
+    // Round-robin across crates rather than filling one crate at a time, so a
+    // tight budget yields a shallow view of everything instead of a deep view
+    // of whichever crate happened to sort first.
     let mut queues: Vec<(&str, std::vec::IntoIter<&rust::ApiItem>)> = crates
         .iter()
-        .filter(|c| !c.api.is_empty())
-        .map(|c| {
-            (
-                c.name.as_str(),
-                c.api.iter().collect::<Vec<_>>().into_iter(),
-            )
+        .filter_map(|c| {
+            let items: Vec<&rust::ApiItem> = c.api.iter().filter(|i| !is_api_noise(i)).collect();
+            if items.is_empty() {
+                None
+            } else {
+                Some((c.name.as_str(), items.into_iter()))
+            }
         })
         .collect();
 
@@ -378,7 +544,7 @@ fn render_api(crates: &[rust::Crate], max_chars: usize) -> (String, bool) {
     }
 
     let mut emitted_headers: Vec<&str> = Vec::new();
-    let mut pending: Vec<(String, String)> = Vec::new(); // (crate, line)
+    let mut pending: Vec<(String, String)> = Vec::new();
 
     'outer: loop {
         let mut progressed = false;
@@ -386,13 +552,7 @@ fn render_api(crates: &[rust::Crate], max_chars: usize) -> (String, bool) {
             let Some(item) = queue.next() else { continue };
             progressed = true;
 
-            let prefix = if item.module.is_empty() {
-                String::new()
-            } else {
-                format!("{}::", item.module)
-            };
-            let line = format!("  {prefix}{}\n", item.signature);
-
+            let line = format_api_line(item, false);
             let header_cost = if emitted_headers.contains(name) {
                 0
             } else {
@@ -414,7 +574,6 @@ fn render_api(crates: &[rust::Crate], max_chars: usize) -> (String, bool) {
         }
     }
 
-    // Group the collected lines under their crate headings.
     for name in &emitted_headers {
         let _ = writeln!(out, "### {name}");
         for (owner, line) in &pending {
@@ -749,5 +908,84 @@ mod tests {
     fn budget_conversion_is_four_chars_per_token() {
         assert_eq!(ContextBudget::from_tokens(1_000).max_chars, 4_000);
         assert!(ContextBudget::compact().max_chars < ContextBudget::standard().max_chars);
+    }
+
+    /// With a graph, higher fan-in wins the budget; without one, source order
+    /// is unchanged. Noise helpers never appear either way.
+    #[test]
+    fn api_layer_ranks_by_fan_in_when_a_graph_is_present() {
+        use crate::callgraph::{CallGraph, Edge, Node};
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/lib.rs"),
+            r#"
+/// Build the context block for a project.
+pub fn extract() {}
+pub fn arg_bool() {}
+pub fn peripheral() {}
+"#,
+        )
+        .unwrap();
+
+        let mut graph = CallGraph::default();
+        graph.nodes.push(Node {
+            name: "extract".into(),
+            container: None,
+            file: "src/lib.rs".into(),
+            line: 1,
+            end_line: 1,
+        });
+        graph.nodes.push(Node {
+            name: "peripheral".into(),
+            container: None,
+            file: "src/lib.rs".into(),
+            line: 2,
+            end_line: 2,
+        });
+        // Callers at indices 2, 3, 4 — three edges into extract, none into peripheral.
+        for i in 2..5 {
+            graph.nodes.push(Node {
+                name: format!("caller{i}"),
+                container: None,
+                file: "src/lib.rs".into(),
+                line: 10 + i,
+                end_line: 10 + i,
+            });
+            graph.edges.push(Edge {
+                from: i as u32,
+                to: 0,
+                sites: 1,
+            });
+        }
+
+        let project = crate::Project::discover(tmp.path()).unwrap();
+        let ranked = project.context_with_graph(
+            ContextBudget { max_chars: 2_000 },
+            Some(&graph),
+        );
+        let api = ranked
+            .rendered
+            .split("## Public API")
+            .nth(1)
+            .unwrap_or("");
+        assert!(
+            api.find("extract").unwrap() < api.find("peripheral").unwrap(),
+            "higher fan-in must sort first:\n{api}"
+        );
+        assert!(
+            api.contains("extract — Build the context block"),
+            "top-ranked items use the doc line:\n{api}"
+        );
+        assert!(
+            !api.contains("arg_bool"),
+            "argument helpers are noise:\n{api}"
+        );
     }
 }

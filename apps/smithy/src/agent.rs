@@ -311,10 +311,21 @@ pub async fn build_session(
             // Sized against the window this model actually has, rather than the
             // flat 6k every model used to get. See `ContextBudget::for_window`.
             let budget = ContextBudget::for_window(info.as_ref().and_then(|i| i.context_length));
-            let extracted =
-                tokio::task::spawn_blocking(move || context_project.context(budget))
-                    .await
-                    .map_err(|e| format!("project scan failed: {e}"))?;
+            // Load a persisted call graph if the user has built one. Never
+            // build here — indexing is explicit (~10s / ~2GB) and opening a
+            // session must not pay for it. A stale graph is fine: wrong order
+            // is cheap, wrong signatures are not.
+            let graph = smithy_project::ProjectRegistry::default_location()
+                .ok()
+                .and_then(|reg| {
+                    let path = reg.callgraph_path(&project.root);
+                    smithy_project::callgraph::CallGraph::load(&path).ok()
+                });
+            let extracted = tokio::task::spawn_blocking(move || {
+                context_project.context_with_graph(budget, graph.as_ref())
+            })
+            .await
+            .map_err(|e| format!("project scan failed: {e}"))?;
             for warning in &extracted.warnings {
                 eprintln!("[project] {warning}");
             }

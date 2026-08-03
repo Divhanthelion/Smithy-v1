@@ -55,7 +55,7 @@ pub use catalogue::{ModelEntry, ModelTier};
 pub use config::{AgentConfig, Endpoint, ProviderChoice};
 pub use explore::Explore;
 pub use symbol_tool::SymbolLookup;
-pub use limits::{Budget, Limits, Stop};
+pub use limits::{tool_result_warn_for_window, Budget, Limits, Stop};
 pub use message::{History, Message, Role};
 pub use parse::{parse, Action};
 pub use persist::{transcript, SessionStore, TranscriptEntry};
