@@ -62,11 +62,13 @@ pub fn day_sheet(out_dir: &std::path::Path) {
             (hours * 18000.0) as u64,
         );
         let rendered = render_tile(&scene);
-        // Prefer the outdoor figure. Falling back to all non-bg ink covers
-        // indoors (window silhouette, no IRON on the rail) without dragging
-        // every outdoor tile out to hut↔perch width.
+        // Figure when outdoors; hut when indoors (window silhouette is Hut,
+        // not Figure). The colour classifier used to return Some(1px) on
+        // indoor frames from hut AA that looked like IRON, so the crop
+        // framed a stray pixel instead of the hut — sleeping rows flickered.
         let (x0, y0, x1, y1) = rendered
-            .figure_bounds()
+            .part_bounds(crate::Part::Figure)
+            .or_else(|| rendered.part_bounds(crate::Part::Hut))
             .or_else(|| rendered.content_bounds())
             .unwrap_or((0, 0, 1, 1));
         // Always keep the rail band under the content: is_bg treats STEEL_BODY

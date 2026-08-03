@@ -2,12 +2,16 @@
 //!
 //! Lifted from the preview example so checks and sheets share one path —
 //! a second rasteriser would be the original seam bug in miniature.
+//!
+//! The part mask is the reason `Ink::begin` exists: IRON cannot be told from
+//! hut AA by colour (midpoint of HUT_ROOF→HUT_WALL is distance 2 from IRON),
+//! so the harness records what `paint` said it was drawing.
 
 use kurbo::{BezPath, PathEl, Point, Rect, Shape};
 use peniko::Color;
 
 use crate::fisherman::{self as f, Scene};
-use crate::Ink;
+use crate::{Ink, Part};
 
 /// The frame's steel, from forged.rs — not fisherman palette. He stands on it;
 /// contrast checks compare RIM against this, not against black.
@@ -42,21 +46,58 @@ fn to_ts(path: &BezPath) -> Option<tiny_skia::Path> {
     pb.finish()
 }
 
-/// A pixmap that implements [`Ink`].
+/// A pixmap that implements [`Ink`], with an exact per-[`Part`] mask.
 pub struct PixmapInk {
     pub pm: tiny_skia::Pixmap,
+    /// Parallel buffer: R = [`Part::tag`], A = 255 when stamped. No AA, so
+    /// A is binary — coverage blending would average tags into phantom Parts.
+    mask: tiny_skia::Pixmap,
+    current: Option<Part>,
 }
 
 impl PixmapInk {
     pub fn new(w: u32, h: u32, bg: Color) -> Self {
         let mut pm = tiny_skia::Pixmap::new(w, h).expect("pixmap");
         pm.fill(tc(bg));
-        PixmapInk { pm }
+        let mut mask = tiny_skia::Pixmap::new(w, h).expect("mask");
+        mask.fill(tiny_skia::Color::from_rgba8(0, 0, 0, 0));
+        PixmapInk {
+            pm,
+            mask,
+            current: None,
+        }
+    }
+
+    /// Colour-only load for golden comparison — mask stays empty.
+    pub fn from_pixmap(pm: tiny_skia::Pixmap) -> Self {
+        let mut mask = tiny_skia::Pixmap::new(pm.width(), pm.height()).expect("mask");
+        mask.fill(tiny_skia::Color::from_rgba8(0, 0, 0, 0));
+        PixmapInk {
+            pm,
+            mask,
+            current: None,
+        }
     }
 
     fn paint(color: Color) -> tiny_skia::Paint<'static> {
         tiny_skia::Paint {
             shader: tiny_skia::Shader::SolidColor(tc(color)),
+            ..Default::default()
+        }
+    }
+
+    fn mask_paint(part: Part) -> tiny_skia::Paint<'static> {
+        let t = part.tag();
+        tiny_skia::Paint {
+            // No AA on the mask. tiny-skia's Source still coverage-blends
+            // into the destination on antialiased edges, so Hut(1) under
+            // Smoke(6) at cov≈0.2 writes R=2 — which is Part::Figure. That
+            // made every indoor frame report four phantom figure pixels
+            // (begin(Figure) never ran). Tags are labels: covered or not.
+            // Colour pixmap keeps AA; only the mask is binary.
+            shader: tiny_skia::Shader::SolidColor(tiny_skia::Color::from_rgba8(t, 0, 0, 255)),
+            blend_mode: tiny_skia::BlendMode::Source,
+            anti_alias: false,
             ..Default::default()
         }
     }
@@ -83,24 +124,64 @@ impl PixmapInk {
         Some((d[i], d[i + 1], d[i + 2], d[i + 3]))
     }
 
-    /// Bounding box of non-background ink, if any.
-    ///
-    /// The day sheet crops to this — the full 1100px rail is mostly empty
-    /// steel, and a grid of full-width tiles downscales each one to ~10px.
+    /// Which [`Part`] owns this pixel, if any.
+    pub fn part_at(&self, x: u32, y: u32) -> Option<Part> {
+        let i = ((y * self.mask.width() + x) * 4) as usize;
+        let d = self.mask.data();
+        if i + 3 >= d.len() {
+            return None;
+        }
+        // A > 0 means the mask was stamped; R holds the tag.
+        if d[i + 3] == 0 {
+            return None;
+        }
+        Part::from_tag(d[i])
+    }
+
+    /// Bounding box of pixels tagged as `part`.
+    pub fn part_bounds(&self, part: Part) -> Option<(u32, u32, u32, u32)> {
+        let tag = part.tag();
+        let mut min_x = self.width();
+        let mut min_y = self.height();
+        let mut max_x = 0u32;
+        let mut max_y = 0u32;
+        let mut any = false;
+        let d = self.mask.data();
+        let w = self.width();
+        for y in 0..self.height() {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                if d[i + 3] == 0 || d[i] != tag {
+                    continue;
+                }
+                any = true;
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
+        }
+        any.then_some((min_x, min_y, max_x, max_y))
+    }
+
+    /// Count of pixels tagged as `part`.
+    pub fn part_count(&self, part: Part) -> u64 {
+        let tag = part.tag();
+        let d = self.mask.data();
+        let mut n = 0u64;
+        let mut i = 0;
+        while i + 3 < d.len() {
+            if d[i + 3] != 0 && d[i] == tag {
+                n += 1;
+            }
+            i += 4;
+        }
+        n
+    }
+
+    /// Bounding box of non-background colour ink (any part). Fallback when
+    /// neither figure nor hut was tagged — should be rare after `begin`.
     pub fn content_bounds(&self) -> Option<(u32, u32, u32, u32)> {
-        self.bounds_where(|rgb| !is_bg(rgb))
-    }
-
-    /// Bounding box of outdoor-figure IRON pixels, if any.
-    ///
-    /// Day-sheet crops prefer this over [`content_bounds`]: the hut is always
-    /// drawn, so a full-content box on a fishing tile spans hut→perch and the
-    /// grid cell is once again the whole rail.
-    pub fn figure_bounds(&self) -> Option<(u32, u32, u32, u32)> {
-        self.bounds_where(is_iron)
-    }
-
-    fn bounds_where(&self, mut keep: impl FnMut((u8, u8, u8)) -> bool) -> Option<(u32, u32, u32, u32)> {
         let mut min_x = self.width();
         let mut min_y = self.height();
         let mut max_x = 0u32;
@@ -111,7 +192,7 @@ impl PixmapInk {
                 let Some((r, g, b, _)) = self.pixel(x, y) else {
                     continue;
                 };
-                if !keep((r, g, b)) {
+                if is_bg((r, g, b)) {
                     continue;
                 }
                 any = true;
@@ -125,6 +206,7 @@ impl PixmapInk {
     }
 
     /// Copy a source rectangle into this pixmap at `(dst_x, dst_y)`.
+    /// Colour only — sheet composites do not need the per-part mask.
     pub fn blit_from(
         &mut self,
         src: &PixmapInk,
@@ -157,9 +239,37 @@ impl PixmapInk {
             }
         }
     }
+
+    fn stamp_mask(&mut self, path: &tiny_skia::Path, stroke: Option<&tiny_skia::Stroke>) {
+        let Some(part) = self.current else {
+            return;
+        };
+        let paint = Self::mask_paint(part);
+        if let Some(stroke) = stroke {
+            self.mask.stroke_path(
+                path,
+                &paint,
+                stroke,
+                tiny_skia::Transform::default(),
+                None,
+            );
+        } else {
+            self.mask.fill_path(
+                path,
+                &paint,
+                tiny_skia::FillRule::Winding,
+                tiny_skia::Transform::default(),
+                None,
+            );
+        }
+    }
 }
 
 impl Ink for PixmapInk {
+    fn begin(&mut self, part: Part) {
+        self.current = Some(part);
+    }
+
     fn fill(&mut self, path: &BezPath, color: Color) {
         if let Some(p) = to_ts(path) {
             self.pm.fill_path(
@@ -169,6 +279,7 @@ impl Ink for PixmapInk {
                 tiny_skia::Transform::default(),
                 None,
             );
+            self.stamp_mask(&p, None);
         }
     }
 
@@ -183,6 +294,7 @@ impl Ink for PixmapInk {
                 tiny_skia::Transform::default(),
                 None,
             );
+            self.stamp_mask(&p, Some(&stroke));
         }
     }
 }
@@ -195,6 +307,10 @@ pub struct OffsetInk<'a> {
 }
 
 impl Ink for OffsetInk<'_> {
+    fn begin(&mut self, part: Part) {
+        self.inner.begin(part);
+    }
+
     fn fill(&mut self, path: &BezPath, color: Color) {
         self.inner.fill(&shift(path, self.dx, self.dy), color);
     }
@@ -239,6 +355,7 @@ pub fn render_scene(scene: &Scene) -> PixmapInk {
             .path_elements(0.25)
             .collect(),
     );
+    // No begin — steel is backdrop, not a Part.
     ink.fill(&rail, STEEL_BODY);
     f::paint(&mut ink, scene);
     ink
@@ -265,20 +382,8 @@ pub fn is_bg(rgb: (u8, u8, u8)) -> bool {
         || colour_dist(rgb, (body.0, body.1, body.2)) <= 6
 }
 
-/// Solid IRON fill of the outdoor figure (and the rod). Distinct from
-/// [`HUT_ROOF`] used for the window silhouette — without that split the
-/// "hidden indoors" check cannot tell drawn-on-rail from drawn-in-window.
-///
-/// Tight radius: AA fringes of HUT_WALL/HUT_ROOF land within ~6 of IRON and
-/// are not figure ink. Solid figure fills are exact `(17,20,27)`; ≤3 catches
-/// them and rejects the hut-edge false positives measured 2026-08-03
-/// (indoors frames reported 3–4 "IRON" pixels that were plank AA).
-pub fn is_iron(rgb: (u8, u8, u8)) -> bool {
-    let iron = rgba8(f::IRON);
-    colour_dist(rgb, (iron.0, iron.1, iron.2)) <= 3
-}
-
-/// RIM / RIM_BRIGHT stroke pixels (gold edge). Used by the contrast check.
+/// RIM / RIM_BRIGHT stroke pixels (gold edge). Used by the contrast check —
+/// that one genuinely wants a colour test against the steel behind him.
 pub fn is_rim(rgb: (u8, u8, u8)) -> bool {
     let rim = rgba8(f::RIM);
     let bright = rgba8(f::RIM_BRIGHT);

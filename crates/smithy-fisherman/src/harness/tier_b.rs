@@ -13,7 +13,7 @@ use crate::fisherman::{
 use crate::routine::{Doing, Place};
 
 use super::raster::{
-    is_bg, is_fire, is_lamp_warm, is_rim, luminance, render_scene, STEEL_BODY,
+    is_bg, is_lamp_warm, is_rim, luminance, render_scene, STEEL_BODY,
 };
 use super::report::CheckResult;
 use super::{height, launched_built, BAND, DAY, SUNRISE, SUNSET, WIDTH};
@@ -139,9 +139,9 @@ fn ink_budget() -> CheckResult {
 }
 
 fn fire_where_fire_is() -> CheckResult {
-    // FIRE_* pixels must sit near the pit. "A hearth that teleports to the
-    // doorstep reads as a decal" — the comment at paint's fire_base is the
-    // assertion. Measured pit centre from the same formula paint uses.
+    // Part::Fire pixels must sit near the pit. "A hearth that teleports to
+    // the doorstep reads as a decal" — the comment at paint's fire_base is
+    // the assertion. Tagged, not coloured: the part mask is exact.
     let scene = sample(18.5, launched_built(), 40); // cooking at the fire
     // Force Cooking/Fire if the clock landed elsewhere (cigarette overlay).
     let scene = Scene {
@@ -173,10 +173,7 @@ fn fire_where_fire_is() -> CheckResult {
     let mut fire_in = 0u64;
     for y in 0..ink.height() {
         for x in 0..ink.width() {
-            let Some((r, g, b, _)) = ink.pixel(x, y) else {
-                continue;
-            };
-            if !is_fire((r, g, b)) {
+            if ink.part_at(x, y) != Some(crate::Part::Fire) {
                 continue;
             }
             fire_total += 1;
@@ -205,7 +202,7 @@ fn fire_where_fire_is() -> CheckResult {
         pass,
         measured: frac,
         threshold: Some(MIN_IN_FRAC),
-        detail: format!("{fire_in}/{fire_total} FIRE_* pixels inside pit bbox (frac {frac:.3})"),
+        detail: format!("{fire_in}/{fire_total} Fire-tagged pixels inside pit bbox (frac {frac:.3})"),
         flips: vec![],
     }
 }

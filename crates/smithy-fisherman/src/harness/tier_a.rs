@@ -10,9 +10,10 @@ use crate::fisherman::{
 };
 use crate::routine::WALK_SECONDS;
 
-use super::raster::{self, is_bg, is_iron, render_scene};
+use super::raster::{self, is_bg, render_scene};
 use super::report::{CheckResult, FacingFlip};
 use super::{height, launched_built, BAND, DAY, SUNRISE, SUNSET, WIDTH};
+use crate::Part;
 
 /// Volute clearance along the rail.
 ///
@@ -96,9 +97,9 @@ fn outdoor_samples() -> Vec<Scene> {
 
 fn he_stays_on_the_rail() -> CheckResult {
     // Sample outdoor + build frames; count non-bg pixels that invade the
-    // volute OR figure-IRON pixels that leave the rail band vertically
+    // volute OR figure-tagged pixels that leave the rail band vertically
     // (rod into the editor pane). Hut roof/smoke are allowed above the
-    // band — they are HUT_*/SMOKE, not figure IRON.
+    // band — they are Part::Hut / Part::Smoke, not Figure.
     let mut offenders = 0u64;
     let mut scenes = outdoor_samples();
     // Mid-build: walls rising near the corner stone is the original case.
@@ -126,7 +127,9 @@ fn he_stays_on_the_rail() -> CheckResult {
                     continue;
                 }
                 // Figure body on the rail only — hut/smoke above the band are fine.
-                if is_iron(rgb) && (yf < rail_top - 1.0 || yf >= height()) {
+                if ink.part_at(x, y) == Some(Part::Figure)
+                    && (yf < rail_top - 1.0 || yf >= height())
+                {
                     offenders += 1;
                 }
             }
@@ -140,16 +143,17 @@ fn he_stays_on_the_rail() -> CheckResult {
         measured: offenders as f64,
         threshold: Some(0.0),
         detail: format!(
-            "{offenders} pixels outside volute clearance (band*{VOLUTE_CLEARANCE}) or figure IRON above rail"
+            "{offenders} pixels outside volute clearance (band*{VOLUTE_CLEARANCE}) or figure above rail"
         ),
         flips: vec![],
     }
 }
 
 fn he_exists() -> CheckResult {
-    // Outdoors → IRON bbox non-empty and inside the stage. Guards the
+    // Outdoors → figure Part bbox non-empty and inside the stage. Guards the
     // "snapped straight out of existence at the wall" class at every place,
-    // not only the door.
+    // not only the door. Tagged, not coloured: IRON cannot tell figure from
+    // hut AA.
     let (_, stage_left, stage) = stage_layout(WIDTH, BAND);
     let mut failures = 0u64;
     let mut checked = 0u64;
@@ -160,30 +164,10 @@ fn he_exists() -> CheckResult {
         }
         checked += 1;
         let ink = render_scene(&scene);
-        let mut min_x = ink.width();
-        let mut max_x = 0u32;
-        let mut min_y = ink.height();
-        let mut max_y = 0u32;
-        let mut count = 0u64;
-        for y in 0..ink.height() {
-            for x in 0..ink.width() {
-                let Some((r, g, b, _)) = ink.pixel(x, y) else {
-                    continue;
-                };
-                if !is_iron((r, g, b)) {
-                    continue;
-                }
-                count += 1;
-                min_x = min_x.min(x);
-                max_x = max_x.max(x);
-                min_y = min_y.min(y);
-                max_y = max_y.max(y);
-            }
-        }
-        if count == 0 {
+        let Some((min_x, min_y, max_x, max_y)) = ink.part_bounds(Part::Figure) else {
             failures += 1;
             continue;
-        }
+        };
         let inside = min_x as f64 >= stage_left - BAND
             && max_x as f64 <= stage_left + stage + BAND * 3.0
             && min_y as f64 >= height() - BAND - 2.0
@@ -199,32 +183,33 @@ fn he_exists() -> CheckResult {
         pass: failures == 0 && checked > 0,
         measured: failures as f64,
         threshold: Some(0.0),
-        detail: format!("{failures} outdoor frames with empty or out-of-stage IRON bbox ({checked} checked)"),
+        detail: format!(
+            "{failures} outdoor frames with empty or out-of-stage figure bbox ({checked} checked)"
+        ),
         flips: vec![],
     }
 }
 
 fn hidden_indoors() -> CheckResult {
-    // Indoors → zero outdoor figure IRON on the rail. Window silhouette uses
-    // HUT_ROOF, not IRON — that distinction is the whole check. Also: when
-    // window_light says lit, warm/lamp pixels near the window; Sleeping mid-
-    // block may fade the lamp (window_light → 0) and that is correct.
-    let indoor_hours = [
-        5.0,   // sleeping pre-dawn
-        6.05,  // waking (up = sunrise − 30m = 6.0)
-        13.5,  // siesta (noon + 20m ≈ 13.33)
-        20.5,  // reading
-        23.0,  // sleeping, lamp may be out
-    ];
-    let mut iron_on_rail = 0u64;
+    // Indoors → zero Part::Figure on the rail. The window silhouette is
+    // tagged Hut (it is drawn into the pane as hut décor), so it does not
+    // trip this. Sampled across every 15 min of the simulated day — the
+    // colour classifier used to report 1–2 false "figure" pixels on half
+    // the indoor frames; the part mask makes "0 across all 96" meaningful.
+    // Also: when window_light says lit, warm/lamp pixels near the window;
+    // Sleeping mid-block may fade the lamp and that is correct.
+    let mut figure_on_rail = 0u64;
     let mut light_failures = 0u64;
     let mut checked = 0u64;
+    let mut indoor_tiles = 0u64;
 
-    for &hours in &indoor_hours {
+    for i in 0..96u32 {
+        let hours = (i * 15) as f64 / 60.0;
         let scene = sample_scene(hours, launched_built(), (hours * 18000.0) as u64);
         if !scene.doing.is_indoors(scene.place) {
             continue;
         }
+        indoor_tiles += 1;
         checked += 1;
         let lit = window_light(scene.doing, scene.place, scene.progress);
         let ink = render_scene(&scene);
@@ -232,30 +217,18 @@ fn hidden_indoors() -> CheckResult {
 
         for y in rail_top..ink.height() {
             for x in 0..ink.width() {
-                let Some((r, g, b, _)) = ink.pixel(x, y) else {
-                    continue;
-                };
-                // Exact IRON only: hut plank AA lands within ~2–3 of IRON
-                // (measured Siesta frame pixel (18,20,26)) and is not the
-                // outdoor figure. Solid figure fills are exact (17,20,27).
-                let iron = raster::rgba8(f::IRON);
-                if (r, g, b) == (iron.0, iron.1, iron.2) {
-                    iron_on_rail += 1;
+                if ink.part_at(x, y) == Some(Part::Figure) {
+                    figure_on_rail += 1;
                 }
             }
         }
 
         if lit > 0.05 {
+            let (scale, stage_left, _) = stage_layout(WIDTH, BAND);
             let hut = f::HutGeometry::new(
-                {
-                    let (scale, stage_left, _) = stage_layout(WIDTH, BAND);
-                    stage_left - scale * 0.35
-                },
+                stage_left - scale * 0.35,
                 height() - BAND * 0.10,
-                {
-                    let (scale, _, _) = stage_layout(WIDTH, BAND);
-                    scale * 1.45
-                },
+                scale * 1.45,
                 BAND,
             );
             let win = hut.window();
@@ -280,15 +253,17 @@ fn hidden_indoors() -> CheckResult {
         }
     }
 
-    let pass = iron_on_rail == 0 && light_failures == 0 && checked > 0;
+    let pass = figure_on_rail == 0 && light_failures == 0 && checked > 0;
     CheckResult {
         name: "hidden_indoors",
         tier: "A",
         pass,
-        measured: (iron_on_rail + light_failures) as f64,
+        measured: (figure_on_rail + light_failures) as f64,
         threshold: Some(0.0),
         detail: format!(
-            "{iron_on_rail} IRON pixels on rail while indoors; {light_failures} lit-expected frames with no warm window pixels ({checked} checked)"
+            "{figure_on_rail} figure-tagged pixels on rail while indoors; \
+             {light_failures} lit-expected frames with no warm window pixels \
+             ({checked} indoor tiles of 96, {indoor_tiles} indoor)"
         ),
         flips: vec![],
     }
@@ -296,7 +271,7 @@ fn hidden_indoors() -> CheckResult {
 
 fn right_size() -> CheckResult {
     // Figure bbox height ∈ [0.5, 1.1] × scale — catches a smudge or a giant
-    // from a scale bug. Cheap; whole class.
+    // from a scale bug. Cheap; whole class. Part mask, not IRON colour.
     let (scale, _, _) = stage_layout(WIDTH, BAND);
     let lo = 0.5 * scale;
     let hi = 1.1 * scale;
@@ -305,37 +280,17 @@ fn right_size() -> CheckResult {
 
     for scene in outdoor_samples() {
         let ink = render_scene(&scene);
-        let mut min_y = ink.height();
-        let mut max_y = 0u32;
-        let mut count = 0u64;
-        for y in 0..ink.height() {
-            for x in 0..ink.width() {
-                let Some((r, g, b, _)) = ink.pixel(x, y) else {
-                    continue;
-                };
-                if is_iron((r, g, b)) {
-                    count += 1;
-                    min_y = min_y.min(y);
-                    max_y = max_y.max(y);
-                }
-            }
-        }
-        if count == 0 {
+        let Some((_, min_y, _, max_y)) = ink.part_bounds(Part::Figure) else {
             failures += 1;
             continue;
-        }
+        };
         let h = (max_y - min_y + 1) as f64;
         worst = if failures == 0 && worst == 0.0 {
             h
+        } else if h < lo || h > hi {
+            h
         } else {
-            // Keep the furthest-from-band measurement visible in the report.
-            if h < lo {
-                h
-            } else if h > hi {
-                h
-            } else {
-                worst.max(h)
-            }
+            worst.max(h)
         };
         if h < lo || h > hi {
             failures += 1;
@@ -350,7 +305,7 @@ fn right_size() -> CheckResult {
         measured: worst,
         threshold: Some(hi),
         detail: format!(
-            "{failures} frames with IRON bbox height outside [{lo:.1}, {hi:.1}] (scale={scale:.1})"
+            "{failures} frames with figure bbox height outside [{lo:.1}, {hi:.1}] (scale={scale:.1})"
         ),
         flips: vec![],
     }
@@ -541,3 +496,4 @@ fn face_of(scene: &Scene) -> f64 {
         scene.completion,
     )
 }
+

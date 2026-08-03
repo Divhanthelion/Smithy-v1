@@ -13,5 +13,5 @@ pub mod routine;
 pub mod harness;
 
 pub use fisherman::*;
-pub use ink::Ink;
+pub use ink::{Ink, Part};
 pub use routine::{Block, Doing, Place};

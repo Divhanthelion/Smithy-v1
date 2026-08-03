@@ -10,9 +10,26 @@
 //! harness`. Nothing in CI asserts them yet — deliberate: `does_not_moonwalk`
 //! is red on a pre-existing build trip-boundary lookback bug, and flipping
 //! the checks into `cargo test` now would make CI red on a scheduled fix.
-//! After that bug is fixed (the next branch), promote `run_checks` into an
+//! After that bug is fixed (branch 3), promote `run_checks` into an
 //! integration test behind the `harness` feature so a regression cannot land
 //! silently. Not before.
+//!
+//! ## Branch 3 — animation bugs (not this PR)
+//!
+//! Both are production: fix them with the moonwalk, not here.
+//!
+//! 1. **Midnight lamp flare.** Sleep spans midnight; `routine::at` works in
+//!    hours-since-local-midnight, so at 00:00 the block rebuilds with
+//!    `start = 0.0` and progress resets `0.900 → 0`. `window_light` reads
+//!    that as "just went to bed" and lights the lamp (0.000 @ 23:45,
+//!    0.450 @ 00:00, 0.000 @ 00:15). Found on the day sheet by rolling
+//!    the day by hand — the default 00:00–23:45 sweep never looks at the
+//!    seam between one day and the next.
+//! 2. **Day strip across midnight.** Sample ~21:00 through ~03:00 with the
+//!    day seed rolling, as its own sheet strip, so that seam is visible.
+//! 3. **Lighting continuity.** Same shape as `does_not_teleport`, for
+//!    `window_light` and `door_open`: 1 s steps, flag any jump past a
+//!    threshold. Would have caught (1) without opening a PNG.
 
 pub mod font;
 pub mod golden;
