@@ -762,52 +762,8 @@ pub fn paint(ink: &mut impl Ink, scene: &Scene) {
     // While the hut is going up he is building it, whatever the clock
     // says. He does not go to bed halfway through raising a wall.
     let building = completion < 1.0;
-    let (doing, along) = if building && completion < HANDOVER {
-        (Doing::Walking, build_position(completion))
-    } else if building {
-        // Finished building; now walk to wherever the day has him, so the
-        // handover is a walk rather than a jump.
-        let handover = ((completion - HANDOVER) / (1.0 - HANDOVER)).clamp(0.0, 1.0);
-        let from = build_position(HANDOVER);
-        let to = place_position(block_place);
-        (
-            Doing::Walking,
-            from + (to - from) * ease((handover / ARRIVAL).min(1.0)),
-        )
-    } else {
-        (
-            block_doing,
-            position_along(came_from, block_place, block_doing, progress),
-        )
-    };
-    // Where he was a moment ago decides which way he is pointing. Reading
-    // it off the movement rather than tracking a heading means it can never
-    // disagree with where he is actually going.
-    //
-    // Within-block lookback rather than a wall-clock second: the old lookback
-    // needed the sun and the day inside Scene, which forced every harness tile
-    // to invent a coherent clock. The facing *sign* is what matters, and that
-    // is the same along any monotonic stretch of `position_along` /
-    // `build_position`.
-    let a_moment_ago = if building && completion < HANDOVER {
-        build_position((completion - 0.004).max(0.0))
-    } else if building {
-        let handover = ((completion - HANDOVER - 0.004) / (1.0 - HANDOVER)).clamp(0.0, 1.0);
-        let from = build_position(HANDOVER);
-        from + (place_position(block_place) - from) * ease((handover / ARRIVAL).min(1.0))
-    } else {
-        position_along(came_from, block_place, block_doing, (progress - 0.004).max(0.0))
-    };
-    let face = facing(a_moment_ago, along);
-    // During the beat at a walk's end he is standing still, and stillness
-    // reads as facing right — which at the hut is *away* from the door
-    // opening beside him. A stopped walker keeps the walk's own heading.
-    let face = if !building && doing == Doing::Walking && (along - a_moment_ago).abs() < 1e-6
-    {
-        facing(place_position(came_from), place_position(block_place))
-    } else {
-        face
-    };
+    let (doing, along) = position_for(came_from, block_place, block_doing, progress, completion);
+    let face = face_for(came_from, block_place, block_doing, progress, completion);
     let left = stage_left + along * stage;
     // Mirrored about his own centre when he is heading left, so the rod
     // and the plank swap sides with him rather than staying put.
@@ -853,6 +809,76 @@ pub fn paint(ink: &mut impl Ink, scene: &Scene) {
     }
 }
 
+/// Where he is along the stage, and what pose drives him, for this frame.
+///
+/// Split out of [`paint`] so the facing lookback can be tested without a
+/// renderer — the lookback used to reach into the previous routine block via
+/// a wall-clock second, and that is exactly the behaviour this branch changed.
+pub fn position_for(
+    previous: Place,
+    place: Place,
+    doing: Doing,
+    progress: f64,
+    completion: f64,
+) -> (Doing, f64) {
+    let building = completion < 1.0;
+    if building && completion < HANDOVER {
+        (Doing::Walking, build_position(completion))
+    } else if building {
+        // Finished building; now walk to wherever the day has him, so the
+        // handover is a walk rather than a jump.
+        let handover = ((completion - HANDOVER) / (1.0 - HANDOVER)).clamp(0.0, 1.0);
+        let from = build_position(HANDOVER);
+        let to = place_position(place);
+        (
+            Doing::Walking,
+            from + (to - from) * ease((handover / ARRIVAL).min(1.0)),
+        )
+    } else {
+        (doing, position_along(previous, place, doing, progress))
+    }
+}
+
+/// Which way he faces this frame.
+///
+/// Within-block lookback rather than a wall-clock second: the old lookback
+/// needed the sun and the day inside [`Scene`], which forced every harness
+/// tile to invent a coherent clock. The facing *sign* is what matters on a
+/// monotonic stretch; at the start of a settled activity the lookback clamps
+/// to the block's own progress, so he does not inherit the walk that
+/// delivered him (see the test that guards this).
+pub fn face_for(
+    previous: Place,
+    place: Place,
+    doing: Doing,
+    progress: f64,
+    completion: f64,
+) -> f64 {
+    let building = completion < 1.0;
+    let (doing_now, along) = position_for(previous, place, doing, progress, completion);
+    let a_moment_ago = if building && completion < HANDOVER {
+        build_position((completion - 0.004).max(0.0))
+    } else if building {
+        let handover = ((completion - HANDOVER - 0.004) / (1.0 - HANDOVER)).clamp(0.0, 1.0);
+        let from = build_position(HANDOVER);
+        from + (place_position(place) - from) * ease((handover / ARRIVAL).min(1.0))
+    } else {
+        // Clamped: progress 0 stays inside this block. The old code subtracted
+        // a wall-clock second and asked the routine, which at a block boundary
+        // could answer with the walk that brought him here.
+        position_along(previous, place, doing, (progress - 0.004).max(0.0))
+    };
+    let face = facing(a_moment_ago, along);
+    // During the beat at a walk's end he is standing still, and stillness
+    // reads as facing right — which at the hut is *away* from the door
+    // opening beside him. A stopped walker keeps the walk's own heading.
+    if !building && doing_now == Doing::Walking && (along - a_moment_ago).abs() < 1e-6 {
+        facing(place_position(previous), place_position(place))
+    } else {
+        face
+    }
+}
+
 fn draw_figure(
     ink: &mut impl Ink,
     pose: &Pose,
@@ -870,7 +896,7 @@ fn draw_figure(
 }
 
 /// Map a path from the unit box onto the panel.
-fn place(path: &BezPath, at: &impl Fn(Point) -> Point) -> BezPath {
+pub fn place(path: &BezPath, at: &impl Fn(Point) -> Point) -> BezPath {
     let mut out = BezPath::new();
     for element in path.elements() {
         use kurbo::PathEl;
@@ -1602,6 +1628,32 @@ mod tests {
         assert!(
             (forward.foot.x - mid.foot.x).abs() > 1e-3,
             "his stride does not move his foot"
+        );
+    }
+
+    /// A settled activity at progress 0 must not inherit the walk that
+    /// delivered him.
+    ///
+    /// The old facing lookback subtracted a wall-clock second and asked the
+    /// routine, so at the start of Cooking (arrived leftward from the perch)
+    /// it still saw that walk and kept him facing left. Within-block lookback
+    /// clamps progress to zero, both samples sit on the fire, and stillness
+    /// wins (+1). The Walking path is rescued by the walk-end beat special
+    /// case; this is the case that is not. Once a golden bakes the new
+    /// facing in, the old behaviour is not recoverable by inspection.
+    #[test]
+    fn a_settled_activity_does_not_inherit_the_walk_that_delivered_him() {
+        // Perch is to the right of Fire: the walk that put him here was
+        // leftward. Under the old lookback he would still be facing left.
+        assert!(
+            place_position(Place::Perch) > place_position(Place::Fire),
+            "the premise needs the delivery walk to be leftward"
+        );
+        let face = face_for(Place::Perch, Place::Fire, Doing::Cooking, 0.0, 1.0);
+        assert_eq!(
+            face, 1.0,
+            "at progress 0 of Cooking he faced {face}, which means the lookback \
+             still reached into the walk that brought him — clamp failed"
         );
     }
 

@@ -151,24 +151,10 @@ fn shift(path: &BezPath, dx: f64, dy: f64) -> BezPath {
 fn ink_figure(ink: &mut impl Ink, pose: &f::Pose, at: &impl Fn(Point) -> Point, scale: f64) {
     let edge = (scale * 0.035).max(0.5);
     for path in f::figure_paths(pose) {
-        let placed = place(&path, at);
+        let placed = f::place(&path, at);
         ink.fill(&placed, f::IRON);
         ink.stroke(&placed, f::RIM.with_alpha(0.85), edge);
     }
-}
-
-fn place(path: &BezPath, at: &impl Fn(Point) -> Point) -> BezPath {
-    let mut out = BezPath::new();
-    for element in path.elements() {
-        match *element {
-            PathEl::MoveTo(p) => out.move_to(at(p)),
-            PathEl::LineTo(p) => out.line_to(at(p)),
-            PathEl::QuadTo(a, b) => out.quad_to(at(a), at(b)),
-            PathEl::CurveTo(a, b, c) => out.curve_to(at(a), at(b), at(c)),
-            PathEl::ClosePath => out.close_path(),
-        }
-    }
-    out
 }
 
 // ---------------------------------------------------------------------------
