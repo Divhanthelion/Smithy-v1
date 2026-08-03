@@ -69,6 +69,11 @@ pub enum AgentUiEvent {
     Answered(String),
     Stopped(String),
     Failed(String),
+    /// Stashed once per completion — never computed on the paint path.
+    ContextUsage {
+        prompt_tokens: i64,
+        snapshot: smithy_editor::ContextUsageSnapshot,
+    },
 }
 
 /// Messages that have arrived from a worker thread and not yet been handled.
@@ -867,6 +872,17 @@ pub fn setup_agent_effect(agent: AgentState) {
                     panel.streaming_reasoning.set(String::new());
                     panel.push(smithy_editor::AgentEntry::Error(error));
                     panel.busy.set(false);
+                }
+                AgentUiEvent::ContextUsage {
+                    prompt_tokens,
+                    snapshot,
+                } => {
+                    // Stash once per completion — budget_bar only reads this.
+                    // Computing ledger (or walking tools/history) inside
+                    // Label::derived would re-run at paint rate; AGENTS.md
+                    // names the prior instances.
+                    panel.context_tokens.set(prompt_tokens);
+                    panel.context_usage.set(Some(snapshot));
                 }
             }
         }

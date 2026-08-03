@@ -49,17 +49,33 @@ pub type EventSink = dyn Fn(TurnEvent) + Send + Sync;
 
 pub struct SessionConfig {
     pub system_prompt: String,
+    /// Chars of the base system prompt before any project block was joined.
+    /// The ledger uses this so attribution never string-searches the prompt.
+    pub system_base_chars: usize,
+    /// Chars of the project context block embedded in the system prompt.
+    pub project_context_chars: usize,
     pub sampling: Sampling,
     pub limits: Limits,
 }
 
 impl SessionConfig {
     pub fn new(system_prompt: impl Into<String>) -> Self {
+        let system_prompt = system_prompt.into();
+        let n = system_prompt.len();
         Self {
-            system_prompt: system_prompt.into(),
+            system_prompt,
+            system_base_chars: n,
+            project_context_chars: 0,
             sampling: Sampling::default(),
             limits: Limits::default(),
         }
+    }
+
+    /// Record how the system prompt was assembled, for the usage ledger.
+    pub fn with_segments(mut self, system_base_chars: usize, project_context_chars: usize) -> Self {
+        self.system_base_chars = system_base_chars;
+        self.project_context_chars = project_context_chars;
+        self
     }
 }
 
@@ -85,6 +101,14 @@ pub struct Session {
     /// local tokenizer would be a second opinion that is wrong in a way nobody
     /// notices until the invoice.
     usage: Usage,
+    /// Prompt size of the last completion, carried across turns so
+    /// [`Budget`] can refuse a doomed first call before the network.
+    last_prompt_tokens: i64,
+    /// Cached portion of [`Self::last_prompt_tokens`], for the ledger's
+    /// cached-vs-cold row.
+    last_cached_tokens: i64,
+    system_base_chars: usize,
+    project_context_chars: usize,
     /// Every reasoning block the model has produced, in order.
     ///
     /// **Deliberately not in [`History`].** The endpoint does not replay
@@ -107,20 +131,159 @@ pub struct Session {
 pub struct Usage {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
+    /// Prompt tokens served from the prefix cache across every request.
+    ///
+    /// The number that says whether the architecture is working: six design
+    /// decisions in this crate pay rent to a byte-stable prefix, and without
+    /// this counter a collapsed hit rate is invisible.
+    pub cached_tokens: i64,
+    /// Reasoning tokens billed across the session, when the endpoint reports
+    /// them. Real spend that never enters the prefix.
+    pub reasoning_tokens: i64,
     /// How many completions were requested — including retries, which are also
     /// billed.
     pub requests: usize,
 }
 
 impl Usage {
-    /// Cost in dollars, given prices per million tokens.
-    pub fn cost(&self, prompt_per_mtok: f64, completion_per_mtok: f64) -> f64 {
-        (self.prompt_tokens as f64 / 1e6) * prompt_per_mtok
+    /// Cost in dollars. Cached prompt tokens are priced at `cached_per_mtok`;
+    /// the cold remainder at `prompt_per_mtok`.
+    ///
+    /// DeepSeek's list ratio is roughly a tenth; OpenAI's is roughly half.
+    /// Callers that know the provider pass the real rate — see
+    /// [`crate::providers::deepseek::pricing_for`] and the meter.
+    pub fn cost(&self, prompt_per_mtok: f64, completion_per_mtok: f64, cached_per_mtok: f64) -> f64 {
+        let cached = self.cached_tokens.max(0) as f64;
+        let cold = (self.prompt_tokens as f64 - cached).max(0.0);
+        (cold / 1e6) * prompt_per_mtok
+            + (cached / 1e6) * cached_per_mtok
             + (self.completion_tokens as f64 / 1e6) * completion_per_mtok
+    }
+
+    /// Fraction of billed prompt tokens that hit the prefix cache, when any
+    /// prompt tokens have been recorded.
+    pub fn cache_hit_rate(&self) -> Option<f64> {
+        if self.prompt_tokens <= 0 {
+            None
+        } else {
+            Some(self.cached_tokens as f64 / self.prompt_tokens as f64)
+        }
     }
 
     pub fn total_tokens(&self) -> i64 {
         self.prompt_tokens + self.completion_tokens
+    }
+}
+
+/// One row of the context-usage panel.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContextSegment {
+    pub name: &'static str,
+    /// Local char count.
+    pub chars: usize,
+    /// Tokens after calibrating so the sum equals the billed prompt.
+    pub tokens: i64,
+    /// Fixed for the life of the session (system, project, tools).
+    pub frozen: bool,
+}
+
+/// Per-segment attribution for one prompt, plus cache / reasoning sidecars.
+///
+/// Chars are measured locally; tokens are scaled so
+/// `segments.iter().map(|s| s.tokens).sum() == prompt_tokens`. That is what
+/// keeps the panel from contradicting the meter without introducing a
+/// tokenizer (`session.rs` forbids one).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContextLedger {
+    pub segments: Vec<ContextSegment>,
+    pub prompt_tokens: i64,
+    pub cached_tokens: i64,
+    pub cold_tokens: i64,
+    /// Reasoning generated this session, not sent in the prefix.
+    pub reasoning_chars: usize,
+    pub reasoning_tokens: i64,
+    /// `chars / 4` estimate before calibration — for the tooltip.
+    pub estimate_tokens: i64,
+}
+
+impl ContextLedger {
+    fn from_session(session: &Session) -> Self {
+        let system_chars = session.system_base_chars;
+        let project_chars = session.project_context_chars;
+        // The wire form already sits on the session as a Value; counting its
+        // JSON length is the schema the model sees.
+        let tools_chars = session.tools.to_string().len();
+
+        // Conversation = everything after the system message. Attachments
+        // already live inside user messages; the panel adds a pending-chip
+        // row from its own state.
+        let conversation_chars: usize = session
+            .history
+            .messages()
+            .iter()
+            .skip(1)
+            .map(|m| {
+                m.content.len()
+                    + m.tool_calls
+                        .iter()
+                        .map(|c| c.name.len() + c.arguments.len())
+                        .sum::<usize>()
+            })
+            .sum();
+
+        let reasoning_chars: usize = session.reasoning.iter().map(|e| e.text.len()).sum();
+
+        let rows: [(&'static str, usize, bool); 4] = [
+            ("System prompt", system_chars, true),
+            ("Project context", project_chars, true),
+            ("Tool schemas", tools_chars, true),
+            ("Conversation", conversation_chars, false),
+        ];
+
+        let total_chars: usize = rows.iter().map(|(_, c, _)| *c).sum();
+        let estimate_tokens = (total_chars as i64) / 4;
+        let prompt_tokens = session.last_prompt_tokens;
+        let cached_tokens = session.last_cached_tokens.min(prompt_tokens).max(0);
+        let cold_tokens = (prompt_tokens - cached_tokens).max(0);
+
+        // Scale so the breakdown sums to the billed number. When there is no
+        // completion yet, fall back to the chars/4 estimate.
+        let calibration = if estimate_tokens > 0 && prompt_tokens > 0 {
+            prompt_tokens as f64 / estimate_tokens as f64
+        } else {
+            1.0
+        };
+
+        let mut segments: Vec<ContextSegment> = rows
+            .iter()
+            .map(|(name, chars, frozen)| {
+                let est = (*chars as i64) / 4;
+                ContextSegment {
+                    name,
+                    chars: *chars,
+                    tokens: ((est as f64) * calibration).round() as i64,
+                    frozen: *frozen,
+                }
+            })
+            .collect();
+
+        // Fix rounding so the rows sum exactly to prompt_tokens when known.
+        if prompt_tokens > 0 {
+            let sum: i64 = segments.iter().map(|s| s.tokens).sum();
+            if let Some(last) = segments.last_mut() {
+                last.tokens += prompt_tokens - sum;
+            }
+        }
+
+        ContextLedger {
+            segments,
+            prompt_tokens,
+            cached_tokens,
+            cold_tokens,
+            reasoning_chars,
+            reasoning_tokens: session.usage.reasoning_tokens,
+            estimate_tokens,
+        }
     }
 }
 
@@ -173,15 +336,21 @@ impl Session {
             sampling: config.sampling,
             limits: config.limits,
             cancel: Arc::new(Mutex::new(CancellationToken::new())),
-            reasoning: Vec::new(),
             usage: Usage::default(),
+            last_prompt_tokens: 0,
+            last_cached_tokens: 0,
+            system_base_chars: config.system_base_chars,
+            project_context_chars: config.project_context_chars,
+            reasoning: Vec::new(),
         }
     }
 
     /// Rebuild a session around a restored history.
     ///
     /// The history goes back untouched — see [`crate::persist`] for why that
-    /// matters.
+    /// matters. Segment lengths for the ledger are recovered from message 0
+    /// when possible; a resumed session still attributes conversation growth
+    /// correctly even if the project/base split is unknown.
     pub fn resume(
         provider: Arc<dyn Provider>,
         registry: Arc<Registry>,
@@ -191,6 +360,11 @@ impl Session {
         limits: Limits,
     ) -> Session {
         let tools = registry.openai_schemas();
+        let system_chars = history
+            .messages()
+            .first()
+            .map(|m| m.content.len())
+            .unwrap_or(0);
         Session {
             provider,
             registry,
@@ -200,8 +374,12 @@ impl Session {
             sampling,
             limits,
             cancel: Arc::new(Mutex::new(CancellationToken::new())),
-            reasoning: Vec::new(),
             usage: Usage::default(),
+            last_prompt_tokens: 0,
+            last_cached_tokens: 0,
+            system_base_chars: system_chars,
+            project_context_chars: 0,
+            reasoning: Vec::new(),
         }
     }
 
@@ -255,6 +433,24 @@ impl Session {
         self.usage
     }
 
+    /// Prompt tokens on the most recent completion (0 before the first).
+    pub fn last_prompt_tokens(&self) -> i64 {
+        self.last_prompt_tokens
+    }
+
+    /// Cached prompt tokens on the most recent completion.
+    pub fn last_cached_tokens(&self) -> i64 {
+        self.last_cached_tokens
+    }
+
+    /// Per-segment attribution for the context-usage panel.
+    ///
+    /// Cheap: chars only, no tokenizer. Call once per completion and stash the
+    /// result in a UI signal — never from a paint/`Label::derived` path.
+    pub fn ledger(&self) -> ContextLedger {
+        ContextLedger::from_session(self)
+    }
+
     /// Every reasoning block the model has produced, for persistence.
     pub fn reasoning(&self) -> &[crate::persist::ReasoningEntry] {
         &self.reasoning
@@ -297,7 +493,10 @@ impl Session {
         let cancel = self.current_cancel();
         self.history.push(Message::user(user_input));
 
-        let mut budget = Budget::new(self.limits.clone());
+        // Seed from the previous turn's last prompt. Without this, a session
+        // already over the hard ceiling pays for one full prefill per turn
+        // before tick() can stop it.
+        let mut budget = Budget::seeded(self.limits.clone(), self.last_prompt_tokens);
         let mut consecutive_failures = 0usize;
 
         loop {
@@ -345,6 +544,10 @@ impl Session {
             self.usage.requests += 1;
             self.usage.prompt_tokens += completion.prompt_tokens;
             self.usage.completion_tokens += completion.completion_tokens;
+            self.usage.cached_tokens += completion.cached_tokens;
+            self.usage.reasoning_tokens += completion.reasoning_tokens;
+            self.last_prompt_tokens = completion.prompt_tokens;
+            self.last_cached_tokens = completion.cached_tokens;
 
             // Capture the reasoning *here*, not in the UI. The panel clears it
             // between turns and never had the whole of it anyway; this is the
@@ -585,7 +788,7 @@ pub fn default_system_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::test_support::{answer, tool_call, ScriptedProvider};
+    use crate::provider::test_support::{answer, answer_at, tool_call, ScriptedProvider};
     use crate::provider::Completion;
     use smithy_tools::{ToolCall, Workspace};
 
@@ -824,6 +1027,62 @@ mod tests {
             Outcome::Stopped(r) => assert!(r.contains("context ceiling")),
             other => panic!("expected Stopped, got {other:?}"),
         }
+    }
+
+    /// A turn that starts already over the hard ceiling must refuse before
+    /// the network call. The old Budget::new(0) path paid for one full prefill
+    /// every turn forever.
+    #[tokio::test]
+    async fn a_turn_starting_over_the_ceiling_never_reaches_the_provider() {
+        let (_t, mut s, provider) = harness(vec![
+            answer_at("first answer", 200_000),
+            answer("should never be reached"),
+        ]);
+        s.limits.context_hard = 110_000;
+
+        let first = s.run_turn("warm up", None).await.unwrap();
+        assert!(matches!(first, Outcome::Answer(_)));
+        assert_eq!(provider.call_count(), 1);
+        assert_eq!(s.last_prompt_tokens(), 200_000);
+
+        let second = s.run_turn("doomed", None).await.unwrap();
+        match second {
+            Outcome::Stopped(r) => {
+                assert!(
+                    r.contains("context ceiling") && r.contains("200000"),
+                    "refusal must say why: {r}"
+                );
+            }
+            other => panic!("expected Stopped before the provider, got {other:?}"),
+        }
+        assert_eq!(
+            provider.call_count(),
+            1,
+            "the doomed turn must not call the provider"
+        );
+    }
+
+    /// The breakdown must sum to the billed prompt_tokens so the panel can
+    /// never contradict the meter. Scale by chars; do not invent a tokenizer.
+    #[tokio::test]
+    async fn the_ledger_sums_exactly_to_the_billed_prompt() {
+        let (_t, mut s, _) = harness(vec![answer_at("ok", 4_000)]);
+        s.run_turn("hello", None).await.unwrap();
+        let ledger = s.ledger();
+        let sum: i64 = ledger.segments.iter().map(|seg| seg.tokens).sum();
+        assert_eq!(sum, ledger.prompt_tokens);
+        assert_eq!(ledger.prompt_tokens, 4_000);
+        assert!(
+            ledger.segments.iter().any(|seg| seg.frozen),
+            "system/project/tools must be marked frozen"
+        );
+        assert!(
+            ledger
+                .segments
+                .iter()
+                .any(|seg| seg.name == "Conversation" && !seg.frozen),
+            "conversation must be live"
+        );
     }
 
     #[tokio::test]

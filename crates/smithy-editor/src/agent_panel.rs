@@ -72,6 +72,46 @@ impl StepStatus {
     }
 }
 
+/// One row of the context-usage breakdown, already attributed.
+#[derive(Debug, Clone)]
+pub struct ContextUsageRow {
+    pub name: String,
+    pub tokens: i64,
+    pub frozen: bool,
+}
+
+/// Snapshot of context attribution, computed once per completion on the
+/// agent side and only *read* while painting.
+#[derive(Debug, Clone, Default)]
+pub struct ContextUsageSnapshot {
+    pub rows: Vec<ContextUsageRow>,
+    pub prompt_tokens: i64,
+    pub cached_tokens: i64,
+    pub cold_tokens: i64,
+    pub reasoning_tokens: i64,
+    pub hit_rate: Option<f64>,
+}
+
+impl ContextUsageSnapshot {
+    pub fn from_ledger(
+        rows: &[ContextUsageRow],
+        prompt_tokens: i64,
+        cached_tokens: i64,
+        cold_tokens: i64,
+        reasoning_tokens: i64,
+        hit_rate: Option<f64>,
+    ) -> Self {
+        Self {
+            rows: rows.to_vec(),
+            prompt_tokens,
+            cached_tokens,
+            cold_tokens,
+            reasoning_tokens,
+            hit_rate,
+        }
+    }
+}
+
 /// Everything the panel renders from.
 #[derive(Clone, Copy)]
 pub struct AgentPanelState {
@@ -93,6 +133,10 @@ pub struct AgentPanelState {
     /// What the model was told about the project, e.g.
     /// "layout, dependencies, modules, public API · ~6000 tokens".
     pub context_label: RwSignal<String>,
+    /// Attribution for the last prompt — stashed on completion, never rebuilt
+    /// on the paint path (serializing tools inside `Label::derived` would be
+    /// the CallGraph::staleness landmine at 60 Hz).
+    pub context_usage: RwSignal<Option<ContextUsageSnapshot>>,
     /// Whether the endpoint preflighted successfully.
     pub connected: RwSignal<bool>,
     /// Which step indices are expanded.
@@ -133,6 +177,7 @@ impl AgentPanelState {
             context_limit: RwSignal::new(110_000),
             model_label: RwSignal::new("connecting…".to_string()),
             context_label: RwSignal::new(String::new()),
+            context_usage: RwSignal::new(None),
             connected: RwSignal::new(false),
             expanded: RwSignal::new(Vec::new()),
             attachments: RwSignal::new(Vec::new()),
@@ -209,6 +254,7 @@ impl AgentPanelState {
         self.streaming_answer.set(String::new());
         self.streaming_reasoning.set(String::new());
         self.context_tokens.set(0);
+        self.context_usage.set(None);
     }
 }
 
@@ -1115,8 +1161,11 @@ fn drop_overlay(state: AgentPanelState) -> impl IntoView {
 }
 
 
-/// A thin context-usage bar. Prefill cost grows superlinearly with context, so
-/// this is the readout that explains a slow turn.
+/// Context usage: bar + per-segment attribution.
+///
+/// Prefill cost grows superlinearly with context, so this is the readout that
+/// explains a slow turn. Rows come from a stashed snapshot — never rebuilt
+/// here from Session state.
 fn budget_bar(state: AgentPanelState) -> impl IntoView {
     let fraction = move || context_fraction(state.context_tokens.get(), state.context_limit.get());
 
@@ -1136,20 +1185,102 @@ fn budget_bar(state: AgentPanelState) -> impl IntoView {
             })
             .style(|s| s.color(catppuccin::SURFACE2).font_size(10.0)),
             Container::new(Empty::new()).style(|s| s.flex_grow(1.0)),
+            Label::derived(move || {
+                state
+                    .context_usage
+                    .get()
+                    .and_then(|u| u.hit_rate)
+                    .map(|r| format!("cache {:.0}%", r * 100.0))
+                    .unwrap_or_default()
+            })
+            .style(|s| s.color(catppuccin::SURFACE2).font_size(10.0)),
         ))
         .style(|s| s.width_full().padding_horiz(12.0).padding_bottom(3.0)),
         // The bar itself: a filled track whose width tracks the fraction.
-        Container::new(Empty::new().style(move |s| {
-            s.height_full()
-                .width_pct(fraction() * 100.0)
-                .background(budget_color(fraction()))
-                .border_radius(1.0)
-        }))
+        // Cached portion is drawn first (cooler), cold on top of the remainder.
+        Container::new(
+            Stack::horizontal((
+                Empty::new().style(move |s| {
+                    let usage = state.context_usage.get();
+                    let cached_pct = usage
+                        .as_ref()
+                        .filter(|u| u.prompt_tokens > 0)
+                        .map(|u| {
+                            (u.cached_tokens as f64 / u.prompt_tokens as f64) * fraction() * 100.0
+                        })
+                        .unwrap_or(0.0);
+                    s.height_full()
+                        .width_pct(cached_pct)
+                        .background(catppuccin::TEAL)
+                        .border_radius(1.0)
+                }),
+                Empty::new().style(move |s| {
+                    let usage = state.context_usage.get();
+                    let cold_pct = usage
+                        .as_ref()
+                        .filter(|u| u.prompt_tokens > 0)
+                        .map(|u| {
+                            (u.cold_tokens as f64 / u.prompt_tokens as f64) * fraction() * 100.0
+                        })
+                        .unwrap_or_else(|| fraction() * 100.0);
+                    s.height_full()
+                        .width_pct(cold_pct)
+                        .background(budget_color(fraction()))
+                        .border_radius(1.0)
+                }),
+            ))
+            .style(|s| s.width_full().height_full()),
+        )
         .style(|s| {
             s.width_full()
                 .height(2.0)
                 .margin_horiz(12.0)
                 .background(catppuccin::SURFACE0)
+        }),
+        // Segment rows. Frozen (system / project / tools) vs live (conversation).
+        // Pending attachments come from the panel signal — they are not in the
+        // session ledger until the next send (audit §4.3).
+        Label::derived(move || {
+            let Some(usage) = state.context_usage.get() else {
+                return String::new();
+            };
+            let mut lines = Vec::new();
+            for row in &usage.rows {
+                if row.tokens <= 0 && row.name != "Conversation" {
+                    continue;
+                }
+                let tag = if row.frozen { "fixed" } else { "live" };
+                lines.push(format!(
+                    "{} {} · {}",
+                    format_tokens(row.tokens),
+                    row.name.to_ascii_lowercase(),
+                    tag
+                ));
+            }
+            let pending = crate::attachment::total_tokens(&state.attachments.get()) as i64;
+            if pending > 0 {
+                lines.push(format!(
+                    "{} attachments · pending",
+                    format_tokens(pending)
+                ));
+            }
+            if usage.reasoning_tokens > 0 {
+                lines.push(format!(
+                    "{} reasoning · generated, not sent",
+                    format_tokens(usage.reasoning_tokens)
+                ));
+            }
+            lines.join("\n")
+        })
+        .style(move |s| {
+            s.color(catppuccin::SURFACE2)
+                .font_size(10.0)
+                .padding_horiz(12.0)
+                .padding_top(4.0)
+                .line_height(1.35)
+                .apply_if(state.context_usage.get().is_none(), |s| {
+                    s.display(floem::taffy::Display::None)
+                })
         }),
     ))
     .style(move |s| {
@@ -1546,10 +1677,15 @@ mod tests {
         state.push(Entry::User("hi".into()));
         state.streaming_answer.set("partial".into());
         state.context_tokens.set(5000);
+        state.context_usage.set(Some(ContextUsageSnapshot {
+            prompt_tokens: 5000,
+            ..Default::default()
+        }));
         state.clear();
         assert!(state.entries.get_untracked().is_empty());
         assert!(state.streaming_answer.get_untracked().is_empty());
         assert_eq!(state.context_tokens.get_untracked(), 0);
+        assert!(state.context_usage.get_untracked().is_none());
     }
 
     /// Chrome must never break mid-word.

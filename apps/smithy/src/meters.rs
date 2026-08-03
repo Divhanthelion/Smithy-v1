@@ -294,8 +294,9 @@ pub fn spend_now(
         model_label.split(' ').next().unwrap_or(&model).to_string()
     };
 
-    let session_cost = price_of(config.provider, &model)
-        .map(|(prompt, completion)| usage.cost(prompt, completion));
+    let session_cost = price_of(config.provider, &model).map(|(prompt, completion, cached)| {
+        usage.cost(prompt, completion, cached)
+    });
 
     Spend {
         usage,
@@ -313,10 +314,14 @@ pub fn spend_now(
 fn price_of(
     provider: smithy_agent::ProviderChoice,
     model: &str,
-) -> Option<(f64, f64)> {
+) -> Option<(f64, f64, f64)> {
     match provider {
         smithy_agent::ProviderChoice::DeepSeek => {
-            smithy_agent::providers::deepseek::pricing_for(model)
+            let (prompt, completion) = smithy_agent::providers::deepseek::pricing_for(model)?;
+            // DeepSeek's published cache-hit rate is a tenth of the cold
+            // prompt rate. Pricing cache hits at the cold rate was why the
+            // meter made the architecture's best feature look expensive.
+            Some((prompt, completion, prompt * 0.1))
         }
         // A local server bills nothing, so a cost of zero would be true but
         // uninformative; tokens are the useful figure.
@@ -464,6 +469,8 @@ mod tests {
             usage: Usage {
                 prompt_tokens: 500_000,
                 completion_tokens: 100_000,
+                cached_tokens: 0,
+                reasoning_tokens: 0,
                 requests: 12,
             },
             session_cost: Some(0.098),
@@ -491,6 +498,8 @@ mod tests {
             usage: Usage {
                 prompt_tokens: 45_000,
                 completion_tokens: 5_000,
+                cached_tokens: 0,
+                reasoning_tokens: 0,
                 requests: 3,
             },
             session_cost: None,
@@ -560,9 +569,25 @@ mod tests {
         let usage = Usage {
             prompt_tokens: 1_000_000,
             completion_tokens: 1_000_000,
+            cached_tokens: 0,
+            reasoning_tokens: 0,
             requests: 1,
         };
-        // DeepSeek v4-flash list prices.
-        assert!((usage.cost(0.14, 0.28) - 0.42).abs() < 1e-9);
+        // DeepSeek v4-flash list prices; no cache hits.
+        assert!((usage.cost(0.14, 0.28, 0.014) - 0.42).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cached_tokens_are_priced_below_cold_prompt_tokens() {
+        let usage = Usage {
+            prompt_tokens: 1_000_000,
+            completion_tokens: 0,
+            cached_tokens: 900_000,
+            reasoning_tokens: 0,
+            requests: 1,
+        };
+        // 100k cold @ 0.14 + 900k cached @ 0.014 = 0.014 + 0.0126 = 0.0266
+        assert!((usage.cost(0.14, 0.28, 0.014) - 0.0266).abs() < 1e-9);
+        assert!((usage.cache_hit_rate().unwrap() - 0.9).abs() < 1e-9);
     }
 }

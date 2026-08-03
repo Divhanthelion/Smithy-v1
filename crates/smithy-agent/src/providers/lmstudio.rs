@@ -565,6 +565,48 @@ mod tests {
         assert_eq!(out.completion_tokens, 56);
     }
 
+    /// OpenAI-compatible / OpenRouter shape — the nested details object.
+    /// Confirmed against live Chat Completions frames that include
+    /// `prompt_tokens_details.cached_tokens`.
+    #[test]
+    fn openai_cached_tokens_are_read_from_prompt_tokens_details() {
+        let (out, _) = drain(&[
+            r#"data: {"choices":[],"usage":{"prompt_tokens":2455,"completion_tokens":70,"prompt_tokens_details":{"cached_tokens":2304},"completion_tokens_details":{"reasoning_tokens":0}}}"#,
+        ]);
+        assert_eq!(out.prompt_tokens, 2455);
+        assert_eq!(out.cached_tokens, 2304);
+        assert_eq!(out.reasoning_tokens, 0);
+    }
+
+    /// DeepSeek's top-level hit count. Confirmed against their documented
+    /// usage block (`prompt_cache_hit_tokens` + `prompt_cache_miss_tokens`).
+    #[test]
+    fn deepseek_cached_tokens_are_read_from_prompt_cache_hit_tokens() {
+        let (out, _) = drain(&[
+            r#"data: {"choices":[],"usage":{"prompt_tokens":18234,"completion_tokens":412,"prompt_cache_hit_tokens":16000,"prompt_cache_miss_tokens":2234}}"#,
+        ]);
+        assert_eq!(out.cached_tokens, 16000);
+    }
+
+    /// Anthropic-shaped cache-read name, used by some OpenRouter routes.
+    #[test]
+    fn anthropic_shaped_cache_read_input_tokens_are_accepted() {
+        let (out, _) = drain(&[
+            r#"data: {"choices":[],"usage":{"prompt_tokens":5000,"completion_tokens":10,"cache_read_input_tokens":4096}}"#,
+        ]);
+        assert_eq!(out.cached_tokens, 4096);
+    }
+
+    /// A reported zero is a miss, not "field missing" — do not fall through
+    /// to a later alias and invent a hit.
+    #[test]
+    fn a_reported_zero_cached_count_wins_over_later_aliases() {
+        let (out, _) = drain(&[
+            r#"data: {"choices":[],"usage":{"prompt_tokens":100,"prompt_tokens_details":{"cached_tokens":0},"prompt_cache_hit_tokens":99}}"#,
+        ]);
+        assert_eq!(out.cached_tokens, 0);
+    }
+
     #[test]
     fn reasoning_deltas_accumulate_separately_from_content() {
         let (out, _) = drain(&[

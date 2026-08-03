@@ -397,14 +397,22 @@ pub async fn build_session(
     }));
     registry.add_hook(Box::new(ShellApprovalHook { tx: shell_approval }));
 
+    let project_chars = context
+        .as_ref()
+        .map(|c| c.rendered.len())
+        .unwrap_or(0);
     let prompt = default_system_prompt(
         workspace.root(),
         &registry.names(),
         context.as_ref().map(|c| c.rendered.as_str()),
     );
+    // Joiner boilerplate between base and project counts as system, not
+    // project — so base = total − project chars rather than a second render.
+    let system_base_chars = prompt.len().saturating_sub(project_chars);
     let ctx = Arc::new(ToolCtx::new(workspace));
 
-    let mut config = SessionConfig::new(prompt);
+    let mut config =
+        SessionConfig::new(prompt).with_segments(system_base_chars, project_chars);
     config.limits = limits.clone();
 
     // What the model was told about the project. A resumed session carries the
@@ -486,6 +494,29 @@ pub async fn run_turn(session: &mut Session, task: String, events: Sender<AgentU
     };
 
     let result = session.run_turn(&task, Some(&sink)).await;
+    // Compute once, after the turn. The panel stashes this in a signal and
+    // only reads it while painting — serializing tools inside Label::derived
+    // would be the CallGraph::staleness landmine at 60 Hz.
+    let ledger = session.ledger();
+    let snapshot = smithy_editor::ContextUsageSnapshot::from_ledger(
+        &ledger.segments
+            .iter()
+            .map(|s| smithy_editor::ContextUsageRow {
+                name: s.name.to_string(),
+                tokens: s.tokens,
+                frozen: s.frozen,
+            })
+            .collect::<Vec<_>>(),
+        ledger.prompt_tokens,
+        ledger.cached_tokens,
+        ledger.cold_tokens,
+        ledger.reasoning_tokens,
+        session.usage().cache_hit_rate(),
+    );
+    let _ = events.send(AgentUiEvent::ContextUsage {
+        prompt_tokens: session.last_prompt_tokens(),
+        snapshot,
+    });
     let final_event = match result {
         Ok(Outcome::Answer(answer)) => AgentUiEvent::Answered(answer),
         Ok(Outcome::Stopped(reason)) => AgentUiEvent::Stopped(reason),

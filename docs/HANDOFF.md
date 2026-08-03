@@ -12,14 +12,12 @@ Session state: what landed, what is open, what to pick up. Stable orientation
 
 ## 1. One paragraph
 
-Three tracks moved. **Repo infrastructure** now exists: CI, an agent brief, and
-a `.gitignore` that no longer eats golden images. **The fisherman** got a real
-verification harness — the preview used to render a *copy* of the drawing code
-and now renders the drawing code itself, with automated checks, contact sheets
-and a blessed golden. **The context audit** was written and nothing in it has
-been implemented; that is the largest untouched item in the tree.
-
-The harness found two production bugs on its first runs. Neither is fixed.
+Three tracks moved. **Repo infrastructure** now exists: local pre-push checks
+(no GitHub Actions — account is locked), an agent brief, and a `.gitignore`
+that no longer eats golden images. **The fisherman** got a real verification
+harness (PR #2 merged) and a tuning branch that fixed moonwalk and midnight
+lamp. **Context measure** (`context/measure`) implements the audit's top three:
+cached tokens, ceiling across turns, and the Context Usage panel.
 
 ---
 
@@ -156,30 +154,24 @@ In order. Everything here came out of the harness rather than out of guessing.
 
 ---
 
-## 5. Untouched: the context audit
+## 5. Context audit — `context/measure` (this branch)
 
-`docs/CONTEXT_AUDIT.md` was written this session and **none of it is
-implemented** (except where the audit itself was wrong — see below). Measured:
-~8k tokens before the user types. Ranked by value:
+`docs/CONTEXT_AUDIT.md`. On this branch:
 
-1. **Cached tokens are dropped.** `providers/sse.rs` reads `prompt_tokens`,
-   `completion_tokens`, `reasoning_tokens` and nothing else. Six design
-   decisions pay rent to prefix caching and nothing measures whether it works;
-   the cost meter overstates cost as a result.
-2. **The context ceiling lets the expensive call through.** `Budget::new` is
-   inside `run_turn_inner`, so `last_prompt_tokens` resets every turn and the
-   ceiling can never stop a turn's *first* request. A long session pays for one
-   full prefill per turn and then stops.
-3. **The Context Usage panel** (per-segment attribution, Cursor-style) —
-   designed in §4 of the audit, not built. `Session` already holds everything;
-   attribute locally in chars and scale by the endpoint's reported total so the
-   breakdown always sums to the billed number.
+1. **Cached tokens** — parsed tolerantly in `sse.rs`, carried on `Completion` /
+   `Usage`, priced separately in `cost()`, hit rate exposed.
+2. **Ceiling across turns** — `last_prompt_tokens` on `Session`, `Budget::seeded`,
+   doomed first call refuses before the network.
+3. **`Session::ledger()` + Context Usage panel** — chars scaled to billed
+   `prompt_tokens`; frozen vs live; cached vs cold; reasoning as generated-not-
+   sent. Snapshot stashed once per completion (never on the paint path).
+
+Still open from the audit:
+
 4. Per-turn tool-result budget; rank the API layer by call-graph degree.
 
-~~Former item 3 (`context_warn` is a flat 32k) withdrawn.~~
-`ModelInfo::suggested_limits()` already scales warn to 25% of the window and
-`agent.rs` applies it — the audit misread the Defaults table. Struck in
-`CONTEXT_AUDIT.md` §2E so it is not re-derived.
+~~Former flat-`context_warn` claim withdrawn.~~ `ModelInfo::suggested_limits()`
+already scales warn to 25% of the window — struck in `CONTEXT_AUDIT.md` §2E.
 
 ---
 

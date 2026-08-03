@@ -301,9 +301,9 @@ Ranked by value per unit of work.
 
 | # | Item | Why first |
 |---|---|---|
-| 1 | §2F cached tokens | Turns the central bet into a measurement. Fixes the cost meter. Small. |
-| 2 | §2A carry `last_prompt_tokens` across turns | Stops billing for calls that are guaranteed to be discarded. ~20 lines. |
-| 3 | §4 `Session::ledger()` + panel | Now everything above has somewhere to be seen. |
+| 1 | §2F cached tokens | **Done on `context/measure`.** Turns the central bet into a measurement. |
+| 2 | §2A carry `last_prompt_tokens` across turns | **Done.** Stops billing for calls that are guaranteed to be discarded. |
+| 3 | §4 `Session::ledger()` + panel | **Done.** Attribution scaled to the billed total; cached vs cold; frozen vs live. |
 | 4 | §2D per-turn tool-result budget | Closes the last uncapped inflow. |
 | 5 | §2C rank the API layer by call-graph degree | Best tokens-per-token improvement available; needs the graph, which exists. |
 | 6 | §2B re-derive the block ceiling, then **measure** | Do it after the panel, so it can show the before/after. |
