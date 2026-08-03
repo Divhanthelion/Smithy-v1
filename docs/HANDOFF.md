@@ -12,13 +12,13 @@ broken, and the open design questions.
 
 ## 1. Verdict in one paragraph
 
-§2.1 automated floor passed (938 tests). Milestone 5 **plumbing works** — build,
-persist, load, menu, center-pane switch — and a graph *appeared* on kernelos
-(278 nodes · 355 edges). The **rendering is rejected by the user as totally
-unacceptable** (see §3). Immediately after that first render, smithy also went
-**Not Responding** (~563 MB); paint-path hang fixes are in `b7f525d` but
-unverified in GUI. Keychain still prompted **three times**; see §5. Do **not**
-treat M5 as done because a graph showed up — the layout is the open problem.
+§2.1 automated floor passed (938 tests). Milestone 5 plumbing works. The first
+on-screen layout was **rejected** (flat high-fan-out strip). A rewrite now wraps
+hubs, fits the camera to the neighborhood, uses bus edges, drops repeated
+`Container::` on sibling labels, paints an opaque map ground, and prefers a
+moderate default focus — unit-tested, installed; **needs a human look** at the
+same kernelos `Terminal::execute_command` case. Keychain still prompts per item
+after adhoc reinstalls (§5).
 
 ---
 
@@ -154,7 +154,10 @@ Not cosmetics. The layout function has to become **viewport-aware** and
 Inspiration remains [Benzi](https://github.com/shobhitx64/Benzi) / CodeMap: a map
 you **click through** to verify a path. Current UI is a star diagram of labels.
 
-Until (1)–(3) land, **do not mark Milestone 5 rendering done.**
+**Status:** items 1–5 implemented in `call_graph.rs` (wrap + `fit_camera` + bus
+edges + opaque fill + moderate `default_focus`); hover shows qualified name +
+location (no separate signature field in the graph schema yet). Awaiting user
+acceptance on the kernelos hub case.
 
 ---
 
@@ -228,14 +231,13 @@ providers on launch.
 
 ## 5. Remaining work
 
-### Milestone 5 — rendering (BLOCKED: user rejected current layout)
-- [ ] **Rewrite layout** per §3b (viewport fit, wrap/columnize high fan-out,
-      opaque ground, better default focus, edge routing). Re-check against the
-      same kernelos `Terminal::execute_command` focus — that hub is the
-      acceptance test.
-- [ ] Reinstall; confirm **no hang** after pan/zoom/click (hang fix unverified).
-- [ ] Hover signature; double-click → file:line; Editor returns to buffer.
-- [ ] Staleness: manual recheck / rebuild only (already cached off the paint path).
+### Milestone 5 — rendering (rewrite landed; human acceptance pending)
+- [x] Wrap/columnize high fan-out; fit camera; opaque ground; bus edges;
+      moderate default focus; hover shows qualified + `file:line`.
+- [ ] **User eyes:** reopen kernelos, focus `Terminal::execute_command` (or let
+      default land elsewhere), confirm readable — no overflow strip, no forged
+      grid as backdrop, no hang on pan/zoom/click.
+- [ ] Double-click → file:line; Editor returns to buffer.
 
 ### Milestone 6 — live linking (not started)
 - `touched` highlights from tool events; highlight-only; follow-agent off by

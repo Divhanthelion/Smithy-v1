@@ -193,16 +193,33 @@ fn default_focus(graph: &CallGraph) -> Option<u32> {
     if graph.nodes.is_empty() {
         return None;
     }
+    // Prefer a readable neighborhood over the global hub. Degree ~6 is the
+    // sweet spot; `execute_command`-style dispatchers score low on purpose.
+    let degree = |i: u32| graph.callers(i).len() + graph.callees(i).len();
     let mut best = 0u32;
-    let mut best_score = 0usize;
+    let mut best_score = i32::MIN;
     for i in 0..graph.nodes.len() as u32 {
-        let score = graph.callers(i).len() + graph.callees(i).len();
+        let d = degree(i) as i32;
+        if d == 0 {
+            continue;
+        }
+        let score = if (3..=14).contains(&d) {
+            100 - (d - 6).abs()
+        } else if d < 3 {
+            d
+        } else {
+            20 - (d - 14).min(20)
+        };
         if score > best_score {
             best_score = score;
             best = i;
         }
     }
-    Some(best)
+    if best_score == i32::MIN {
+        Some(0)
+    } else {
+        Some(best)
+    }
 }
 
 /// Clear on project switch so the previous tree's map cannot linger.
@@ -219,17 +236,25 @@ pub fn clear(ui: CallGraphUi) {
 
 // --- layout -----------------------------------------------------------------
 
-const MAX_VISIBLE: usize = 60;
-const NODE_H: f64 = 28.0;
-const NODE_PAD_X: f64 = 12.0;
-const ROW_GAP: f64 = 56.0;
-const COL_GAP: f64 = 16.0;
+const MAX_PER_LAYER: usize = 18;
+const MAX_VISIBLE: usize = 40;
+const NODE_H: f64 = 30.0;
+const NODE_PAD_X: f64 = 14.0;
+/// Vertical gap between hop bands (caller ↔ focus ↔ callee).
+const BAND_GAP: f64 = 52.0;
+/// Vertical gap between wrapped rows inside one band.
+const ROW_STEP: f64 = 38.0;
+const COL_GAP: f64 = 12.0;
+const FIT_MARGIN: f64 = 36.0;
+/// World-space row width when the pane size is not yet known.
+const DEFAULT_ROW_WIDTH: f64 = 640.0;
 
 #[derive(Debug, Clone)]
 struct LaidOut {
     index: u32,
     label: String,
-    location: String,
+    /// Hover text: qualified name + file:line.
+    detail: String,
     x: f64,
     y: f64,
     w: f64,
@@ -246,16 +271,28 @@ enum Layer {
     Callee,
 }
 
+fn display_label(node: &Node, focus: &Node) -> String {
+    // Same `impl` as the focus → drop the repeated container so a dispatcher
+    // of `cmd_*` reads as names, not a wall of `Terminal::`.
+    match (&node.container, &focus.container) {
+        (Some(c), Some(fc)) if c == fc => node.name.clone(),
+        _ => node.qualified(),
+    }
+}
+
+fn label_width(label: &str) -> f64 {
+    (label.chars().count() as f64 * 7.4 + NODE_PAD_X * 2.0).clamp(64.0, 240.0)
+}
+
 /// Deterministic focus-relative layout. Callers above, focus centre, callees
-/// below. Caps at [`MAX_VISIBLE`].
-///
-/// `stale` must be precomputed — [`CallGraph::staleness`] walks and hashes the
-/// whole tree, and this runs on every paint.
+/// below. High fan-out **wraps** within `max_row_width` instead of one endless
+/// strip. `stale` must be precomputed — never call [`CallGraph::staleness`] here.
 fn layout(
     graph: &CallGraph,
     focus: u32,
     hops: u8,
     stale: &Staleness,
+    max_row_width: f64,
 ) -> (Vec<LaidOut>, usize) {
     let Some(focus_node) = graph.nodes.get(focus as usize) else {
         return (Vec::new(), 0);
@@ -306,9 +343,7 @@ fn layout(
         hop2_callees.dedup_by_key(|(i, _)| *i);
     }
 
-    let budget_each = (MAX_VISIBLE.saturating_sub(1)) / 2;
     let mut hidden = 0usize;
-
     let take = |src: &[(u32, u32)], limit: usize, hidden: &mut usize| -> Vec<(u32, u32)> {
         if src.len() > limit {
             *hidden += src.len() - limit;
@@ -318,65 +353,35 @@ fn layout(
         }
     };
 
-    let callers_v = take(&callers, budget_each, &mut hidden);
-    let callees_v = take(&callees, budget_each, &mut hidden);
+    let callers_v = take(&callers, MAX_PER_LAYER, &mut hidden);
+    let callees_v = take(&callees, MAX_PER_LAYER, &mut hidden);
     let used = 1 + callers_v.len() + callees_v.len();
     let leftover = MAX_VISIBLE.saturating_sub(used);
     let half = leftover / 2;
     let hop2_c = if hops >= 2 {
-        take(&hop2_callers, half, &mut hidden)
+        take(&hop2_callers, half.min(MAX_PER_LAYER / 2), &mut hidden)
     } else {
         Vec::new()
     };
     let hop2_e = if hops >= 2 {
-        take(&hop2_callees, leftover.saturating_sub(hop2_c.len()), &mut hidden)
+        take(
+            &hop2_callees,
+            leftover.saturating_sub(hop2_c.len()).min(MAX_PER_LAYER / 2),
+            &mut hidden,
+        )
     } else {
         Vec::new()
     };
 
-    let label_w = |n: &Node| -> f64 {
-        let label = n.qualified();
-        (label.chars().count() as f64 * 7.2 + NODE_PAD_X * 2.0).clamp(72.0, 280.0)
-    };
-
-    let place_row = |items: &[(u32, u32)], y: f64, layer: Layer, out: &mut Vec<LaidOut>| {
-        if items.is_empty() {
-            return;
-        }
-        let widths: Vec<f64> = items
-            .iter()
-            .map(|(i, _)| label_w(&graph.nodes[*i as usize]))
-            .collect();
-        let total: f64 = widths.iter().sum::<f64>() + COL_GAP * (items.len().saturating_sub(1)) as f64;
-        let mut x = -total / 2.0;
-        for (k, &(idx, sites)) in items.iter().enumerate() {
-            let n = &graph.nodes[idx as usize];
-            let w = widths[k];
-            out.push(LaidOut {
-                index: idx,
-                label: n.qualified(),
-                location: n.location(),
-                x,
-                y,
-                w,
-                h: NODE_H,
-                stale: graph.node_is_stale(n, stale),
-                sites,
-                layer,
-            });
-            x += w + COL_GAP;
-        }
-    };
-
+    let max_w = max_row_width.max(200.0);
     let mut out = Vec::new();
-    place_row(&hop2_c, -ROW_GAP * 2.0, Layer::Caller, &mut out);
-    place_row(&callers_v, -ROW_GAP, Layer::Caller, &mut out);
 
-    let fw = label_w(focus_node);
+    // Place from focus outward so band gaps stay consistent after wrapping.
+    let fw = label_width(&focus_node.qualified());
     out.push(LaidOut {
         index: focus,
         label: focus_node.qualified(),
-        location: focus_node.location(),
+        detail: format!("{}\n{}", focus_node.qualified(), focus_node.location()),
         x: -fw / 2.0,
         y: 0.0,
         w: fw,
@@ -386,10 +391,152 @@ fn layout(
         layer: Layer::Focus,
     });
 
-    place_row(&callees_v, ROW_GAP, Layer::Callee, &mut out);
-    place_row(&hop2_e, ROW_GAP * 2.0, Layer::Callee, &mut out);
+    let place_wrapped = |items: &[(u32, u32)],
+                         y0: f64,
+                         downward: bool,
+                         layer: Layer,
+                         out: &mut Vec<LaidOut>| {
+        if items.is_empty() {
+            return;
+        }
+        let step = if downward { ROW_STEP } else { -ROW_STEP };
+        let mut row: Vec<(u32, u32, f64)> = Vec::new();
+        let mut row_w = 0.0;
+        let mut y = y0;
+
+        let flush = |row: &mut Vec<(u32, u32, f64)>, y: f64, out: &mut Vec<LaidOut>| {
+            if row.is_empty() {
+                return;
+            }
+            let total: f64 = row.iter().map(|(_, _, w)| *w).sum::<f64>()
+                + COL_GAP * (row.len().saturating_sub(1)) as f64;
+            let mut x = -total / 2.0;
+            for &(idx, sites, w) in row.iter() {
+                let n = &graph.nodes[idx as usize];
+                let label = display_label(n, focus_node);
+                out.push(LaidOut {
+                    index: idx,
+                    label: label.clone(),
+                    detail: format!("{}\n{}", n.qualified(), n.location()),
+                    x,
+                    y,
+                    w,
+                    h: NODE_H,
+                    stale: graph.node_is_stale(n, stale),
+                    sites,
+                    layer,
+                });
+                x += w + COL_GAP;
+            }
+            row.clear();
+        };
+
+        for &(idx, sites) in items {
+            let n = &graph.nodes[idx as usize];
+            let label = display_label(n, focus_node);
+            let w = label_width(&label);
+            let next = if row.is_empty() {
+                w
+            } else {
+                row_w + COL_GAP + w
+            };
+            if !row.is_empty() && next > max_w {
+                flush(&mut row, y, out);
+                row_w = 0.0;
+                y += step;
+            }
+            row.push((idx, sites, w));
+            row_w = if row.len() == 1 {
+                w
+            } else {
+                row_w + COL_GAP + w
+            };
+        }
+        flush(&mut row, y, out);
+    };
+
+    // How tall did a wrapped band grow? Used to offset hop-2 away from hop-1.
+    let band_depth = |items: &[(u32, u32)]| -> f64 {
+        if items.is_empty() {
+            return 0.0;
+        }
+        let mut rows = 1usize;
+        let mut row_w = 0.0;
+        for &(idx, _) in items {
+            let n = &graph.nodes[idx as usize];
+            let w = label_width(&display_label(n, focus_node));
+            let next = if row_w == 0.0 { w } else { row_w + COL_GAP + w };
+            if row_w > 0.0 && next > max_w {
+                rows += 1;
+                row_w = w;
+            } else {
+                row_w = next;
+            }
+        }
+        (rows.saturating_sub(1)) as f64 * ROW_STEP
+    };
+
+    let callee_depth = band_depth(&callees_v);
+    let caller_depth = band_depth(&callers_v);
+
+    place_wrapped(
+        &callers_v,
+        -BAND_GAP,
+        false,
+        Layer::Caller,
+        &mut out,
+    );
+    place_wrapped(
+        &hop2_c,
+        -(BAND_GAP * 2.0 + caller_depth),
+        false,
+        Layer::Caller,
+        &mut out,
+    );
+    place_wrapped(&callees_v, BAND_GAP, true, Layer::Callee, &mut out);
+    place_wrapped(
+        &hop2_e,
+        BAND_GAP * 2.0 + callee_depth,
+        true,
+        Layer::Callee,
+        &mut out,
+    );
 
     (out, hidden)
+}
+
+/// Pan/zoom so the laid-out neighborhood fits in the pane with margin.
+fn fit_camera(nodes: &[LaidOut], pane_w: f64, pane_h: f64) -> ((f64, f64), f64) {
+    if nodes.is_empty() || pane_w < 40.0 || pane_h < 40.0 {
+        return ((0.0, 0.0), 1.0);
+    }
+    let mut min_x = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    for n in nodes {
+        min_x = min_x.min(n.x);
+        max_x = max_x.max(n.x + n.w);
+        min_y = min_y.min(n.y);
+        max_y = max_y.max(n.y + n.h);
+    }
+    let bw = (max_x - min_x).max(1.0);
+    let bh = (max_y - min_y).max(1.0);
+    let zoom = ((pane_w - 2.0 * FIT_MARGIN) / bw)
+        .min((pane_h - 2.0 * FIT_MARGIN) / bh)
+        .clamp(0.55, 1.35);
+    let cx = (min_x + max_x) / 2.0;
+    let cy = (min_y + max_y) / 2.0;
+    // screen = pane/2 + pan + world * zoom  →  pan = -world_center * zoom
+    ((-cx * zoom, -cy * zoom), zoom)
+}
+
+fn row_width_for_pane(pane_w: f64) -> f64 {
+    if pane_w < 40.0 {
+        DEFAULT_ROW_WIDTH
+    } else {
+        (pane_w - 2.0 * FIT_MARGIN).clamp(280.0, 720.0)
+    }
 }
 
 // --- view -------------------------------------------------------------------
@@ -421,7 +568,12 @@ pub fn call_graph_view(
                 }
             },
         )
-        .style(|s| s.flex_grow(1.0).width_full().min_height(0.0)),
+        .style(|s| {
+            s.flex_grow(1.0)
+                .width_full()
+                .min_height(0.0)
+                .background(design::BG_BASE)
+        }),
     ))
     .style(|s| {
         s.width_full()
@@ -509,6 +661,7 @@ fn toolbar(ui: CallGraphUi, on_build: impl Fn() + 'static) -> impl IntoView {
             .padding_vert(design::SPACE_2)
             .border_bottom(1.0)
             .border_color(design::BORDER)
+            .background(design::BG_BASE)
     })
 }
 
@@ -540,7 +693,13 @@ fn empty_pane(on_build: impl Fn() + 'static) -> impl IntoView {
                     .cursor(floem::style::CursorStyle::Pointer)
             }),
     ))
-    .style(|s| s.width_full().height_full().items_center().justify_center())
+    .style(|s| {
+        s.width_full()
+            .height_full()
+            .items_center()
+            .justify_center()
+            .background(design::BG_BASE)
+    })
 }
 
 fn message_pane(title: &'static str, detail: &'static str) -> impl IntoView {
@@ -553,7 +712,13 @@ fn message_pane(title: &'static str, detail: &'static str) -> impl IntoView {
         Label::derived(move || detail.to_string())
             .style(|s| s.font_size(design::TEXT_SM).color(design::FG_FAINT)),
     ))
-    .style(|s| s.width_full().height_full().items_center().justify_center())
+    .style(|s| {
+        s.width_full()
+            .height_full()
+            .items_center()
+            .justify_center()
+            .background(design::BG_BASE)
+    })
 }
 
 fn graph_pane(
@@ -561,9 +726,35 @@ fn graph_pane(
     project_root: RwSignal<PathBuf>,
     on_open: impl Fn(PathBuf, usize) + 'static + Clone,
 ) -> impl IntoView {
+    // Refit when the neighborhood or pane changes — not when the user pans.
+    floem::reactive::Effect::new(move |_| {
+        let focus = ui.focus.get();
+        let hops = ui.hops.get();
+        let (pw, ph) = ui.size.get();
+        let Some(graph) = ui.graph.get() else {
+            return;
+        };
+        let Some(f) = focus.or_else(|| default_focus(&graph)) else {
+            return;
+        };
+        if pw < 40.0 || ph < 40.0 {
+            return;
+        }
+        let stale = ui.stale.get_untracked();
+        let (nodes, _) = layout(&graph, f, hops, &stale, row_width_for_pane(pw));
+        let (pan, zoom) = fit_camera(&nodes, pw, ph);
+        let cur = ui.pan.get_untracked();
+        let cz = ui.zoom.get_untracked();
+        if (cur.0 - pan.0).abs() > 0.5
+            || (cur.1 - pan.1).abs() > 0.5
+            || (cz - zoom).abs() > 0.01
+        {
+            ui.pan.set(pan);
+            ui.zoom.set(zoom);
+        }
+    });
+
     let edges = canvas(move |cx, size| {
-        // Only notify when the pane actually resized. Writing size on every
-        // paint fed `dyn_container` below and froze the UI (Not Responding).
         let (w, h) = (size.width, size.height);
         let prev = ui.size.get_untracked();
         if (prev.0 - w).abs() > 0.5 || (prev.1 - h).abs() > 0.5 {
@@ -572,6 +763,13 @@ fn graph_pane(
         if w < 8.0 || h < 8.0 {
             return;
         }
+        // Opaque fill — forged sky must not read as part of the map.
+        cx.fill(
+            &floem::kurbo::Rect::new(0.0, 0.0, w, h),
+            design::BG_BASE,
+            0.0,
+        );
+
         let Some(graph) = ui.graph.get() else {
             return;
         };
@@ -579,7 +777,7 @@ fn graph_pane(
             return;
         };
         let stale = ui.stale.get();
-        let (nodes, _) = layout(&graph, focus, ui.hops.get(), &stale);
+        let (nodes, _) = layout(&graph, focus, ui.hops.get(), &stale, row_width_for_pane(w));
         let (pan_x, pan_y) = ui.pan.get();
         let zoom = ui.zoom.get().clamp(0.4, 3.0);
         let ox = w / 2.0 + pan_x;
@@ -589,28 +787,67 @@ fn graph_pane(
         let Some(focus_laid) = nodes.iter().find(|n| n.layer == Layer::Focus) else {
             return;
         };
-        let f = to_screen(
+        let f_top = to_screen(focus_laid.x + focus_laid.w / 2.0, focus_laid.y);
+        let f_bot = to_screen(
             focus_laid.x + focus_laid.w / 2.0,
-            focus_laid.y + focus_laid.h / 2.0,
+            focus_laid.y + focus_laid.h,
         );
-        for n in &nodes {
-            if n.layer == Layer::Focus {
-                continue;
+
+        // Bus edges: stub from focus → horizontal spine → drop to each node.
+        // A star of diagonals is unreadable past ~4 siblings.
+        let mut draw_bus = |layer: Layer, focus_pt: Point, toward_down: bool| {
+            let group: Vec<&LaidOut> = nodes.iter().filter(|n| n.layer == layer).collect();
+            if group.is_empty() {
+                return;
             }
-            let p = to_screen(n.x + n.w / 2.0, n.y + n.h / 2.0);
-            let thickness = (1.0 + (n.sites as f64).ln().max(0.0)).clamp(1.0, 4.0) * zoom;
-            let color = if n.stale {
-                design::FG_GHOST.with_alpha(0.5)
+            let centers: Vec<Point> = group
+                .iter()
+                .map(|n| {
+                    let cx = n.x + n.w / 2.0;
+                    let ey = if toward_down { n.y } else { n.y + n.h };
+                    to_screen(cx, ey)
+                })
+                .collect();
+            let bus_y = if toward_down {
+                (focus_pt.y + centers.iter().map(|p| p.y).fold(f64::INFINITY, f64::min)) / 2.0
             } else {
-                design::BORDER.with_alpha(0.85)
+                (focus_pt.y + centers.iter().map(|p| p.y).fold(f64::NEG_INFINITY, f64::max)) / 2.0
             };
-            let stroke = if n.stale {
-                Stroke::new(thickness).with_dashes(0.0, [4.0, 4.0])
-            } else {
-                Stroke::new(thickness)
-            };
-            cx.stroke(&Line::new(f, p), color, &stroke);
-        }
+            let min_x = centers.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
+            let max_x = centers.iter().map(|p| p.x).fold(f64::NEG_INFINITY, f64::max);
+
+            let spine = Stroke::new(1.25 * zoom);
+            let color = design::BORDER.with_alpha(0.75);
+            cx.stroke(
+                &Line::new(focus_pt, Point::new(focus_pt.x, bus_y)),
+                color,
+                &spine,
+            );
+            if (max_x - min_x).abs() > 1.0 {
+                cx.stroke(
+                    &Line::new(Point::new(min_x, bus_y), Point::new(max_x, bus_y)),
+                    color,
+                    &spine,
+                );
+            }
+            for (n, p) in group.iter().zip(centers.iter()) {
+                let thickness = (1.0 + (n.sites as f64).ln().max(0.0)).clamp(1.0, 3.5) * zoom;
+                let c = if n.stale {
+                    design::FG_GHOST.with_alpha(0.5)
+                } else {
+                    design::BORDER.with_alpha(0.9)
+                };
+                let stroke = if n.stale {
+                    Stroke::new(thickness).with_dashes(0.0, [4.0, 4.0])
+                } else {
+                    Stroke::new(thickness)
+                };
+                cx.stroke(&Line::new(Point::new(p.x, bus_y), *p), c, &stroke);
+            }
+        };
+
+        draw_bus(Layer::Caller, f_top, false);
+        draw_bus(Layer::Callee, f_bot, true);
     })
     .style(|s| s.absolute().inset(0.0).width_full().height_full().pointer_events_none());
 
@@ -622,7 +859,6 @@ fn graph_pane(
                 ui.pan.get(),
                 ui.zoom.get(),
                 ui.size.get(),
-                project_root.get(),
                 ui.graph.get().as_ref().map(|g| g.nodes.len()),
             )
         },
@@ -636,19 +872,26 @@ fn graph_pane(
                 .or_else(|| default_focus(&graph))
                 .unwrap_or(0);
             let stale = ui.stale.get_untracked();
-            let (nodes, hidden) = layout(&graph, focus, ui.hops.get_untracked(), &stale);
+            let (pw, ph) = ui.size.get_untracked();
+            let (nodes, hidden) = layout(
+                &graph,
+                focus,
+                ui.hops.get_untracked(),
+                &stale,
+                row_width_for_pane(pw),
+            );
             let (pan_x, pan_y) = ui.pan.get_untracked();
             let zoom = ui.zoom.get_untracked().clamp(0.4, 3.0);
-            let (pw, ph) = ui.size.get_untracked();
             let ox = pw / 2.0 + pan_x;
             let oy = ph / 2.0 + pan_y;
+            let _ = ph;
 
             let mut children: Vec<_> = nodes
                 .into_iter()
                 .map(|n| {
                     let idx = n.index;
                     let label = n.label.clone();
-                    let location = n.location.clone();
+                    let detail = n.detail.clone();
                     let is_focus = n.layer == Layer::Focus;
                     let stale = n.stale;
                     let left = ox + n.x * zoom;
@@ -676,7 +919,7 @@ fn graph_pane(
                                 }
                             } else {
                                 ui.focus.set(Some(idx));
-                                ui.pan.set((0.0, 0.0));
+                                // Camera refit is the Effect above.
                             }
                         })
                         .style(move |s| {
@@ -685,7 +928,7 @@ fn graph_pane(
                                 .inset_top(top)
                                 .width(width)
                                 .height(height)
-                                .font_size((design::TEXT_XS as f64 * zoom).clamp(9.0, 15.0) as f32)
+                                .font_size((design::TEXT_XS as f64 * zoom).clamp(10.0, 15.0) as f32)
                                 .font_family(design::MONO.to_string())
                                 .color(if stale {
                                     design::FG_GHOST
@@ -713,8 +956,8 @@ fn graph_pane(
                                 .cursor(floem::style::CursorStyle::Pointer)
                         })
                         .tooltip(move || {
-                            let loc = location.clone();
-                            Label::derived(move || loc.clone()).style(|s| {
+                            let detail = detail.clone();
+                            Label::derived(move || detail.clone()).style(|s| {
                                 s.font_size(design::TEXT_XS)
                                     .font_family(design::MONO.to_string())
                                     .color(design::FG)
@@ -747,7 +990,12 @@ fn graph_pane(
     .style(|s| s.absolute().inset(0.0).width_full().height_full());
 
     Stack::new((edges, nodes_layer))
-        .style(|s| s.width_full().height_full().min_height(0.0))
+        .style(|s| {
+            s.width_full()
+                .height_full()
+                .min_height(0.0)
+                .background(design::BG_BASE)
+        })
         .on_event_stop(floem::event::listener::PointerWheel, move |_, update| {
             use floem::event::PointerScrollEventExt;
             let delta = update.resolve_to_points(None, None);
@@ -816,10 +1064,43 @@ mod tests {
         }
     }
 
+    fn hub_graph(callees: usize) -> CallGraph {
+        let mut nodes = vec![Node {
+            name: "dispatch".into(),
+            container: Some("Terminal".into()),
+            file: "t.rs".into(),
+            line: 1,
+            end_line: 10,
+        }];
+        let mut edges = Vec::new();
+        for i in 0..callees {
+            nodes.push(Node {
+                name: format!("cmd_{i}"),
+                container: Some("Terminal".into()),
+                file: "t.rs".into(),
+                line: 20 + i,
+                end_line: 22 + i,
+            });
+            edges.push(Edge {
+                from: 0,
+                to: (i + 1) as u32,
+                sites: 1,
+            });
+        }
+        CallGraph {
+            version: 1,
+            nodes,
+            edges,
+            stats: BuildStats::default(),
+            built_at: 0,
+            sources: Default::default(),
+        }
+    }
+
     #[test]
     fn layout_puts_callers_above_and_callees_below() {
         let g = tiny_graph();
-        let (nodes, hidden) = layout(&g, 1, 1, &Staleness::default());
+        let (nodes, hidden) = layout(&g, 1, 1, &Staleness::default(), 640.0);
         assert_eq!(hidden, 0);
         let focus = nodes.iter().find(|n| n.layer == Layer::Focus).unwrap();
         assert_eq!(focus.label, "T::b");
@@ -832,7 +1113,93 @@ mod tests {
     }
 
     #[test]
-    fn default_focus_picks_the_busiest_node() {
-        assert_eq!(default_focus(&tiny_graph()), Some(1));
+    fn high_fanout_wraps_instead_of_one_strip() {
+        let g = hub_graph(12);
+        let (nodes, _) = layout(&g, 0, 1, &Staleness::default(), 320.0);
+        let callees: Vec<_> = nodes.iter().filter(|n| n.layer == Layer::Callee).collect();
+        assert_eq!(callees.len(), 12);
+        let ys: std::collections::HashSet<i64> = callees
+            .iter()
+            .map(|n| (n.y * 10.0).round() as i64)
+            .collect();
+        assert!(
+            ys.len() >= 2,
+            "expected wrapped rows, got single y band: {ys:?}"
+        );
+        // Shared container → short labels
+        assert!(callees.iter().all(|n| n.label.starts_with("cmd_")));
+        assert!(!callees.iter().any(|n| n.label.contains("::")));
+    }
+
+    #[test]
+    fn fit_camera_keeps_content_inside_the_pane() {
+        let g = hub_graph(10);
+        let (nodes, _) = layout(&g, 0, 1, &Staleness::default(), 400.0);
+        let ((pan_x, pan_y), zoom) = fit_camera(&nodes, 800.0, 600.0);
+        let ox = 400.0 + pan_x;
+        let oy = 300.0 + pan_y;
+        for n in &nodes {
+            let left = ox + n.x * zoom;
+            let right = ox + (n.x + n.w) * zoom;
+            let top = oy + n.y * zoom;
+            let bottom = oy + (n.y + n.h) * zoom;
+            assert!(left >= -1.0, "left {left}");
+            assert!(right <= 801.0, "right {right}");
+            assert!(top >= -1.0, "top {top}");
+            assert!(bottom <= 601.0, "bottom {bottom}");
+        }
+    }
+
+    #[test]
+    fn default_focus_prefers_a_moderate_neighborhood() {
+        // Hub (degree 20) vs a middling node (degree 4) — pick middling.
+        let mut nodes = vec![
+            Node {
+                name: "hub".into(),
+                container: None,
+                file: "a.rs".into(),
+                line: 1,
+                end_line: 2,
+            },
+            Node {
+                name: "mid".into(),
+                container: None,
+                file: "b.rs".into(),
+                line: 1,
+                end_line: 2,
+            },
+        ];
+        let mut edges = Vec::new();
+        for i in 0..20 {
+            nodes.push(Node {
+                name: format!("leaf{i}"),
+                container: None,
+                file: "c.rs".into(),
+                line: i,
+                end_line: i,
+            });
+            edges.push(Edge {
+                from: 0,
+                to: (i + 2) as u32,
+                sites: 1,
+            });
+        }
+        // mid ↔ four of the leaves
+        for i in 0..4 {
+            edges.push(Edge {
+                from: 1,
+                to: (i + 2) as u32,
+                sites: 1,
+            });
+        }
+        let g = CallGraph {
+            version: 1,
+            nodes,
+            edges,
+            stats: BuildStats::default(),
+            built_at: 0,
+            sources: Default::default(),
+        };
+        assert_eq!(default_focus(&g), Some(1));
     }
 }
