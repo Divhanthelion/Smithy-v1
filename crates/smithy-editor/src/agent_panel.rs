@@ -1304,6 +1304,15 @@ fn budget_bar(state: AgentPanelState) -> impl IntoView {
 /// and the panel header already speaks in dots. Yellow means busy — loading the
 /// model the first time takes tens of seconds, and a button that looked idle
 /// through that would be pressed again and again.
+///
+/// **The failure detail lives under a hover, not beside the dot.** It used to
+/// print the raw error inline — `microphone unavailable: Failed to get default
+/// input config` — parked in red in the composer. That inverted the panel's own
+/// severity language: an unreachable agent, which stops the entire point of the
+/// app, is one small dot, while an unconfigured microphone, which costs nothing,
+/// was a sentence in red. A stranger reads the loudest thing on screen as the
+/// most broken thing. The dot already carried the state; the string only
+/// carried alarm.
 fn microphone(
     state: AgentPanelState,
     hotkey: String,
@@ -1311,6 +1320,10 @@ fn microphone(
 ) -> impl IntoView {
     use smithy_voice::Voice;
 
+    // The hover text needs the shortcut too, and both closures outlive us.
+    let hover_hotkey = hotkey.clone();
+
+    floem::views::tooltip(
     Stack::horizontal((
         Label::derived(move || {
             match state.voice.get() {
@@ -1350,7 +1363,11 @@ fn microphone(
             Voice::Ready => hotkey.clone(),
             Voice::Listening => "listening…".to_string(),
             Voice::Transcribing => "transcribing…".to_string(),
-            Voice::Failed(why) => why,
+            // One word, not the error. Short enough to read as a state rather
+            // than a fault, and long enough to invite the hover that explains
+            // it. Deliberately not the shortcut — offering a key that will not
+            // work is worse than saying nothing.
+            Voice::Failed(_) => "unavailable".to_string(),
         })
         .style(move |s| {
             // **The family matters even on a label that is mostly words.** This
@@ -1370,7 +1387,36 @@ fn microphone(
                 })
         }),
     ))
-    .style(|s| s.items_center())
+    .style(|s| s.items_center()),
+    // The detail, on hover. This is the first tooltip in the app, so it styles
+    // itself rather than inheriting one — `TooltipContainerClass` has no theme
+    // entry here and an unstyled tip renders as text on nothing.
+    move || {
+        let hotkey = hover_hotkey.clone();
+        Label::derived(move || match state.voice.get() {
+            Voice::Cold => format!("Dictation. {hotkey} loads the model on first use."),
+            Voice::Loading => {
+                "Loading the speech model. The first time takes tens of seconds.".to_string()
+            }
+            Voice::Ready => format!("Dictation. Hold {hotkey} to talk."),
+            Voice::Listening => "Listening. Release to transcribe.".to_string(),
+            Voice::Transcribing => "Transcribing what you said.".to_string(),
+            // The whole reason this hover exists.
+            Voice::Failed(why) => why,
+        })
+        .style(|s| {
+            s.font_family(crate::design::SYMBOL.to_string())
+                .font_size(crate::design::TEXT_SM)
+                .color(catppuccin::TEXT)
+                .background(catppuccin::CRUST)
+                .border(1.0)
+                .border_color(catppuccin::SURFACE1)
+                .border_radius(6.0)
+                .padding_horiz(8.0)
+                .padding_vert(5.0)
+        })
+    },
+    )
 }
 
 fn composer(

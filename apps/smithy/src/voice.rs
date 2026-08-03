@@ -35,8 +35,16 @@ impl VoiceControl {
         let recorder = match AudioRecorder::new() {
             Ok(recorder) => recorder,
             Err(e) => {
-                // No microphone is not a crash. The button simply says so.
-                state.set(Voice::Failed(format!("no microphone: {e}")));
+                // Not a crash — the button simply goes dim.
+                //
+                // **Not "no microphone".** It said that for a while, on a
+                // machine with a working microphone, because this error covers
+                // every reason the input device could not be opened: no default
+                // device selected, the OS never granted the permission, another
+                // process holding it exclusively. Naming the one cause it is
+                // usually *not* sends you looking at hardware. The detail is in
+                // the message and the panel puts it under a hover.
+                state.set(Voice::Failed(format!("microphone unavailable: {e}")));
                 return None;
             }
         };
