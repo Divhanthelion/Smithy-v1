@@ -660,6 +660,8 @@ struct OverviewChip {
     w: f64,
     h: f64,
     stale: bool,
+    /// Index into the clusters vec — used by tests / future hull highlighting.
+    #[allow(dead_code)]
     cluster: usize,
 }
 
@@ -733,7 +735,7 @@ fn overview_layout(
     let mut cursor_y = 0.0;
     let mut row_h = 0.0;
 
-    for (file, title, items, cw, ch) in &measured {
+    for (_file, title, items, cw, ch) in &measured {
         if cursor_x > 0.0 && cursor_x + cw > grid_w {
             cursor_x = 0.0;
             cursor_y += row_h + OV_CLUSTER_GAP;
