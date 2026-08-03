@@ -390,6 +390,76 @@ fn native_models_url(base_url: &str) -> String {
     }
 }
 
+/// Money left on a hosted account.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Balance {
+    /// ISO code, e.g. `USD`. Reported rather than assumed — DeepSeek bills some
+    /// accounts in CNY.
+    pub currency: String,
+    /// What is left to spend: granted credit plus what was topped up.
+    pub total: f64,
+    /// Whether the provider considers the account usable at all.
+    pub available: bool,
+}
+
+impl Balance {
+    pub fn render(&self) -> String {
+        let symbol = match self.currency.as_str() {
+            "USD" => "$",
+            "CNY" => "¥",
+            _ => "",
+        };
+        if symbol.is_empty() {
+            format!("{:.2} {}", self.total, self.currency)
+        } else {
+            format!("{symbol}{:.2}", self.total)
+        }
+    }
+}
+
+/// Ask DeepSeek what is left on the account.
+///
+/// The only provider here with a balance endpoint. OpenRouter has one too but
+/// reports a credit *limit* rather than a remaining balance for most keys, and
+/// LM Studio is a local server with nothing to bill — so this is deliberately
+/// DeepSeek-shaped rather than a general abstraction over one implementation.
+pub async fn deepseek_balance(base_url: &str, api_key: &str) -> Result<Balance, String> {
+    let url = format!("{}/user/balance", base_url.trim_end_matches('/'));
+    let response = client(15)?
+        .get(&url)
+        .bearer_auth(api_key)
+        .send()
+        .await
+        .map_err(|e| format!("could not reach DeepSeek: {e}"))?;
+
+    let status = response.status();
+    if status.as_u16() == 401 || status.as_u16() == 403 {
+        return Err("DeepSeek rejected the API key.".to_string());
+    }
+    if !status.is_success() {
+        return Err(format!("DeepSeek returned HTTP {}", status.as_u16()));
+    }
+
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("could not parse the balance response: {e}"))?;
+
+    parse_balance(&body).ok_or_else(|| "DeepSeek's balance response had no usable figures".into())
+}
+
+fn parse_balance(body: &serde_json::Value) -> Option<Balance> {
+    let available = body["is_available"].as_bool().unwrap_or(false);
+    // `balance_infos` is an array — one entry per currency the account holds.
+    let first = body["balance_infos"].as_array()?.first()?;
+    Some(Balance {
+        currency: first["currency"].as_str().unwrap_or("USD").to_string(),
+        // Strings, not numbers, in DeepSeek's response.
+        total: first["total_balance"].as_str()?.parse().ok()?,
+        available,
+    })
+}
+
 /// What happened when a local model was asked to load.
 #[derive(Debug, Clone)]
 pub struct Loaded {
@@ -691,6 +761,50 @@ mod tests {
         let out = explain_error(&long, 500);
         assert!(out.ends_with('…'));
         assert!(out.chars().count() <= 201, "{}", out.chars().count());
+    }
+
+    /// The exact body a live account returns. Note the figures are *strings*.
+    #[test]
+    fn a_balance_is_parsed_from_deepseeks_actual_response() {
+        let body = json!({
+            "is_available": true,
+            "balance_infos": [{
+                "currency": "USD",
+                "total_balance": "9.93",
+                "granted_balance": "0.00",
+                "topped_up_balance": "9.93"
+            }]
+        });
+        let balance = parse_balance(&body).expect("parsed");
+        assert_eq!(balance.currency, "USD");
+        assert!((balance.total - 9.93).abs() < 1e-9);
+        assert!(balance.available);
+        assert_eq!(balance.render(), "$9.93");
+    }
+
+    /// An account billed in yuan must not be rendered with a dollar sign.
+    #[test]
+    fn a_non_dollar_currency_is_not_silently_relabelled() {
+        let body = json!({
+            "is_available": true,
+            "balance_infos": [{ "currency": "CNY", "total_balance": "42.50" }]
+        });
+        assert_eq!(parse_balance(&body).unwrap().render(), "¥42.50");
+
+        let body = json!({
+            "is_available": true,
+            "balance_infos": [{ "currency": "GBP", "total_balance": "7.00" }]
+        });
+        assert_eq!(parse_balance(&body).unwrap().render(), "7.00 GBP");
+    }
+
+    /// A shape we do not recognise must yield nothing rather than a confident
+    /// zero — "you have $0.00 left" is an alarming thing to invent.
+    #[test]
+    fn an_unusable_balance_response_is_none_not_zero() {
+        assert!(parse_balance(&json!({})).is_none());
+        assert!(parse_balance(&json!({"balance_infos": []})).is_none());
+        assert!(parse_balance(&json!({"balance_infos": [{"currency": "USD"}]})).is_none());
     }
 
     #[test]

@@ -25,6 +25,8 @@ impl EditorComponent {
     /// would let you undo your way into the previous file's contents.
     pub fn view(
         &self,
+        // The project map, shown behind the shortcuts when nothing is open.
+        project_map: RwSignal<String>,
         active_buffer: RwSignal<Option<BufferId>>,
         buffer_manager: Rc<RefCell<BufferManager>>,
         open_editor: RwSignal<Option<smithy_editor::EditorHandle>>,
@@ -55,13 +57,15 @@ impl EditorComponent {
                             ) as Box<dyn View>
                         }
                         None => {
-                            Box::new(Container::new(smithy_editor::empty_editor())) as Box<dyn View>
+                            Box::new(Container::new(smithy_editor::empty_editor_with_map(project_map)))
+                        as Box<dyn View>
                         }
                     }
                 }
                 None => {
                     open_editor.set(None);
-                    Box::new(Container::new(smithy_editor::empty_editor())) as Box<dyn View>
+                    Box::new(Container::new(smithy_editor::empty_editor_with_map(project_map)))
+                        as Box<dyn View>
                 }
             },
         )

@@ -178,11 +178,68 @@ impl Default for MenuBarState {
 /// dropdown nested here would be positioned below a parent clamped to
 /// [`crate::design::MENU_BAR_HEIGHT`], so it was clipped out of existence and
 /// the menus appeared not to work at all.
+/// The right-hand meters: what the machine and the account are being spent.
+///
+/// Plain strings, filled by the app, for the reason the agent panel renders
+/// [`crate::agent_panel::Entry`] rather than a `Message` — this crate does not
+/// know what a token costs or how to read a process table, and should not learn.
+#[derive(Clone, Copy)]
+pub struct StatusReadout {
+    /// e.g. `smithy 536 MB · rust-analyzer 5.8 GB`. Empty hides it.
+    pub memory: RwSignal<String>,
+    /// Turns the memory readout amber. Set when something is using enough to be
+    /// worth noticing.
+    pub memory_warn: RwSignal<bool>,
+    /// e.g. `$0.07 · $9.93 left`. Empty hides it.
+    pub spend: RwSignal<String>,
+    /// Turns the spend readout amber — a balance running low.
+    pub spend_warn: RwSignal<bool>,
+}
+
+impl StatusReadout {
+    pub fn new() -> Self {
+        Self {
+            memory: RwSignal::new(String::new()),
+            memory_warn: RwSignal::new(false),
+            spend: RwSignal::new(String::new()),
+            spend_warn: RwSignal::new(false),
+        }
+    }
+}
+
+impl Default for StatusReadout {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn meter(text: RwSignal<String>, warn: RwSignal<bool>, warn_color: Color) -> impl IntoView {
+    Label::derived(move || text.get()).style(move |s| {
+        // Never wrap: this is chrome, and the agent panel learned what inherited
+        // `BreakWord` does to a fixed label.
+        s.text_overflow(floem::style::TextOverflow::NoWrap(
+            floem::style::NoWrapOverflow::Ellipsis,
+        ))
+        .font_size(10.0)
+        .font_family(crate::design::MONO.to_string())
+        .padding_horiz(9.0)
+        .color(if warn.get() {
+            warn_color
+        } else {
+            catppuccin::SURFACE2
+        })
+        .apply_if(text.get().is_empty(), |s| {
+            s.display(floem::taffy::Display::None)
+        })
+    })
+}
+
 pub fn menu_bar(
     state: MenuBarState,
     menus: Vec<Menu>,
     clock: RwSignal<bool>,
     clock_tick: RwSignal<u64>,
+    status: StatusReadout,
 ) -> impl IntoView {
     let menus_for_row = menus;
 
@@ -202,6 +259,8 @@ pub fn menu_bar(
         )
         .style(|s| s.flex_row().items_center()),
         Container::new(Empty::new()).style(|s| s.flex_grow(1.0)),
+        meter(status.spend, status.spend_warn, catppuccin::PEACH),
+        meter(status.memory, status.memory_warn, catppuccin::PEACH),
         clock_readout(clock, clock_tick),
     ))
     .style(|s| {

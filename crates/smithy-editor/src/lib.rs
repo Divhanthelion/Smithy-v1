@@ -61,7 +61,8 @@ pub use agent_panel::{agent_panel, AgentPanelState, Entry as AgentEntry, StepSta
 pub use attachment::{Attachment, AttachmentKind};
 pub use buffer_manager::{BufferManager, BufferState};
 pub use code_editor::{
-    code_editor, empty_editor, external_change_bar, on_external_change, EditorHandle,
+    code_editor, empty_editor, empty_editor_with_map, external_change_bar, on_external_change,
+    EditorHandle,
     ExternalChange, OnExternalChange,
 };
 pub use diff_view::{diff_modal, FileDiff};
@@ -72,7 +73,7 @@ pub use forged::{circuit_backdrop, forged_frame, shell_inset, shell_top_inset};
 pub use hover_popup::{hover_popup, HoverState};
 pub use lsp::{LspDiagnostic, LspHandle, LspManager, LspResponse};
 pub use main_layout::{main_layout_view, LayoutTheme};
-pub use menu_bar::{accel, menu_bar, menu_overlay, Menu, MenuBarState, MenuItem};
+pub use menu_bar::{accel, menu_bar, menu_overlay, Menu, MenuBarState, MenuItem, StatusReadout};
 pub use problems_panel::{is_same_file, problems_panel, DiagnosticsState, ProblemRow};
 pub use review::ChangeStatus;
 pub use settings::{settings_modal, ModelRow, SettingsState, PROVIDERS};

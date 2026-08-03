@@ -370,6 +370,28 @@ Then `show <FILE> --reasoning` to read one in the terminal, or
 Reasoning only exists for sessions recorded after this was added; older files
 list `0` and replay without it.
 
+## The meters
+
+Top-right of the menu bar, beside the clock.
+
+**Spend** — what this session has cost, from the endpoint's own token accounting
+times the model's list price, plus the balance left on the account. DeepSeek is
+the only backend here with a balance endpoint, polled every three minutes; the
+session figure updates every five seconds. A local model or an unpriced one shows
+tokens instead of a number that might be wrong.
+
+Session cost is the figure that teaches you something: a conversation re-sends
+its whole prefix on every request, so the same question costs more at turn forty
+than at turn four. Balance is the one that matters when you have put ten dollars
+on an account.
+
+**Memory** — Smithy's own resident set, and every `rust-analyzer` on the machine
+summed. The analyzer is the interesting number: one instance on a large workspace
+was measured at **5.12 GB**, with a second at 724 MB beside it, which is invisible
+unless you go looking in Activity Monitor. It turns amber past 4 GB. If it does,
+`SMITHY_LSP_LIGHT=1` trades real compiler diagnostics for the analyzer's largest
+memory saving.
+
 ## Budgets
 
 A turn stops on whichever ceiling it reaches first: tool calls, wall clock, or

@@ -341,6 +341,19 @@ pub struct AgentState {
     /// new project simply does not have, so switching left the previous project's
     /// problems on screen and the next project's were *added* to them.
     pub diagnostics: DiagnosticsState,
+    /// The hosted account's balance, refreshed on a slow timer by
+    /// [`crate::meters`].
+    ///
+    /// Shared state rather than a local in `main` so a provider switch can clear
+    /// it: a figure carried over from the previous account is worse than showing
+    /// none at all.
+    pub balance: crate::meters::BalanceCache,
+    /// The project map rendered behind an empty editor.
+    ///
+    /// Here rather than in `main` so `switch_project` can rebuild it — a map of
+    /// the previous repository behind the new one's empty pane would be worse
+    /// than no map at all.
+    pub project_map: RwSignal<String>,
     /// So switching project can re-root the language server too. Without this,
     /// the servers kept analysing whichever project was opened first — see
     /// `LspRegistry::current_client_for`.
@@ -515,6 +528,8 @@ pub fn init_state() -> (AppState, AppSignals, AgentState) {
         terminal_tabs: terminal_tabs.clone(),
         lsp_handle: lsp_handle.clone(),
         diagnostics: DiagnosticsState::new(),
+        balance: crate::meters::BalanceCache::new(),
+        project_map: RwSignal::new(String::new()),
     };
 
     let app_state = AppState {

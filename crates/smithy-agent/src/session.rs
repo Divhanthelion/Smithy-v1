@@ -77,6 +77,14 @@ pub struct Session {
     limits: Limits,
     /// Cooperative cancellation for the Stop button. See [`Stopper`].
     cancel: Arc<Mutex<CancellationToken>>,
+    /// What this session has spent, in tokens.
+    ///
+    /// Accumulated from the endpoint's own `usage` block rather than counted
+    /// locally — the same reason [`crate::provider::Completion`] carries
+    /// `prompt_tokens` at all: the server reports what it actually billed, and a
+    /// local tokenizer would be a second opinion that is wrong in a way nobody
+    /// notices until the invoice.
+    usage: Usage,
     /// Every reasoning block the model has produced, in order.
     ///
     /// **Deliberately not in [`History`].** The endpoint does not replay
@@ -86,6 +94,34 @@ pub struct Session {
     /// which is what used to happen: the traces vanished the moment the panel
     /// cleared, and a long session's most legible record went with them.
     reasoning: Vec<crate::persist::ReasoningEntry>,
+}
+
+/// Tokens billed across a session, as the endpoint reported them.
+///
+/// Cumulative and monotonic: it counts what was *sent to the provider*, so a
+/// long conversation re-sending its prefix on every request accumulates the
+/// prefix each time. That is not double-counting — it is what you are charged
+/// for, and it is precisely why a 100k-token conversation gets expensive per
+/// turn even when your message was short.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    /// How many completions were requested — including retries, which are also
+    /// billed.
+    pub requests: usize,
+}
+
+impl Usage {
+    /// Cost in dollars, given prices per million tokens.
+    pub fn cost(&self, prompt_per_mtok: f64, completion_per_mtok: f64) -> f64 {
+        (self.prompt_tokens as f64 / 1e6) * prompt_per_mtok
+            + (self.completion_tokens as f64 / 1e6) * completion_per_mtok
+    }
+
+    pub fn total_tokens(&self) -> i64 {
+        self.prompt_tokens + self.completion_tokens
+    }
 }
 
 /// What `Outcome::Stopped` says when the user pressed Stop. A constant because
@@ -138,6 +174,7 @@ impl Session {
             limits: config.limits,
             cancel: Arc::new(Mutex::new(CancellationToken::new())),
             reasoning: Vec::new(),
+            usage: Usage::default(),
         }
     }
 
@@ -164,6 +201,7 @@ impl Session {
             limits,
             cancel: Arc::new(Mutex::new(CancellationToken::new())),
             reasoning: Vec::new(),
+            usage: Usage::default(),
         }
     }
 
@@ -210,6 +248,11 @@ impl Session {
 
     pub fn sampling(&self) -> &Sampling {
         &self.sampling
+    }
+
+    /// What this session has cost so far, in tokens.
+    pub fn usage(&self) -> Usage {
+        self.usage
     }
 
     /// Every reasoning block the model has produced, for persistence.
@@ -296,6 +339,12 @@ impl Session {
                 }
                 result = self.complete(events) => result?,
             };
+
+            // Bill it. Recorded before anything can fail below, because a
+            // completion that arrived was paid for whether or not it parsed.
+            self.usage.requests += 1;
+            self.usage.prompt_tokens += completion.prompt_tokens;
+            self.usage.completion_tokens += completion.completion_tokens;
 
             // Capture the reasoning *here*, not in the UI. The panel clears it
             // between turns and never had the whole of it anyway; this is the

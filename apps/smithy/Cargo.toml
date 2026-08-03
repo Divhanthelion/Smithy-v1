@@ -15,6 +15,7 @@ smithy-editor.workspace = true
 smithy-agent.workspace = true
 smithy-tools.workspace = true
 smithy-project.workspace = true
+sysinfo.workspace = true
 smithy-voice.workspace = true
 floem.workspace = true
 tokio.workspace = true

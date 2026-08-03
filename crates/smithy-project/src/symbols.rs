@@ -90,6 +90,10 @@ pub struct Symbol {
     pub file: String,
     /// 1-based, so it can be pasted into an editor or a `read` offset.
     pub line: usize,
+    /// 0-based column. Only ever used to order declarations that share a line —
+    /// `enum Dir { N, S, E, W }` is one line and four variants, and without this
+    /// they come back in hash order, which is to say differently each run.
+    pub column: usize,
     pub is_public: bool,
 }
 
@@ -196,7 +200,7 @@ impl SymbolIndex {
                 s.kind == SymbolKind::Variant && s.container.as_deref() == Some(enum_name)
             })
             .collect();
-        variants.sort_by_key(|s| s.line);
+        variants.sort_by_key(|s| (s.line, s.column));
         variants
     }
 
@@ -208,7 +212,7 @@ impl SymbolIndex {
             .flatten()
             .filter(|s| s.kind == SymbolKind::Method && s.container.as_deref() == Some(type_name))
             .collect();
-        methods.sort_by_key(|s| s.line);
+        methods.sort_by_key(|s| (s.line, s.column));
         methods
     }
 
@@ -459,6 +463,7 @@ fn make(
         file: file.to_string(),
         // tree-sitter rows are 0-based; editors and `read` offsets are not.
         line: node.start_position().row + 1,
+        column: node.start_position().column,
         is_public: has_visibility(node, source),
     }
 }

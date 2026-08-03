@@ -14,6 +14,7 @@ use smithy_editor::{
 mod agent;
 mod app_state;
 mod editor;
+mod meters;
 mod runtime;
 mod settings;
 mod terminal;
@@ -111,6 +112,15 @@ fn app_view() -> impl IntoView {
     // live on disk, and this is only what the form is currently showing.
     let settings_state = smithy_editor::SettingsState::new();
     let settings_dir = agent_state.registry.data_dir().to_path_buf();
+
+    // The project map, shown behind the shortcuts when no file is open.
+    //
+    // The same text the agent gets as its project context — layout, dependencies,
+    // module paths, public API — so an empty editor answers "what is in this
+    // repository?" instead of only listing keyboard shortcuts. Extracted off the
+    // UI thread because it shells out to `cargo metadata` and parses the tree.
+    let project_map = agent_state.project_map;
+    refresh_project_map(&agent_state, project_map);
 
     // The open editor, declared before the file watcher because the watcher's
     // effect needs it: an external change is only interesting for the file
@@ -350,6 +360,7 @@ fn app_view() -> impl IntoView {
             move || external_change.set(None),
         ),
         Container::new(editor_component.view(
+            project_map,
             signals.active_buffer,
             app_state.buffer_manager.clone(),
             open_editor,
@@ -797,7 +808,42 @@ fn app_view() -> impl IntoView {
     // passed, so something has to tell it. Seconds are shown, so a minute tick
     // would leave it wrong for fifty-nine of every sixty.
     let clock_tick = smithy_editor::tick::every(std::time::Duration::from_secs(1));
-    let menu_view = smithy_editor::menu_bar(menu_state, menus.clone(), clock_visible, clock_tick);
+    // The top-right meters. Two independent cadences: memory is a local read
+    // every few seconds, the account balance is a network call every few
+    // minutes. Sharing one tick would either hammer the provider or make the
+    // memory figure useless.
+    let status = smithy_editor::StatusReadout::new();
+    {
+        let meter_tick = smithy_editor::tick::every(meters::MEMORY_INTERVAL);
+        let balance_cache = agent_state.balance.clone();
+        let panel = agent_state.panel;
+        let session = agent_state.session.clone();
+        let settings_dir = settings_dir.clone();
+
+        floem::reactive::Effect::new(move |_| {
+            meter_tick.get();
+
+            let sample = meters::sample_memory();
+            status.memory.set(sample.render());
+            status.memory_warn.set(sample.is_heavy());
+
+            // Cost is derived from what the *panel* already knows about the
+            // model plus what the session has been billed, so it costs nothing
+            // to recompute on every tick.
+            let spend = meters::spend_now(
+                &settings_dir,
+                &panel.model_label.get_untracked(),
+                &session,
+                &balance_cache,
+            );
+            status.spend.set(spend.render());
+            status.spend_warn.set(spend.is_low());
+        });
+    }
+    meters::spawn_balance_poller(agent_state.clone(), settings_dir.clone());
+
+    let menu_view =
+        smithy_editor::menu_bar(menu_state, menus.clone(), clock_visible, clock_tick, status);
     let menu_overlay = smithy_editor::menu_overlay(menu_state, menus);
 
     // Use standardized main layout
@@ -1311,6 +1357,43 @@ fn shell_approval_modal(
     })
 }
 
+/// Rebuild the project map shown behind an empty editor.
+///
+/// On a worker: the extraction shells out to `cargo metadata` and parses every
+/// source file with tree-sitter, which is not something to do between a click
+/// and a repaint. The result crosses back through a channel because floem's
+/// signals are not `Send`.
+///
+/// Sized generously — this is read by a person on a screen, not prefilled into a
+/// prompt, so the token budget that governs the agent's copy does not apply.
+fn refresh_project_map(agent: &app_state::AgentState, map: floem::reactive::RwSignal<String>) {
+    let project = agent.project.borrow().clone();
+    let (tx, rx) = crossbeam_channel::bounded::<String>(1);
+
+    runtime::tokio_runtime().spawn(async move {
+        let rendered = tokio::task::spawn_blocking(move || {
+            project
+                .context(smithy_project::ContextBudget::from_tokens(24_000))
+                .rendered
+        })
+        .await
+        .unwrap_or_default();
+        let _ = tx.send(rendered);
+    });
+
+    // The bridge delivers `Option<T>`, so it lands in a staging signal and an
+    // effect copies the value across. One value, delivered once — the coalescing
+    // that makes `update_signal_from_channel` unsafe for streams is harmless
+    // here.
+    let staged = floem::reactive::RwSignal::new(None::<String>);
+    floem::ext_event::update_signal_from_channel(staged.write_only(), rx);
+    floem::reactive::Effect::new(move |_| {
+        if let Some(rendered) = staged.get() {
+            map.set(rendered);
+        }
+    });
+}
+
 /// Ask for a directory, then ground the agent in it.
 fn open_project_dialog(agent: &app_state::AgentState) {
     let Some(dir) = smithy_editor::file_dialog::pick_folder() else {
@@ -1397,6 +1480,9 @@ fn switch_project(agent: &app_state::AgentState, root: std::path::PathBuf) {
     // in — the same class of mistake `review.abandon` above exists to prevent.
     agent.panel.clear_attachments();
     agent.panel.project_root.set(project.root.clone());
+    // The map behind an empty editor belongs to the project, so it moves too.
+    agent.project_map.set(String::new());
+    refresh_project_map(agent, agent.project_map);
     agent
         .panel
         .model_label

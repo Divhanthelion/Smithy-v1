@@ -629,7 +629,51 @@ pub fn external_change_bar(
 }
 
 /// Placeholder shown when no file is open.
-pub fn empty_editor() -> impl IntoView {
+/// The empty-editor view, with the project map behind the shortcuts.
+///
+/// `map` is the same text the agent is given as its project context — crate
+/// layout, dependencies, module paths, public API. Showing it here costs nothing
+/// (it is already built for the session) and answers the question an empty
+/// editor otherwise leaves hanging: *what is in this repository?*
+///
+/// It is set as a backdrop rather than the content: dimmed, monospaced,
+/// scrollable, and behind the shortcut list, so the pane still reads as "nothing
+/// open" at a glance while being useful if you look.
+pub fn empty_editor_with_map(map: RwSignal<String>) -> impl IntoView {
+    Stack::new((
+        // The map, filling the pane behind everything.
+        floem::views::scroll::Scroll::new(
+            Label::derived(move || map.get()).style(|s| {
+                s.font_family(design::MONO.to_string())
+                    .font_size(design::TEXT_XS)
+                    .line_height(1.5)
+                    .color(design::FG_GHOST)
+                    .padding(design::SPACE_5)
+                    .width_full()
+            }),
+        )
+        .style(move |s| {
+            s.absolute()
+                .inset(0.0)
+                .width_full()
+                .height_full()
+                .min_width(0.0)
+                .apply_if(map.get().trim().is_empty(), |s| {
+                    s.display(floem::taffy::Display::None)
+                })
+        }),
+        // The shortcuts, floating over it. `shortcut_list` rather than
+        // `empty_editor`, because that one paints an opaque background and
+        // would hide the very thing this function exists to show.
+        Container::new(shortcut_list()).style(|s| {
+            s.absolute().inset(0.0).items_center().justify_center()
+        }),
+    ))
+    .style(|s| s.width_full().height_full().background(design::BG_BASE))
+}
+
+/// Just the shortcut list, with no background of its own.
+fn shortcut_list() -> impl IntoView {
     // `design::SYMBOL`, not the bare generic. These keycaps did render as
     // missing-glyph boxes, but dropping the family was the wrong fix and did not
     // help: the generic `monospace` resolved to Courier, which has no ⌘ (U+2318)
@@ -671,7 +715,12 @@ pub fn empty_editor() -> impl IntoView {
         // what the handler matches.
         shortcut("⌃`".to_string(), "toggle the terminal"),
     ))
-    .style(|s| {
+    .style(|s| s.items_center().justify_center())
+}
+
+/// The empty-editor pane with no project map behind it.
+pub fn empty_editor() -> impl IntoView {
+    Container::new(shortcut_list()).style(|s| {
         s.width_full()
             .height_full()
             .items_center()

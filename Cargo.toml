@@ -108,6 +108,11 @@ keyring = "4.1"
 # something surprising.
 html2text = "0.17"
 
+# Process memory, for the menu-bar meter. Reading another process's RSS is
+# per-platform mach/proc work, and a rust-analyzer sitting on five gigabytes is
+# worth seeing rather than worth hand-rolling.
+sysinfo = { version = "0.37", default-features = false, features = ["system"] }
+
 rayon = "1.10"
 
 # --- Filesystem / search ---
