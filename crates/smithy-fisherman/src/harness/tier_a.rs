@@ -393,16 +393,22 @@ fn does_not_teleport() -> CheckResult {
 
     let day_ok = max_day < MAX_DELTA_PER_SECOND;
     let build_ok = max_build < MAX_BUILD_DELTA_PER_SECOND;
-    let measured = max_day.max(max_build);
+    // Report utilisation of each budget (1.0 = at the limit). Measured is the
+    // worse of the two so a single number cannot look green while one clock
+    // is over — the previous report put build's absolute Δ next to the day's
+    // limit and read as a contradiction.
+    let day_util = max_day / MAX_DELTA_PER_SECOND;
+    let build_util = max_build / MAX_BUILD_DELTA_PER_SECOND;
+    let measured = day_util.max(build_util);
     CheckResult {
         name: "does_not_teleport",
         tier: "A",
         pass: day_ok && build_ok,
         measured,
-        threshold: Some(MAX_DELTA_PER_SECOND),
+        threshold: Some(1.0),
         detail: format!(
-            "day max |Δ|/s={max_day:.6} at {at_day} (lim {MAX_DELTA_PER_SECOND:.6}); \
-             build max |Δ|/s={max_build:.6} at {at_build} (lim {MAX_BUILD_DELTA_PER_SECOND:.6})"
+            "day max |Δ|/s={max_day:.6} at {at_day} (lim {MAX_DELTA_PER_SECOND:.6}, util {day_util:.3}); \
+             build max |Δ|/s={max_build:.6} at {at_build} (lim {MAX_BUILD_DELTA_PER_SECOND:.6}, util {build_util:.3})"
         ),
         flips: vec![],
     }
