@@ -22,5 +22,14 @@ CODEBASE_DUMP.txt
 
 # Finder.
 .DS_Store
+
+# Screenshots and rendered sheets, which are generated and large.
+#
+# Golden images are the exception: they are the *specification* for a rendered
+# view, they are reviewed in the diff like code, and a blanket `*.png` swallows
+# them silently — they appear to work locally and are simply absent for everyone
+# else. Any `tests/golden/` tree is therefore kept.
 *.png
+!**/tests/golden/**/*.png
+
 script.sh
