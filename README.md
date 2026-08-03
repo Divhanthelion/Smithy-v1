@@ -477,7 +477,7 @@ or LSP layer, the output from the relevant debug flag above.
 ## Building on it
 
 ```bash
-cargo test --workspace     # 947 passing
+cargo test --workspace     # 950 passing
 cargo build --workspace    # 0 warnings, and it stays 0
 cargo clippy --workspace --all-targets
 ```

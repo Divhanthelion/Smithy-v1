@@ -5,10 +5,10 @@
 //! deleting the check.
 
 use crate::fisherman::{
-    self as f, face_for, position_for, scene_at, stage_layout, window_light, Scene, ARRIVAL,
-    BUILD_SECONDS, HANDOVER,
+    self as f, door_openness, face_for, position_for, scene_at, stage_layout, window_light, Scene,
+    ARRIVAL, BUILD_SECONDS, HANDOVER,
 };
-use crate::routine::WALK_SECONDS;
+use crate::routine::{Doing, Place, WALK_SECONDS};
 
 use super::raster::{self, is_bg, render_scene};
 use super::report::{CheckResult, FacingFlip};
@@ -48,6 +48,14 @@ pub const MAX_BUILD_DELTA_PER_SECOND: f64 =
 /// Epsilon below which a leftward Δ is ignored (float noise, not a step).
 const MOONWALK_EPS: f64 = 1e-6;
 
+/// Max |Δ| per second for `window_light` / `door_open`.
+///
+/// Door openness is the fastest intentional cue: it eases open over the
+/// arrival beat (`1 − ARRIVAL` of a walk) under smoothstep, whose max
+/// derivative is 1.5× linear. Same derivation as [`MAX_DELTA_PER_SECOND`].
+/// The midnight lamp flare jumped 0.450 in one second — well above this.
+pub const MAX_LIGHT_DELTA_PER_SECOND: f64 = 1.5 / ((1.0 - ARRIVAL) * WALK_SECONDS);
+
 pub fn run_all() -> Vec<CheckResult> {
     vec![
         he_stays_on_the_rail(),
@@ -56,6 +64,7 @@ pub fn run_all() -> Vec<CheckResult> {
         right_size(),
         does_not_teleport(),
         does_not_moonwalk(),
+        lighting_continuity(),
         facing_continuity(),
     ]
 }
@@ -370,8 +379,10 @@ fn does_not_teleport() -> CheckResult {
 }
 
 fn does_not_moonwalk() -> CheckResult {
-    // Whenever Δposition < −ε, facing must be < 0. The loaded-trip bug,
-    // generalised past the two cases with unit tests.
+    // Whenever Δposition < −ε, facing must be < 0. Trip-boundary lookback
+    // and the HANDOVER stillness case both lived here — 29 frames, left
+    // red on purpose until face_for clamped trips and looked into the
+    // last outbound at handover.
     let mut violations = 0u64;
     let mut prev_along = position_of(&sample_scene(0.0, launched_built(), 0));
 
@@ -387,9 +398,6 @@ fn does_not_moonwalk() -> CheckResult {
         prev_along = along;
     }
 
-    // Build phase at fine steps — the original loaded-trip lived here.
-    // Record the completions: "29 steps" says it is broken; the list of
-    // trip boundaries tells the next branch where to look.
     let steps = 2_000u64;
     let mut build_completions: Vec<f64> = Vec::new();
     let mut prev_along = position_of(&sample_scene(10.0, 0.0, 0));
@@ -407,8 +415,6 @@ fn does_not_moonwalk() -> CheckResult {
         prev_along = along;
     }
 
-    // Collapse near-duplicates so the detail names trip boundaries rather
-    // than dumping 29 almost-equal floats. 0.001 ≈ two harness steps.
     let mut boundaries: Vec<f64> = Vec::new();
     for &c in &build_completions {
         if boundaries
@@ -432,13 +438,97 @@ fn does_not_moonwalk() -> CheckResult {
         measured: violations as f64,
         threshold: Some(0.0),
         detail: format!(
-            "{violations} steps with Δposition < 0 while facing ≥ 0 \
-             (build trip-boundary lookback is a known red if non-zero — \
-             face_for subtracts 0.004 completion and can see the previous trip); \
-             completions: [{boundary_list}]"
+            "{violations} steps with Δposition < 0 while facing ≥ 0; \
+             build completions: [{boundary_list}]"
         ),
         flips: vec![],
     }
+}
+
+fn lighting_continuity() -> CheckResult {
+    // Same shape as does_not_teleport, for window_light and door_open —
+    // but only *within* a (doing, place) stretch. Door snaps open at the
+    // first frame of a leaving walk and shut when an arriving walk ends;
+    // the waking lamp steps from 0 to 0.75. Those are block seams, not
+    // discontinuities. The midnight lamp flare was Sleeping/Hut on both
+    // sides with progress resetting — same doing+place, so it still trips.
+    //
+    // Sample across midnight with the day seed rolling — a single DAY-0
+    // sweep never compares 23:59 to 00:00.
+    let mut max_lamp = 0.0;
+    let mut max_door = 0.0;
+    let mut at_lamp = 0u64;
+    let mut at_door = 0u64;
+
+    let mut prev_scene = sample_at_abs(0);
+    let mut prev = light_of(&prev_scene);
+    // 36 h: one full day plus the morning after, so the seam is inside.
+    for sec in 1..(86_400u64 + 12 * 3600) {
+        let scene = sample_at_abs(sec);
+        let now = light_of(&scene);
+        let same_stretch =
+            scene.doing == prev_scene.doing && scene.place == prev_scene.place;
+        if same_stretch {
+            let d_lamp = (now.0 - prev.0).abs();
+            let d_door = (now.1 - prev.1).abs();
+            if d_lamp > max_lamp {
+                max_lamp = d_lamp;
+                at_lamp = sec;
+            }
+            if d_door > max_door {
+                max_door = d_door;
+                at_door = sec;
+            }
+        }
+        prev = now;
+        prev_scene = scene;
+    }
+
+    let lamp_ok = max_lamp < MAX_LIGHT_DELTA_PER_SECOND;
+    let door_ok = max_door < MAX_LIGHT_DELTA_PER_SECOND;
+    let util = (max_lamp / MAX_LIGHT_DELTA_PER_SECOND).max(max_door / MAX_LIGHT_DELTA_PER_SECOND);
+    CheckResult {
+        name: "lighting_continuity",
+        tier: "A",
+        pass: lamp_ok && door_ok,
+        measured: util,
+        threshold: Some(1.0),
+        detail: format!(
+            "within-stretch lamp max |Δ|/s={max_lamp:.6} at {at_lamp}s; \
+             door max |Δ|/s={max_door:.6} at {at_door}s \
+             (lim {MAX_LIGHT_DELTA_PER_SECOND:.6}; block seams excluded)"
+        ),
+        flips: vec![],
+    }
+}
+
+/// Scene at an absolute second from local midnight of [`DAY`], day seed rolling.
+fn sample_at_abs(sec: u64) -> Scene {
+    let hours_abs = sec as f64 / 3600.0;
+    let day = DAY + (hours_abs / 24.0).floor() as i64;
+    let hours = hours_abs.rem_euclid(24.0);
+    scene_at(
+        WIDTH,
+        height(),
+        BAND,
+        hours,
+        SUNRISE,
+        SUNSET,
+        day,
+        launched_built(),
+        sec,
+    )
+}
+
+fn light_of(scene: &Scene) -> (f64, f64) {
+    let lamp = window_light(scene.doing, scene.place, scene.progress);
+    let door = if scene.completion < 1.0 {
+        let handover = ((scene.completion - HANDOVER) / (1.0 - HANDOVER)).clamp(0.0, 1.0);
+        door_openness(Doing::Walking, scene.place, Place::Garden, handover)
+    } else {
+        door_openness(scene.doing, scene.place, scene.previous, scene.progress)
+    };
+    (lamp, door)
 }
 
 fn facing_continuity() -> CheckResult {

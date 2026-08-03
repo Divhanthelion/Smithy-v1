@@ -19,7 +19,9 @@ and now renders the drawing code itself, with automated checks, contact sheets
 and a blessed golden. **The context audit** was written and nothing in it has
 been implemented; that is the largest untouched item in the tree.
 
-The harness found two production bugs on its first runs. Neither is fixed.
+The harness found two production bugs on its first runs. Both are fixed on
+`fisherman/tuning` (moonwalk + midnight lamp); Tier A/B now gate `cargo test`
+behind the harness feature.
 
 ---
 
@@ -41,7 +43,7 @@ The harness found two production bugs on its first runs. Neither is fixed.
   colour. **Do not re-add a workflow** without first confirming Actions can
   start.
 
-  Consequence worth carrying: every "947 green, zero warnings" in this
+  Consequence worth carrying: every "950 green, zero warnings" in this
   document was verified by running the commands, not by any automation that
   ran on its own.
 - `AGENTS.md` — the entry point that did not exist. Crate map, build commands,
@@ -74,7 +76,7 @@ drawing him **facing right always** (it hardcoded `came_from = Garden`), and
 **standing on the rail during Reading and Sleeping** when he should have been
 inside the hut.
 
-### 2.3 The harness — PR #2, **OPEN, ready to merge** (`9d928cc`)
+### 2.3 The harness — PR #2, **merged** (`c026ef0`)
 
 `cargo run -p smithy-fisherman --example sheets --features harness` →
 `target/fisherman/`.
@@ -103,56 +105,48 @@ path keeps AA.
 
 ---
 
-## 3. Two production bugs, found by the harness, **not fixed**
+## 3. Two production bugs — fixed on `fisherman/tuning`
 
-Both are in shipping code. Both belong to the next branch.
+### 3.1 Moonwalk at plank-trip boundaries — `does_not_moonwalk`, was 29, now 0
 
-### 3.1 Moonwalk at plank-trip boundaries — `does_not_moonwalk`, red, 29 frames
+`face_for` clamps lookback to the current trip's start so it cannot see the
+previous inbound. At `HANDOVER` it looks *into* the last outbound instead of
+clamping to stillness (a second, distinct case). Guarded by unit tests and
+by the harness check (now green; threshold unchanged).
 
-`face_for` subtracts 0.004 completion and can see the *previous* trip, so at
-each trip boundary he walks one way while facing the other. Pre-existing:
-`build_position((completion - 0.004).max(0.0))` is in `ad36a3a`, before any of
-this work. Completions: `0.1115, 0.1125, 0.2225, 0.2235, … 0.8895, 0.8905,
-0.9000`. Note the last one is `HANDOVER`, not a trip — a second, distinct case.
+### 3.2 Midnight lamp flare — fixed
 
-**Left red deliberately. Do not widen the threshold.**
-
-### 3.2 Midnight lamp flare — no check catches it yet
-
-Sleep spans midnight, but `routine::at` works in hours-since-local-midnight, so
-at 00:00 the block rebuilds with `start = 0.0` and progress resets `0.900 → 0`.
-`window_light` reads that as "just went to bed" and lights the lamp:
-
-```
-23.75  Sleeping  start 21.500  prog 0.900  lamp 0.000
- 0.00  Sleeping  start  0.000  prog 0.000  lamp 0.450   <-- flare
- 0.25  Sleeping  start  0.000  prog 0.042  lamp 0.000
-```
-
-Found by eye on `day.png`, then confirmed by probe. The harness could not have
-caught it: **the day sweep never crosses midnight** — it renders 96 tiles of
-`DAY` 0, so the seam between one day and the next is the one seam it never
-looks at.
+`routine::sleep_progress` treats overnight sleep as one night across the
+midnight split. `window_light` no longer sees progress 0 at 00:00.
+Measured after: lamp stays 0.000 across 23:45 / 00:00 / 00:15.
+`lighting_continuity` (within-stretch, day seed rolling) would catch a
+regression; `midnight.png` is the eyes artifact.
 
 ---
 
-## 4. Next branch — `fisherman/tuning`
+## 4. This branch — `fisherman/tuning`
 
-In order. Everything here came out of the harness rather than out of guessing.
+Done, in order:
 
-1. **Fix §3.1** (both cases: trip boundaries *and* the handover at 0.9000).
-2. **Fix §3.2.**
-3. **Day strip across midnight** — sample ~21:00 to ~03:00 with the day seed
-   rolling, as its own artifact.
-4. **Lighting-continuity check** — same shape as `does_not_teleport`, but for
-   `window_light` and `door_open`: flag any 1-second step where either jumps
-   more than a threshold. §3.2 would have been caught by a number instead of an
-   eye.
-5. **Promote Tier A/B into `cargo test`** behind the `harness` feature, so a
-   regression cannot land silently. **Not before 1 and 2** — CI would go red on
-   a scheduled fix. The note is already in `harness/mod.rs`.
-6. **Then tune.** This is the first stretch where "does it look good" is the
-   only open question, because everything a number can answer now has a number.
+1. §3.1 moonwalk (trip boundaries + handover).
+2. §3.2 midnight lamp.
+3. Day strip across midnight → `midnight.png`.
+4. `lighting_continuity` check (block seams excluded; within-stretch bound
+   is the door's analytical peak).
+5. Tier A/B promoted to `cargo test` behind `harness`
+   (`tests/harness_checks.rs`).
+6. First tune pass: build sheet samples mid-outbound trips so the carry
+   reads (equal completion steps had him idle at the lumber every row).
+   Pose/timing feel still open — numbers cannot answer those.
+
+```bash
+cargo test --workspace                                          # 950, ~10s
+cargo build --workspace --all-targets                           # 0 warnings
+cargo run -p smithy-fisherman --example sheets --features harness
+cargo run -p smithy --release
+```
+
+`report.json` before any PNG. Currently 11 pass / 0 fail / 1 report-only.
 
 ---
 
@@ -214,7 +208,7 @@ Everything else is in `AGENTS.md`. New:
 ## 8. Commands
 
 ```bash
-cargo test --workspace                                          # 947, ~10s
+cargo test --workspace                                          # 950, ~10s
 cargo build --workspace --all-targets                           # 0 warnings
 cargo run -p smithy-fisherman --example sheets --features harness
 cargo run -p smithy --release

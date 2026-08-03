@@ -119,6 +119,86 @@ pub fn day_sheet(out_dir: &std::path::Path) {
     sheet.save(&out_dir.join("day.png"));
 }
 
+/// ~21:00 through ~03:00 with the day seed rolling — the seam the day sheet
+/// never looks at.
+///
+/// The ordinary day sweep is 96 tiles of [`DAY`] 0, so midnight is only ever
+/// an endpoint. The lamp flare lived on the other side of that endpoint.
+pub fn midnight_sheet(out_dir: &std::path::Path) {
+    const PAD: u32 = 8;
+    // 21:00 → 03:00 inclusive at 15-minute steps: 6 h → 25 tiles.
+    let start_hour = 21.0;
+    let tiles = 25u32;
+
+    let mut crops: Vec<(String, PixmapInk, u32, u32, u32, u32)> = Vec::with_capacity(tiles as usize);
+    let mut cell_w = 1u32;
+    let mut cell_h = 1u32;
+
+    for i in 0..tiles {
+        let hours_abs = start_hour + (i as f64) * 0.25;
+        let day = DAY + (hours_abs / 24.0).floor() as i64;
+        let hours = hours_abs.rem_euclid(24.0);
+        let scene = scene_at(
+            WIDTH,
+            height(),
+            BAND,
+            hours,
+            SUNRISE,
+            SUNSET,
+            day,
+            launched_built(),
+            (hours_abs * 18000.0) as u64,
+        );
+        let rendered = render_tile(&scene);
+        let (x0, y0, x1, y1) = rendered
+            .part_bounds(crate::Part::Figure)
+            .or_else(|| rendered.part_bounds(crate::Part::Hut))
+            .or_else(|| rendered.content_bounds())
+            .unwrap_or((0, 0, 1, 1));
+        let rail_top = (scene.height - scene.band).floor().max(0.0) as u32;
+        let y0 = y0.min(rail_top);
+        let y1 = y1.max(rendered.height().saturating_sub(1));
+        let cx0 = x0.saturating_sub(PAD);
+        let cy0 = y0.saturating_sub(PAD);
+        let cx1 = (x1 + PAD).min(rendered.width() - 1);
+        let cy1 = (y1 + PAD).min(rendered.height() - 1);
+        let cw = cx1 - cx0 + 1;
+        let ch = cy1 - cy0 + 1;
+        cell_w = cell_w.max(cw);
+        cell_h = cell_h.max(ch);
+
+        let h = hours.floor() as u32;
+        let m = ((hours.fract() * 60.0).round() as u32) % 60;
+        let label = format!(
+            "D{day} {} {:02}:{:02}",
+            doing_label(scene.doing),
+            h,
+            m
+        );
+        crops.push((label, rendered, cx0, cy0, cw, ch));
+    }
+
+    let label_h = 12u32;
+    let tile_w = cell_w;
+    let tile_h = cell_h + label_h;
+    let gap = 4u32;
+    // One row — a strip, so the midnight seam is a neighbour pair.
+    let sheet_w = tiles * tile_w + (tiles - 1) * gap;
+    let sheet_h = tile_h;
+    let mut sheet = PixmapInk::new(sheet_w, sheet_h, STEEL_DEEP);
+
+    for (i, (label, rendered, cx0, cy0, cw, ch)) in crops.into_iter().enumerate() {
+        let i = i as u32;
+        let ox = i * (tile_w + gap);
+        let dx = ox + (tile_w - cw) / 2;
+        let dy = label_h + (cell_h - ch) / 2;
+        sheet.blit_from(&rendered, cx0, cy0, cw, ch, dx, dy);
+        draw_label(&mut sheet, ox as i32 + 2, 2, &label, 1);
+    }
+
+    sheet.save(&out_dir.join("midnight.png"));
+}
+
 /// All 12 Doing states in place with props and lighting (1× — the golden).
 pub fn scenes_sheet(out_dir: &std::path::Path) {
     scenes_sheet_at(out_dir, BAND, "scenes.png", 2);
@@ -187,7 +267,13 @@ fn scenes_sheet_at(out_dir: &std::path::Path, band: f64, name: &str, label_scale
 
 /// Hut going up across BUILD_SECONDS.
 pub fn build_sheet(out_dir: &std::path::Path) {
-    let frames = 10u32;
+    use crate::fisherman::{BUILD_TRIPS, HANDOVER};
+
+    // One mid-outbound frame per plank trip, then handover, then done.
+    // Equal completion steps used to land on trip boundaries — he stood at
+    // the lumber every row and the sheet read as "hut grows, man idle."
+    let trip_frames = BUILD_TRIPS as u32; // 9
+    let frames = trip_frames + 2; // + handover + finished
     let tile_w = WIDTH as u32;
     let tile_h = height() as u32;
     let gap = 4u32;
@@ -198,8 +284,13 @@ pub fn build_sheet(out_dir: &std::path::Path) {
     );
 
     for i in 0..frames {
-        let t = i as f64 / (frames - 1) as f64;
-        let completion = t;
+        let completion = if i < trip_frames {
+            ((i as f64 + 0.25) / BUILD_TRIPS).min(HANDOVER - 1e-4)
+        } else if i == trip_frames {
+            HANDOVER + (1.0 - HANDOVER) * 0.4
+        } else {
+            1.0
+        };
         let launched = completion * BUILD_SECONDS;
         let oy = (i * (tile_h + gap)) as f64;
         // Daytime outdoor block so the routine isn't asleep while he builds.

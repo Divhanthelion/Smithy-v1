@@ -43,3 +43,8 @@ required-features = ["harness"]
 name = "harness_goldens"
 path = "tests/harness_goldens.rs"
 required-features = ["harness"]
+
+[[test]]
+name = "harness_checks"
+path = "tests/harness_checks.rs"
+required-features = ["harness"]

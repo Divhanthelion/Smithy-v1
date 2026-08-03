@@ -847,6 +847,18 @@ pub fn position_for(
 /// monotonic stretch; at the start of a settled activity the lookback clamps
 /// to the block's own progress, so he does not inherit the walk that
 /// delivered him (see the test that guards this).
+///
+/// Build trips are the same idea with a sharper edge. Each plank trip is a
+/// there-and-back; subtracting a fixed completion delta across a trip
+/// boundary lands in the *previous* trip's inbound, so he walks out loaded
+/// while still facing the empty return — the moonwalk `does_not_moonwalk`
+/// counted at 29 frames. Clamp the lookback to the current trip's start.
+///
+/// Handover is the opposite seam: looking *into* the last build trip is
+/// what keeps him facing the way he was going until he actually turns for
+/// the walk home. Clamping handover lookback to `HANDOVER` made stillness
+/// read as facing right at completion 0.9000 while the last outbound step
+/// was still landing — a second, distinct moonwalk.
 pub fn face_for(
     previous: Place,
     place: Place,
@@ -857,11 +869,21 @@ pub fn face_for(
     let building = completion < 1.0;
     let (doing_now, along) = position_for(previous, place, doing, progress, completion);
     let a_moment_ago = if building && completion < HANDOVER {
-        build_position((completion - 0.004).max(0.0))
+        // Stay inside this plank trip. Crossing into the previous one is
+        // exactly the loaded-trip moonwalk.
+        let trip_start = (completion * BUILD_TRIPS).floor() / BUILD_TRIPS;
+        build_position((completion - 0.004).max(trip_start))
     } else if building {
-        let handover = ((completion - HANDOVER - 0.004) / (1.0 - HANDOVER)).clamp(0.0, 1.0);
-        let from = build_position(HANDOVER);
-        from + (place_position(place) - from) * ease((handover / ARRIVAL).min(1.0))
+        let lookback_c = completion - 0.004;
+        if lookback_c < HANDOVER {
+            // Still see the last outbound — do not invent a turn until the
+            // handover walk itself moves him.
+            build_position(lookback_c.max(0.0))
+        } else {
+            let handover = ((lookback_c - HANDOVER) / (1.0 - HANDOVER)).clamp(0.0, 1.0);
+            let from = build_position(HANDOVER);
+            from + (place_position(place) - from) * ease((handover / ARRIVAL).min(1.0))
+        }
     } else {
         // Clamped: progress 0 stays inside this block. The old code subtracted
         // a wall-clock second and asked the routine, which at a block boundary
@@ -1698,6 +1720,32 @@ mod tests {
         assert!(
             turns >= PLANKS,
             "{turns} turns over {PLANKS} planks — he is walking one way backwards"
+        );
+    }
+
+    /// Lookback across a plank-trip boundary used to see the previous inbound,
+    /// so the first frames of each outbound were faced the wrong way.
+    #[test]
+    fn a_plank_trip_does_not_inherit_the_previous_trips_facing() {
+        // Just after the first trip boundary: outbound (left), must face left.
+        let completion = 1.0 / BUILD_TRIPS + 0.001;
+        let face = face_for(Place::Garden, Place::Garden, Doing::Walking, 0.0, completion);
+        assert_eq!(
+            face, -1.0,
+            "at completion {completion:.4} (start of trip 1) he faced {face} — \
+             lookback still saw the previous inbound"
+        );
+    }
+
+    /// At `HANDOVER` the lookback used to clamp into the handover walk at
+    /// progress 0, stillness faced right, and the last outbound step was
+    /// still landing leftward.
+    #[test]
+    fn handover_keeps_the_last_outbound_facing_until_he_turns() {
+        let face = face_for(Place::Perch, Place::Perch, Doing::Fishing, 0.5, HANDOVER);
+        assert_eq!(
+            face, -1.0,
+            "at HANDOVER he faced {face} — stillness at the seam invented a turn"
         );
     }
 
