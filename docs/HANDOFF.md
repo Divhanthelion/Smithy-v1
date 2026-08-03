@@ -31,6 +31,16 @@ The harness found two production bugs on its first runs. Neither is fixed.
   Linux: `smithy-voice` uses `candle-core` with the `accelerate` feature).
   Build gated at zero warnings; **clippy reports but does not gate**, with its
   ten findings enumerated and instructions to flip the ratchet.
+
+  > **CI has never actually run.** Every workflow run since the first has
+  > failed in 4–6 seconds with *"the job was not started because your account
+  > is locked due to a billing issue"* — an account-level Actions lock, not
+  > anything in this repo (which is public, so runner minutes are free). The
+  > workflow itself is untested as a result. **Every "947 green, zero
+  > warnings" in this document was verified by running it locally, not by
+  > CI.** Until the lock is cleared at github.com/settings/billing, treat the
+  > red check on a PR as "CI could not start" and verify locally before
+  > merging.
 - `AGENTS.md` — the entry point that did not exist. Crate map, build commands,
   house conventions, landmines.
 - `.gitignore` — blanket `*.png` was swallowing golden images. Now
