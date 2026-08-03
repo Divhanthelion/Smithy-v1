@@ -246,10 +246,33 @@ That is exactly the failure mode this design exists to prevent, caught because a
 number looked wrong rather than because a test failed. The four buckets now sum
 to the reference count exactly, and a test enforces it.
 
-### 4. Persistence
-Write, load, hash-check, refresh.
-**Done when:** the graph survives a restart, and editing one file marks exactly
-that file's nodes stale.
+### 4. Persistence — **done**
+`save`/`load` (write-then-rename, schema-versioned), per-file content hashing,
+and `staleness(root)` returning changed / added / deleted.
+
+This workspace's graph: **408 KB, 59 KB gzipped** for 2,221 nodes and 3,908
+edges, against 5.12 GB resident — the ~13,000× ratio that made "just write it to
+a file" the right instinct.
+
+Verified live: appending one line to `scip.rs` reported
+`1 changed since indexing` naming that file; reverting it reported `current`
+again. Content hashing rather than mtime is what makes the second half true — a
+`cargo fmt` or a save with no edit must not mark the tree stale.
+
+FNV-1a, not `DefaultHasher`, whose output is explicitly not stable across Rust
+releases. A hash written to disk that changes meaning on a toolchain upgrade
+would silently invalidate every cached graph. It is also already what
+`registry::project_key` uses, so there is one hash in the codebase rather than
+two.
+
+**A mistake worth recording, because it was my own documented warning.** The
+first save built `sources` from the graph's *nodes*. Files containing only
+`pub mod` declarations or constants produce no nodes, so seven of them —
+`lib.rs`, `theme.rs`, `mod.rs`, `error.rs` — vanished from the record and
+promptly reported as *newly added* on the next check. The `sources` doc comment
+says in as many words that files with no functions must be recorded too. Sources
+now come from the documents the **indexer** saw, never from the nodes: 107 files
+→ 114.
 
 ### 5. Rendering
 floem `canvas` — precedent exists in `celestial.rs` and `squiggle.rs`.

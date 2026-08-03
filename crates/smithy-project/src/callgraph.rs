@@ -101,12 +101,85 @@ pub struct BuildStats {
     pub locals: usize,
 }
 
+/// What the persisted format is. Bumped when the shape changes, so a graph
+/// written by a future version is discarded rather than misread.
+pub const SCHEMA_VERSION: u32 = 1;
+
 /// A resolved call graph.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CallGraph {
+    #[serde(default)]
+    pub version: u32,
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
     pub stats: BuildStats,
+    /// Unix seconds. Displayed, so a stale map can say how stale.
+    #[serde(default)]
+    pub built_at: u64,
+    /// Every file the indexer analysed → its content hash at index time.
+    ///
+    /// **Per file, not one timestamp for the whole graph.** Editing one file
+    /// should mark that file's nodes stale and leave the rest trustworthy; a
+    /// global timestamp would condemn the entire map on any keystroke, which
+    /// would make the freshness signal useless and therefore ignored.
+    ///
+    /// Files with no functions are recorded too. Adding the first function to a
+    /// previously empty file changes the graph, and a `sources` map built only
+    /// from nodes would not notice.
+    #[serde(default)]
+    pub sources: HashMap<String, u64>,
+}
+
+impl Default for CallGraph {
+    fn default() -> Self {
+        CallGraph {
+            version: SCHEMA_VERSION,
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            stats: BuildStats::default(),
+            built_at: 0,
+            sources: HashMap::new(),
+        }
+    }
+}
+
+/// What has changed under a persisted graph.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Staleness {
+    /// Analysed, and since edited.
+    pub changed: Vec<String>,
+    /// Analysed, and since deleted.
+    pub missing: Vec<String>,
+    /// Rust files that exist now and were not analysed.
+    pub added: Vec<String>,
+}
+
+impl Staleness {
+    pub fn is_stale(&self) -> bool {
+        !self.changed.is_empty() || !self.missing.is_empty() || !self.added.is_empty()
+    }
+
+    pub fn file_count(&self) -> usize {
+        self.changed.len() + self.missing.len() + self.added.len()
+    }
+
+    /// One line for a header, or empty when the graph is current.
+    pub fn describe(&self) -> String {
+        if !self.is_stale() {
+            return String::new();
+        }
+        let mut parts = Vec::new();
+        if !self.changed.is_empty() {
+            parts.push(format!("{} changed", self.changed.len()));
+        }
+        if !self.added.is_empty() {
+            parts.push(format!("{} added", self.added.len()));
+        }
+        if !self.missing.is_empty() {
+            parts.push(format!("{} deleted", self.missing.len()));
+        }
+        format!("{} since indexing", parts.join(", "))
+    }
 }
 
 impl CallGraph {
@@ -238,6 +311,118 @@ impl CallGraph {
         graph
     }
 
+    /// Hash every analysed file, so staleness can be judged per file later.
+    ///
+    /// Separate from [`CallGraph::assemble`], which is pure. Called by
+    /// [`CallGraph::build`]; a caller assembling by hand must call it too or the
+    /// graph will claim to be permanently current.
+    pub fn record_sources(&mut self, root: &Path, files: &[String]) {
+        self.built_at = unix_seconds();
+        self.sources = files
+            .iter()
+            .filter_map(|file| {
+                let bytes = std::fs::read(root.join(file)).ok()?;
+                Some((file.clone(), content_hash(&bytes)))
+            })
+            .collect();
+    }
+
+    /// What has changed since the graph was built.
+    ///
+    /// Walks the tree the same way the index does, so a file that would be
+    /// analysed on a rebuild is one that counts as `added` now.
+    pub fn staleness(&self, root: &Path) -> Staleness {
+        let mut staleness = Staleness::default();
+        let mut seen = std::collections::HashSet::new();
+
+        for entry in ignore::WalkBuilder::new(root)
+            .hidden(false)
+            .git_ignore(true)
+            .require_git(false)
+            .build()
+            .flatten()
+        {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .to_string();
+            seen.insert(relative.clone());
+
+            match self.sources.get(&relative) {
+                None => staleness.added.push(relative),
+                Some(&recorded) => {
+                    let now = std::fs::read(path).map(|b| content_hash(&b)).unwrap_or(0);
+                    if now != recorded {
+                        staleness.changed.push(relative);
+                    }
+                }
+            }
+        }
+
+        for file in self.sources.keys() {
+            if !seen.contains(file) {
+                staleness.missing.push(file.clone());
+            }
+        }
+
+        // Sorted so the report is stable between runs and diffable.
+        staleness.changed.sort();
+        staleness.added.sort();
+        staleness.missing.sort();
+        staleness
+    }
+
+    /// Whether a node's file has changed since indexing.
+    ///
+    /// What the renderer dims. Node-level rather than graph-level: editing one
+    /// file should not make the other two thousand nodes look untrustworthy.
+    pub fn node_is_stale(&self, node: &Node, staleness: &Staleness) -> bool {
+        staleness.changed.contains(&node.file) || staleness.missing.contains(&node.file)
+    }
+
+    /// Write the graph.
+    ///
+    /// Write-then-rename, as [`crate::registry`] and the session store both do:
+    /// an interrupted write must not leave a file that fails to parse on the
+    /// next launch, which here would mean silently losing the map and quietly
+    /// re-indexing for ten seconds.
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+        }
+        let json = serde_json::to_string(self).map_err(|e| e.to_string())?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, json).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, path).map_err(|e| format!("cannot replace {}: {e}", path.display()))
+    }
+
+    /// Read a graph back.
+    ///
+    /// A file from a *newer* schema is refused rather than misread — an older
+    /// binary guessing at a shape it does not know would produce a map that is
+    /// wrong in ways nobody would think to check.
+    pub fn load(path: &Path) -> Result<CallGraph, String> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let graph: CallGraph = serde_json::from_str(&text)
+            .map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
+        if graph.version > SCHEMA_VERSION {
+            return Err(format!(
+                "{} was written by a newer version (schema {} > {})",
+                path.display(),
+                graph.version,
+                SCHEMA_VERSION
+            ));
+        }
+        Ok(graph)
+    }
+
     /// Run `rust-analyzer scip`, then assemble.
     ///
     /// **Blocking and expensive**: measured at ~10 s and 2.3 GB peak on a
@@ -275,8 +460,41 @@ impl CallGraph {
 
         let scip = ScipIndex::from_file(&scip_path)?;
         let symbols = SymbolIndex::build(root);
-        Ok(CallGraph::assemble(&scip, &symbols))
+        let mut graph = CallGraph::assemble(&scip, &symbols);
+
+        // Every file the *indexer* saw, not just those that produced nodes: a
+        // file with no functions still changes the graph the moment one is added.
+        let analysed: Vec<String> = scip
+            .documents
+            .iter()
+            .map(|d| d.relative_path.clone())
+            .collect();
+        graph.record_sources(root, &analysed);
+        Ok(graph)
     }
+}
+
+/// FNV-1a, 64-bit.
+///
+/// Deliberately not `DefaultHasher`: its output is explicitly not guaranteed
+/// stable across Rust releases, and a hash written to disk that changes meaning
+/// on a toolchain upgrade would silently invalidate every cached graph. FNV-1a
+/// is specified, tiny, and already what [`crate::registry::project_key`] uses —
+/// one hash in the codebase rather than two.
+pub fn content_hash(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash
+}
+
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Whether a SCIP symbol is a document-scoped local.
@@ -565,6 +783,134 @@ fn callee() {
         );
         assert_eq!(graph.stats.self_edges, 0);
         assert_eq!(graph.stats.locals, 2);
+    }
+
+    // --- persistence ---
+
+    /// A tree with two Rust files, and a graph recorded over it.
+    fn persisted() -> (tempfile::TempDir, CallGraph) {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.rs"), "fn a() {\n    b();\n}\n").unwrap();
+        std::fs::write(src.join("b.rs"), "fn b() {\n}\n").unwrap();
+
+        let mut graph = CallGraph::default();
+        graph.record_sources(
+            tmp.path(),
+            &["src/a.rs".to_string(), "src/b.rs".to_string()],
+        );
+        (tmp, graph)
+    }
+
+    #[test]
+    fn a_graph_round_trips_through_a_file() {
+        let (tmp, mut graph) = persisted();
+        graph.nodes.push(Node {
+            name: "a".into(),
+            container: None,
+            file: "src/a.rs".into(),
+            line: 1,
+            end_line: 3,
+        });
+        graph.edges.push(Edge { from: 0, to: 0, sites: 1 });
+
+        let path = tmp.path().join("callgraph.json");
+        graph.save(&path).unwrap();
+        assert_eq!(CallGraph::load(&path).unwrap(), graph);
+    }
+
+    #[test]
+    fn an_untouched_tree_is_not_stale() {
+        let (tmp, graph) = persisted();
+        let staleness = graph.staleness(tmp.path());
+        assert!(!staleness.is_stale(), "{staleness:?}");
+        assert_eq!(staleness.describe(), "");
+    }
+
+    /// The point of hashing per file: one edit must not condemn the whole map.
+    #[test]
+    fn editing_one_file_marks_only_that_file() {
+        let (tmp, graph) = persisted();
+        std::fs::write(tmp.path().join("src/a.rs"), "fn a() {\n    // changed\n}\n").unwrap();
+
+        let staleness = graph.staleness(tmp.path());
+        assert_eq!(staleness.changed, vec!["src/a.rs"]);
+        assert!(staleness.added.is_empty());
+        assert!(staleness.missing.is_empty());
+
+        let in_a = Node {
+            name: "a".into(),
+            container: None,
+            file: "src/a.rs".into(),
+            line: 1,
+            end_line: 3,
+        };
+        let in_b = Node {
+            file: "src/b.rs".into(),
+            ..in_a.clone()
+        };
+        assert!(graph.node_is_stale(&in_a, &staleness));
+        assert!(!graph.node_is_stale(&in_b, &staleness), "b is untouched");
+    }
+
+    /// Rewriting a file with identical bytes is not a change. Content hashing
+    /// rather than mtime is what makes that true — and `cargo fmt` or a save
+    /// with no edit would otherwise mark everything stale.
+    #[test]
+    fn rewriting_a_file_with_the_same_bytes_is_not_a_change() {
+        let (tmp, graph) = persisted();
+        let path = tmp.path().join("src/a.rs");
+        let same = std::fs::read(&path).unwrap();
+        std::fs::write(&path, same).unwrap();
+        assert!(!graph.staleness(tmp.path()).is_stale());
+    }
+
+    #[test]
+    fn a_new_file_is_added_and_a_deleted_one_is_missing() {
+        let (tmp, graph) = persisted();
+        std::fs::write(tmp.path().join("src/c.rs"), "fn c() {}\n").unwrap();
+        std::fs::remove_file(tmp.path().join("src/b.rs")).unwrap();
+
+        let staleness = graph.staleness(tmp.path());
+        assert_eq!(staleness.added, vec!["src/c.rs"]);
+        assert_eq!(staleness.missing, vec!["src/b.rs"]);
+        assert_eq!(staleness.file_count(), 2);
+        assert!(staleness.describe().contains("1 added"), "{}", staleness.describe());
+        assert!(staleness.describe().contains("1 deleted"));
+    }
+
+    /// A graph from a newer schema must be refused, not guessed at. Reading a
+    /// shape we do not know would produce a map wrong in ways nobody checks.
+    #[test]
+    fn a_newer_schema_is_refused_rather_than_misread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("callgraph.json");
+        let graph = CallGraph {
+            version: SCHEMA_VERSION + 1,
+            ..CallGraph::default()
+        };
+        graph.save(&path).unwrap();
+        let err = CallGraph::load(&path).unwrap_err();
+        assert!(err.contains("newer version"), "{err}");
+    }
+
+    #[test]
+    fn a_corrupt_file_is_an_error_rather_than_a_panic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("callgraph.json");
+        std::fs::write(&path, "{not json").unwrap();
+        assert!(CallGraph::load(&path).is_err());
+    }
+
+    /// Hashes are written to disk, so the function producing them must be
+    /// specified rather than whatever `DefaultHasher` happens to do this
+    /// release. FNV-1a over these inputs is fixed for all time.
+    #[test]
+    fn the_content_hash_is_stable_and_specified() {
+        assert_eq!(content_hash(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(content_hash(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_ne!(content_hash(b"fn a() {}"), content_hash(b"fn b() {}"));
     }
 
     #[test]

@@ -29,10 +29,37 @@ fn main() {
         .position(|a| a == "--scip")
         .and_then(|i| args.get(i + 1))
         .cloned();
+    let flag_values: Vec<&String> = ["--scip", "--save", "--load"]
+        .iter()
+        .filter_map(|f| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)))
+        .collect();
     let symbol = args
         .iter()
         .skip(1)
-        .find(|a| !a.starts_with("--") && Some(*a) != prebuilt.as_ref());
+        .find(|a| !a.starts_with("--") && !flag_values.contains(a));
+
+    // `--save FILE` persists; `--load FILE` reads back instead of building.
+    let save_to = args.iter().position(|a| a == "--save").and_then(|i| args.get(i + 1)).cloned();
+    let load_from = args.iter().position(|a| a == "--load").and_then(|i| args.get(i + 1)).cloned();
+
+    if let Some(path) = &load_from {
+        let graph = match CallGraph::load(std::path::Path::new(path)) {
+            Ok(g) => g,
+            Err(e) => { eprintln!("{e}"); std::process::exit(1); }
+        };
+        let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        println!("loaded           {} nodes, {} edges", graph.nodes.len(), graph.edges.len());
+        println!("file size        {:.0} KB", bytes as f64 / 1024.0);
+        println!("indexed files    {}", graph.sources.len());
+        let staleness = graph.staleness(root);
+        println!(
+            "freshness        {}",
+            if staleness.is_stale() { staleness.describe() } else { "current".into() }
+        );
+        for f in staleness.changed.iter().take(5) { println!("  changed  {f}"); }
+        for f in staleness.added.iter().take(5) { println!("  added    {f}"); }
+        return;
+    }
 
     let started = std::time::Instant::now();
     let graph = match &prebuilt {
@@ -45,7 +72,15 @@ fn main() {
                 }
             };
             let symbols = SymbolIndex::build(root);
-            CallGraph::assemble(&scip, &symbols)
+            let mut graph = CallGraph::assemble(&scip, &symbols);
+            // Sources come from the *documents the indexer saw*, never from the
+            // nodes. A file of `pub mod` declarations or constants produces no
+            // nodes but is still analysed, and recording only node files makes
+            // every such file look newly added on the next staleness check.
+            let analysed: Vec<String> =
+                scip.documents.iter().map(|d| d.relative_path.clone()).collect();
+            graph.record_sources(root, &analysed);
+            graph
         }
         None => {
             eprintln!("running `rust-analyzer scip` — expect ~10 s and ~2 GB…");
@@ -59,6 +94,16 @@ fn main() {
         }
     };
     let elapsed = started.elapsed();
+
+    if let Some(path) = &save_to {
+        match graph.save(std::path::Path::new(path)) {
+            Ok(()) => {
+                let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                println!("saved            {path} ({:.0} KB)", bytes as f64 / 1024.0);
+            }
+            Err(e) => eprintln!("{e}"),
+        }
+    }
 
     let s = graph.stats;
     println!("nodes            {}", graph.nodes.len());

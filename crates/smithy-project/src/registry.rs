@@ -59,6 +59,17 @@ impl ProjectRegistry {
             .join("sessions")
     }
 
+    /// Where a project's persisted call graph lives.
+    ///
+    /// Beside `sessions/`, under the same key, so everything Smithy knows about
+    /// one project sits in one browsable directory.
+    pub fn callgraph_path(&self, root: &Path) -> PathBuf {
+        self.data_dir
+            .join("projects")
+            .join(project_key(root))
+            .join("callgraph.json")
+    }
+
     pub fn recents(&self) -> Vec<RecentProject> {
         let Ok(text) = std::fs::read_to_string(self.recents_path()) else {
             return Vec::new();
