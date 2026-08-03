@@ -238,13 +238,13 @@ pub fn clear(ui: CallGraphUi) {
 
 const MAX_PER_LAYER: usize = 18;
 const MAX_VISIBLE: usize = 40;
-const NODE_H: f64 = 30.0;
+const NODE_H: f64 = 44.0;
 const NODE_PAD_X: f64 = 14.0;
 /// Vertical gap between hop bands (caller ↔ focus ↔ callee).
-const BAND_GAP: f64 = 52.0;
+const BAND_GAP: f64 = 64.0;
 /// Vertical gap between wrapped rows inside one band.
-const ROW_STEP: f64 = 38.0;
-const COL_GAP: f64 = 12.0;
+const ROW_STEP: f64 = 52.0;
+const COL_GAP: f64 = 14.0;
 const FIT_MARGIN: f64 = 36.0;
 /// World-space row width when the pane size is not yet known.
 const DEFAULT_ROW_WIDTH: f64 = 640.0;
@@ -253,8 +253,8 @@ const DEFAULT_ROW_WIDTH: f64 = 640.0;
 struct LaidOut {
     index: u32,
     label: String,
-    /// Hover text: qualified name + file:line.
-    detail: String,
+    /// Second line on the chip — basename:line (always visible; tooltips pile up).
+    location: String,
     x: f64,
     y: f64,
     w: f64,
@@ -280,8 +280,18 @@ fn display_label(node: &Node, focus: &Node) -> String {
     }
 }
 
-fn label_width(label: &str) -> f64 {
-    (label.chars().count() as f64 * 7.4 + NODE_PAD_X * 2.0).clamp(64.0, 240.0)
+fn short_location(node: &Node) -> String {
+    let base = std::path::Path::new(&node.file)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&node.file);
+    format!("{base}:{}", node.line)
+}
+
+fn label_width(label: &str, location: &str) -> f64 {
+    let top = label.chars().count() as f64 * 7.4;
+    let bot = location.chars().count() as f64 * 6.2;
+    (top.max(bot) + NODE_PAD_X * 2.0).clamp(88.0, 260.0)
 }
 
 /// Deterministic focus-relative layout. Callers above, focus centre, callees
@@ -377,11 +387,11 @@ fn layout(
     let mut out = Vec::new();
 
     // Place from focus outward so band gaps stay consistent after wrapping.
-    let fw = label_width(&focus_node.qualified());
+    let fw = label_width(&focus_node.qualified(), &short_location(focus_node));
     out.push(LaidOut {
         index: focus,
         label: focus_node.qualified(),
-        detail: format!("{}\n{}", focus_node.qualified(), focus_node.location()),
+        location: short_location(focus_node),
         x: -fw / 2.0,
         y: 0.0,
         w: fw,
@@ -416,8 +426,8 @@ fn layout(
                 let label = display_label(n, focus_node);
                 out.push(LaidOut {
                     index: idx,
-                    label: label.clone(),
-                    detail: format!("{}\n{}", n.qualified(), n.location()),
+                    label,
+                    location: short_location(n),
                     x,
                     y,
                     w,
@@ -434,7 +444,7 @@ fn layout(
         for &(idx, sites) in items {
             let n = &graph.nodes[idx as usize];
             let label = display_label(n, focus_node);
-            let w = label_width(&label);
+            let w = label_width(&label, &short_location(n));
             let next = if row.is_empty() {
                 w
             } else {
@@ -464,7 +474,8 @@ fn layout(
         let mut row_w = 0.0;
         for &(idx, _) in items {
             let n = &graph.nodes[idx as usize];
-            let w = label_width(&display_label(n, focus_node));
+            let label = display_label(n, focus_node);
+            let w = label_width(&label, &short_location(n));
             let next = if row_w == 0.0 { w } else { row_w + COL_GAP + w };
             if row_w > 0.0 && next > max_w {
                 rows += 1;
@@ -596,6 +607,25 @@ fn toolbar(ui: CallGraphUi, on_build: impl Fn() + 'static) -> impl IntoView {
                 .color(design::FG_FAINT)
                 .margin_right(design::SPACE_3)
                 .apply_if(ui.status.get().is_empty(), |s| {
+                    s.display(floem::taffy::Display::None)
+                })
+        }),
+        Label::derived(move || {
+            let Some(graph) = ui.graph.get() else {
+                return String::new();
+            };
+            let Some(focus) = ui.focus.get().or_else(|| default_focus(&graph)) else {
+                return String::new();
+            };
+            let callers = graph.callers(focus).len();
+            let callees = graph.callees(focus).len();
+            format!("{callers} callers · {callees} callees · click to walk")
+        })
+        .style(move |s| {
+            s.font_size(design::TEXT_XS)
+                .color(design::FG_MUTED)
+                .margin_right(design::SPACE_3)
+                .apply_if(ui.graph.get().is_none(), |s| {
                     s.display(floem::taffy::Display::None)
                 })
         }),
@@ -891,7 +921,7 @@ fn graph_pane(
                 .map(|n| {
                     let idx = n.index;
                     let label = n.label.clone();
-                    let detail = n.detail.clone();
+                    let location = n.location.clone();
                     let is_focus = n.layer == Layer::Focus;
                     let stale = n.stale;
                     let left = ox + n.x * zoom;
@@ -903,7 +933,24 @@ fn graph_pane(
                         std::time::Instant::now() - std::time::Duration::from_secs(1),
                     );
 
-                    Label::derived(move || label.clone())
+                    let name = Label::derived(move || label.clone()).style(move |s| {
+                        s.font_size((design::TEXT_XS as f64 * zoom).clamp(10.0, 14.0) as f32)
+                            .font_family(design::MONO.to_string())
+                            .color(if stale {
+                                design::FG_GHOST
+                            } else if is_focus {
+                                design::FG
+                            } else {
+                                design::FG_MUTED
+                            })
+                    });
+                    let loc = Label::derived(move || location.clone()).style(move |s| {
+                        s.font_size((9.0 * zoom).clamp(8.0, 11.0) as f32)
+                            .font_family(design::MONO.to_string())
+                            .color(design::FG_FAINT)
+                    });
+
+                    Stack::vertical((name, loc))
                         .on_event_stop(floem::event::listener::Click, move |_, _| {
                             let now = std::time::Instant::now();
                             let double =
@@ -919,7 +966,6 @@ fn graph_pane(
                                 }
                             } else {
                                 ui.focus.set(Some(idx));
-                                // Camera refit is the Effect above.
                             }
                         })
                         .style(move |s| {
@@ -928,17 +974,9 @@ fn graph_pane(
                                 .inset_top(top)
                                 .width(width)
                                 .height(height)
-                                .font_size((design::TEXT_XS as f64 * zoom).clamp(10.0, 15.0) as f32)
-                                .font_family(design::MONO.to_string())
-                                .color(if stale {
-                                    design::FG_GHOST
-                                } else if is_focus {
-                                    design::FG
-                                } else {
-                                    design::FG_MUTED
-                                })
                                 .items_center()
                                 .justify_center()
+                                .padding_horiz(4.0)
                                 .background(if is_focus {
                                     design::BG_FLOAT
                                 } else {
@@ -954,15 +992,6 @@ fn graph_pane(
                                 })
                                 .border_radius(4.0)
                                 .cursor(floem::style::CursorStyle::Pointer)
-                        })
-                        .tooltip(move || {
-                            let detail = detail.clone();
-                            Label::derived(move || detail.clone()).style(|s| {
-                                s.font_size(design::TEXT_XS)
-                                    .font_family(design::MONO.to_string())
-                                    .color(design::FG)
-                                    .padding(design::SPACE_2)
-                            })
                         })
                         .into_any()
                 })
