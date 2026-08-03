@@ -280,6 +280,23 @@ Say it out loud so nobody trusts the harness past where it earns trust:
 Steps 1–4 are the week's leverage. Steps 5–8 are what let the rest of the week
 be spent on the animation instead of on wondering.
 
+### After the harness (branch 3)
+
+Animation bugs — not harness PRs. Land with the moonwalk fix.
+
+1. **`does_not_moonwalk`** — build trip-boundary `face_for` lookback
+   (`completion - 0.004` can see the previous plank trip). Currently 29 red
+   frames; known, left red on purpose in the harness PR.
+2. **Midnight lamp flare** — sleep spans midnight; `routine::at` is hours-
+   since-local-midnight, so at 00:00 progress resets `0.900 → 0` and
+   `window_light` treats it as bedtime (lamp 0.000 → 0.450 → 0.000 across
+   23:45 / 00:00 / 00:15). Production; every night.
+3. **Harness follow-ons that would have caught (2):**
+   - Day strip ~21:00–03:00 with the day seed rolling (the 00:00–23:45 sweep
+     never looks at the day seam).
+   - Lighting continuity check: 1 s steps on `window_light` / `door_open`,
+     same shape as `does_not_teleport`.
+
 ---
 
 ## 7. Landmines

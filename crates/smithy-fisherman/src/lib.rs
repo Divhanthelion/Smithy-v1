@@ -7,6 +7,11 @@ pub mod fisherman;
 pub mod ink;
 pub mod routine;
 
+/// Headless checks and contact sheets. Behind the `harness` feature so the
+/// default build stays free of tiny-skia / serde_json.
+#[cfg(feature = "harness")]
+pub mod harness;
+
 pub use fisherman::*;
-pub use ink::Ink;
+pub use ink::{Ink, Part};
 pub use routine::{Block, Doing, Place};

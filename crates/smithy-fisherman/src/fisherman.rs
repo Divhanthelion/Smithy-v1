@@ -132,7 +132,7 @@ fn unit_interval(value: u64) -> f64 {
 use kurbo::{BezPath, Circle, Ellipse, Point, Rect, Shape, Vec2};
 use peniko::Color;
 
-use crate::ink::Ink;
+use crate::ink::{Ink, Part};
 use crate::routine::{Doing, Place};
 
 /// Flatten a kurbo shape to a path for [`Ink`].
@@ -885,6 +885,7 @@ fn draw_figure(
     at: &impl Fn(Point) -> Point,
     scale: f64,
 ) {
+    ink.begin(Part::Figure);
     let edge = (scale * 0.035).max(0.5);
     for path in figure_paths(pose) {
         let placed = place(&path, at);
@@ -935,6 +936,9 @@ fn draw_line_and_rod(
     let mut rod = BezPath::new();
     rod.move_to(at(pose.rod_butt));
     rod.line_to(tip);
+    // Rod is part of the silhouette — same Part as the body, so "he exists"
+    // and "right size" see the shouldered/cast rod as him, not as a prop.
+    ink.begin(Part::Figure);
     ink.stroke(&rod, IRON, (scale * 0.06).max(1.2));
     ink.stroke(&rod, RIM.with_alpha(0.9), (scale * 0.025).max(0.6));
 
@@ -947,6 +951,7 @@ fn draw_line_and_rod(
     let seconds = frame as f64 / 5.0;
     let sway = (((seconds - 0.4) / LINE_SWAY_SECONDS) * std::f64::consts::TAU).sin() * scale * 0.08;
     let path = line_path(tip, panel_height - 2.0, sway);
+    ink.begin(Part::Line);
     ink.stroke(&path, LINE.with_alpha(0.75), 0.9);
 }
 
@@ -973,6 +978,7 @@ fn draw_fire(
         return;
     }
 
+    ink.begin(Part::Fire);
     let height = scale * 0.38 * strength;
 
     // The hearth glow first, under everything: bare flames on cold metal read
@@ -1022,6 +1028,7 @@ fn draw_props(
     scale: f64,
     frame: u64,
 ) {
+    ink.begin(Part::Props);
     match block.doing {
         Doing::Cooking => {
             // A fish on a stick, held out over the flame.
@@ -1041,7 +1048,9 @@ fn draw_props(
         Doing::Coffee => {
             // The mug, and steam off it — the cheapest possible "this is hot".
             let mug = at(Point::new(pose.hand.x, pose.hand.y));
+            ink.begin(Part::Props);
             ink.fill(&shape_path(&Circle::new(mug, scale * 0.055)), PAGE.with_alpha(0.9));
+            ink.begin(Part::Smoke);
             for puff in 0..2 {
                 let p = ((frame as f64 / 26.0) + f64::from(puff) * 0.5).fract();
                 ink.fill(&shape_path(&Circle::new(
@@ -1058,8 +1067,10 @@ fn draw_props(
             let mut cigarette = BezPath::new();
             cigarette.move_to(butt);
             cigarette.line_to(tip);
+            ink.begin(Part::Props);
             ink.stroke(&cigarette, PAGE.with_alpha(0.9), (scale * 0.018).max(0.6));
             ink.fill(&shape_path(&Circle::new(tip, (scale * 0.028).max(0.7))), FIRE_CORE.with_alpha(0.9));
+            ink.begin(Part::Smoke);
             for puff in 0..3 {
                 let p = ((frame as f64 / 22.0) + f64::from(puff) * 0.33).fract();
                 ink.fill(&shape_path(&Circle::new(
@@ -1101,6 +1112,7 @@ fn draw_plank(
     if trip > 0.5 {
         return;
     }
+    ink.begin(Part::Props);
     let hand = at(pose.hand);
     let board = Rect::new(
         hand.x - scale * 0.34,
@@ -1301,6 +1313,7 @@ fn draw_hut(
     let edge = (h * 0.04).max(0.5);
     let lit = window_light(block.doing, block.place, progress);
 
+    ink.begin(Part::Hut);
     // The walls, plank by plank from the ground up.
     for plank in 0..planks {
         let top = base - h * (plank as f64 + 1.0) / PLANKS as f64;
@@ -1385,6 +1398,7 @@ fn draw_window(
     lit: f64,
     h: f64,
 ) {
+    ink.begin(Part::Hut);
     let pane = hut.window();
 
     if lit < 0.02 {
@@ -1454,6 +1468,7 @@ fn draw_chimney_smoke(
     if strength < 0.05 {
         return;
     }
+    ink.begin(Part::Smoke);
     let mouth = hut.chimney();
     for puff in 0..4 {
         let phase = ((frame as f64 / 46.0) + f64::from(puff) * 0.25).fract();

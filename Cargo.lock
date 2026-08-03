@@ -6242,6 +6242,7 @@ version = "0.1.0"
 dependencies = [
  "kurbo",
  "peniko",
+ "serde_json",
  "tiny-skia 0.11.4",
 ]
 
