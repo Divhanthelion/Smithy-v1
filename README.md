@@ -105,9 +105,17 @@ quantisation suffix like `@8bit` doesn't need configuring.
 
 ### Giving it context
 
-Drag files or folders onto the agent panel. They appear as chips above the
-composer with their size and token cost; click one to include or exclude it, and
-the row totals what the next message will spend. Attachments go out with that one
+Two ways in:
+
+- **`+` in the Explorer** — every row has one. Click it and the file goes to the
+  agent's next message; the panel opens if it was hidden. This is the one to
+  reach for, because the file you want is usually already on screen.
+- **Drag and drop** onto the agent panel — for files from outside the project,
+  where the Explorer cannot see them.
+
+Either way they appear as chips above the composer with their size and token
+cost; click one to include or exclude it, and the row totals what the next
+message will spend. Attachments go out with that one
 message and are then cleared — they're already in the conversation's history, so
 re-sending them would just cost twice.
 

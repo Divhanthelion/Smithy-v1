@@ -437,10 +437,23 @@ fn app_view() -> impl IntoView {
     // The Explorer's own hide button, doing what `⌘B` does — the same signal,
     // so the two cannot disagree about whether the panel is showing.
     let sidebar_for_hide = signals.sidebar_visible;
+    // Attaching from the Explorer. The panel is revealed if it was hidden —
+    // otherwise the chip lands somewhere you cannot see and the click looks
+    // like it did nothing, which is the failure this whole affordance exists to
+    // remove.
+    let on_add_to_context = {
+        let panel = agent_state.panel;
+        let agent_visible = signals.agent_visible;
+        move |path: std::path::PathBuf| {
+            panel.attach(&[path]);
+            agent_visible.set(true);
+        }
+    };
     let file_browser = file_browser_view(
         file_browser_state,
         agent_state.file_browser_refresh,
         on_file_open,
+        on_add_to_context,
         move || sidebar_for_hide.set(false),
     );
 

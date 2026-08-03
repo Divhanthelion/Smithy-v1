@@ -116,9 +116,12 @@ fn file_entry_view(
     font_size: f32,
     on_click: impl Fn(PathBuf) + 'static + Clone,
     on_double_click: impl Fn(PathBuf) + 'static + Clone,
+    on_add_to_context: impl Fn(PathBuf) + 'static + Clone,
 ) -> impl IntoView {
     let path = entry.path.clone();
     let path_for_dblclick = entry.path.clone();
+    let path_for_context = entry.path.clone();
+    let is_parent_link = entry.is_parent_nav;
     let is_dir = entry.is_dir;
     let is_selected = entry.is_selected;
     let indent = entry.indent_level;
@@ -159,6 +162,37 @@ fn file_entry_view(
             };
             s.font_size(font_size).color(text_color)
         }),
+        Container::new(Empty::new()).style(|s| s.flex_grow(1.0)),
+        // Send this file to the agent.
+        //
+        // The Explorer already shows you the file you mean; before this the only
+        // way to attach it was to find it *again* in Finder and drag it across a
+        // window boundary onto a panel that had to be visible and focused. Drag
+        // and drop still works and is the right gesture for a file from
+        // elsewhere — this is the one for a file that is already on screen.
+        //
+        // Hidden on the ".." row, which is a navigation affordance rather than a
+        // file, and attaching the parent directory by accident would sweep in
+        // the whole tree above the project.
+        // Dim rather than hover-revealed. Revealing on row hover would need the
+        // parent's hover state to reach this child, which floem does not do
+        // without a shared signal — and a control you cannot see until you are
+        // already on top of it is a control nobody finds.
+        Label::derived(|| "+".to_string())
+            .on_event_stop(floem::event::listener::Click, move |_, _| {
+                on_add_to_context(path_for_context.clone())
+            })
+            .style(move |s| {
+                s.font_size(font_size + 1.0)
+                    .color(design::FG_GHOST)
+                    .padding_horiz(5.0)
+                    .border_radius(3.0)
+                    .cursor(floem::style::CursorStyle::Pointer)
+                    .hover(|s| s.color(design::ACCENT).background(design::BG_HOVER))
+                    .apply_if(is_parent_link, |s| {
+                        s.display(floem::taffy::Display::None)
+                    })
+            }),
     ))
     .style(move |s| {
         let bg = if is_selected {
@@ -212,9 +246,11 @@ fn file_list_view(
     font_size: f32,
     on_click: impl Fn(PathBuf) + 'static + Clone,
     on_double_click: impl Fn(PathBuf) + 'static + Clone,
+    on_add_to_context: impl Fn(PathBuf) + 'static + Clone,
 ) -> impl IntoView {
     let on_click = on_click.clone();
     let on_dblclick = on_double_click.clone();
+    let on_add = on_add_to_context.clone();
 
     dyn_stack(
         move || entries_signal.get(),
@@ -226,6 +262,7 @@ fn file_list_view(
                 font_size,
                 on_click.clone(),
                 on_dblclick.clone(),
+                on_add.clone(),
             )
         },
     )
@@ -375,6 +412,7 @@ pub fn file_browser_panel_view(
     font_size: f32,
     on_click: impl Fn(PathBuf) + 'static + Clone,
     on_double_click: impl Fn(PathBuf) + 'static + Clone,
+    on_add_to_context: impl Fn(PathBuf) + 'static + Clone,
     on_home: impl Fn() + 'static + Clone,
     on_root: impl Fn() + 'static + Clone,
     on_refresh: impl Fn() + 'static + Clone,
@@ -405,6 +443,7 @@ pub fn file_browser_panel_view(
             font_size,
             on_click,
             on_double_click,
+            on_add_to_context,
         ))
         .custom_style(|s: floem::views::scroll::ScrollCustomStyle| {
             s.hide_bars(false)
@@ -436,6 +475,9 @@ pub fn file_browser_view(
     state: SharedFileBrowserState,
     refresh: RwSignal<u64>,
     on_file_open: impl Fn(PathBuf) + 'static + Clone,
+    // Attach a path to the agent's next message. Files and directories both —
+    // a directory is expanded gitignore-aware and capped by `attachment`.
+    on_add_to_context: impl Fn(PathBuf) + 'static + Clone,
     on_hide: impl Fn() + 'static + Clone,
 ) -> impl IntoView {
     let state_ref = state.borrow();
@@ -619,6 +661,7 @@ pub fn file_browser_view(
         font_size,
         on_click,
         on_double_click,
+        on_add_to_context,
         on_home,
         on_root,
         on_refresh,
