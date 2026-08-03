@@ -433,19 +433,42 @@ fn does_not_moonwalk() -> CheckResult {
     }
 
     // Build phase at fine steps — the original loaded-trip lived here.
+    // Record the completions: "29 steps" says it is broken; the list of
+    // trip boundaries tells the next branch where to look.
     let steps = 2_000u64;
+    let mut build_completions: Vec<f64> = Vec::new();
     let mut prev_along = position_of(&sample_scene(10.0, 0.0, 0));
     for i in 1..=steps {
         let launched = BUILD_SECONDS * (i as f64 / steps as f64);
+        let completion = launched / BUILD_SECONDS;
         let scene = sample_scene(10.0, launched, i);
         let along = position_of(&scene);
         let face = face_of(&scene);
         let delta = along - prev_along;
         if delta < -MOONWALK_EPS && face >= 0.0 {
             violations += 1;
+            build_completions.push(completion);
         }
         prev_along = along;
     }
+
+    // Collapse near-duplicates so the detail names trip boundaries rather
+    // than dumping 29 almost-equal floats. 0.001 ≈ two harness steps.
+    let mut boundaries: Vec<f64> = Vec::new();
+    for &c in &build_completions {
+        if boundaries
+            .last()
+            .map(|&prev| (c - prev).abs() > 0.001)
+            .unwrap_or(true)
+        {
+            boundaries.push(c);
+        }
+    }
+    let boundary_list = boundaries
+        .iter()
+        .map(|c| format!("{c:.4}"))
+        .collect::<Vec<_>>()
+        .join(", ");
 
     CheckResult {
         name: "does_not_moonwalk",
@@ -456,7 +479,8 @@ fn does_not_moonwalk() -> CheckResult {
         detail: format!(
             "{violations} steps with Δposition < 0 while facing ≥ 0 \
              (build trip-boundary lookback is a known red if non-zero — \
-             face_for subtracts 0.004 completion and can see the previous trip)"
+             face_for subtracts 0.004 completion and can see the previous trip); \
+             completions: [{boundary_list}]"
         ),
         flips: vec![],
     }

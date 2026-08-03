@@ -3,12 +3,13 @@
 //!     cargo run -p smithy-fisherman --example sheets --features harness
 //!
 //! Writes `target/fisherman/`:
-//!   report.json  — every check, measured / threshold / pass
-//!   day.png      — 96 tiles, every 15 min
-//!   scenes.png   — all 12 Doing states in place
-//!   build.png    — hut across BUILD_SECONDS
-//!   walk.png     — one stride frame by frame
-//!   diff/*.png   — only on golden mismatch
+//!   report.json   — every check, measured / threshold / pass
+//!   day.png       — 96 cropped tiles in a grid, every 15 min
+//!   scenes.png    — all 12 Doing states in place (1×, golden candidate)
+//!   scenes_3x.png — same at 3×, eyes only (not a golden)
+//!   build.png     — hut across BUILD_SECONDS
+//!   walk.png      — one stride frame by frame
+//!   diff/*.png    — only on golden mismatch
 //!
 //! Read report.json first. Open a PNG only when a check fails or the change
 //! was aesthetic. See docs/FISHERMAN_VERIFICATION_PLAN.md.

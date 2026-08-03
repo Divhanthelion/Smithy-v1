@@ -82,6 +82,81 @@ impl PixmapInk {
         }
         Some((d[i], d[i + 1], d[i + 2], d[i + 3]))
     }
+
+    /// Bounding box of non-background ink, if any.
+    ///
+    /// The day sheet crops to this — the full 1100px rail is mostly empty
+    /// steel, and a grid of full-width tiles downscales each one to ~10px.
+    pub fn content_bounds(&self) -> Option<(u32, u32, u32, u32)> {
+        self.bounds_where(|rgb| !is_bg(rgb))
+    }
+
+    /// Bounding box of outdoor-figure IRON pixels, if any.
+    ///
+    /// Day-sheet crops prefer this over [`content_bounds`]: the hut is always
+    /// drawn, so a full-content box on a fishing tile spans hut→perch and the
+    /// grid cell is once again the whole rail.
+    pub fn figure_bounds(&self) -> Option<(u32, u32, u32, u32)> {
+        self.bounds_where(is_iron)
+    }
+
+    fn bounds_where(&self, mut keep: impl FnMut((u8, u8, u8)) -> bool) -> Option<(u32, u32, u32, u32)> {
+        let mut min_x = self.width();
+        let mut min_y = self.height();
+        let mut max_x = 0u32;
+        let mut max_y = 0u32;
+        let mut any = false;
+        for y in 0..self.height() {
+            for x in 0..self.width() {
+                let Some((r, g, b, _)) = self.pixel(x, y) else {
+                    continue;
+                };
+                if !keep((r, g, b)) {
+                    continue;
+                }
+                any = true;
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
+        }
+        any.then_some((min_x, min_y, max_x, max_y))
+    }
+
+    /// Copy a source rectangle into this pixmap at `(dst_x, dst_y)`.
+    pub fn blit_from(
+        &mut self,
+        src: &PixmapInk,
+        src_x: u32,
+        src_y: u32,
+        w: u32,
+        h: u32,
+        dst_x: u32,
+        dst_y: u32,
+    ) {
+        for row in 0..h {
+            for col in 0..w {
+                let sx = src_x + col;
+                let sy = src_y + row;
+                let dx = dst_x + col;
+                let dy = dst_y + row;
+                if sx >= src.width() || sy >= src.height() || dx >= self.width() || dy >= self.height()
+                {
+                    continue;
+                }
+                let Some((r, g, b, a)) = src.pixel(sx, sy) else {
+                    continue;
+                };
+                let i = ((dy * self.width() + dx) * 4) as usize;
+                let d = self.pm.data_mut();
+                d[i] = r;
+                d[i + 1] = g;
+                d[i + 2] = b;
+                d[i + 3] = a;
+            }
+        }
+    }
 }
 
 impl Ink for PixmapInk {

@@ -3,6 +3,16 @@
 //! Order is the budget strategy: assert first (`report.json`), open a PNG
 //! only when a number fails or the change was aesthetic. See
 //! `docs/FISHERMAN_VERIFICATION_PLAN.md` §3–4.
+//!
+//! ## Wiring checks into `cargo test`
+//!
+//! Tier A/B currently run only via `cargo run --example sheets --features
+//! harness`. Nothing in CI asserts them yet — deliberate: `does_not_moonwalk`
+//! is red on a pre-existing build trip-boundary lookback bug, and flipping
+//! the checks into `cargo test` now would make CI red on a scheduled fix.
+//! After that bug is fixed (the next branch), promote `run_checks` into an
+//! integration test behind the `harness` feature so a regression cannot land
+//! silently. Not before.
 
 pub mod font;
 pub mod golden;
@@ -87,6 +97,9 @@ pub fn write_sheets(out_dir: &Path) {
     std::fs::create_dir_all(out_dir).expect("create fisherman out dir");
     sheets::day_sheet(out_dir);
     sheets::scenes_sheet(out_dir);
+    // Eyes only — 3× so indoor tiles still have a readable silhouette in
+    // the window. Not a golden; goldens stay 1×.
+    sheets::scenes_sheet_3x(out_dir);
     sheets::build_sheet(out_dir);
     sheets::walk_sheet(out_dir);
 }
