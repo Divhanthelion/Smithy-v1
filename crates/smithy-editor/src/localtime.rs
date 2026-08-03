@@ -60,20 +60,6 @@ pub fn local_day(unix_seconds: f64) -> i64 {
     ((unix_seconds + utc_offset_seconds() as f64) / 86_400.0).floor() as i64
 }
 
-/// A longitude that matches the system's timezone offset.
-///
-/// The earth turns 15° an hour, so the offset gives longitude to within the
-/// width of a timezone — good enough to put the sky in the right part of its
-/// daily rotation. **Latitude cannot be recovered this way**, which is why
-/// [`crate::celestial::DEFAULT_LOCATION`] still carries one.
-///
-/// Being an hour out rotates the sky by 15°. Being eight hours out, which is
-/// what a hardcoded San Francisco does to anyone who is not in it, rotates it
-/// by 120° — a different half of the sky.
-pub fn longitude_from_timezone() -> f64 {
-    (utc_offset_hours() * 15.0).clamp(-180.0, 180.0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,16 +116,5 @@ mod tests {
             rollovers += i32::from(day_changed);
         }
         assert_eq!(rollovers, 2, "two days hold two midnights");
-    }
-
-    /// Longitude from the offset, at fifteen degrees an hour.
-    #[test]
-    fn the_timezone_longitude_is_fifteen_degrees_an_hour() {
-        let longitude = longitude_from_timezone();
-        assert!((-180.0..=180.0).contains(&longitude));
-        assert!(
-            (longitude - utc_offset_hours() * 15.0).abs() < 1e-9,
-            "the conversion is not 15° an hour"
-        );
     }
 }

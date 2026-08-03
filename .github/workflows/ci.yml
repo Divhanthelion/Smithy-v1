@@ -55,19 +55,6 @@ jobs:
 
       # The README states "0 warnings, and it stays 0". This step is what makes
       # that a fact rather than an aspiration, so it is a hard gate.
-      #
-      # It is one warning away from green: `longitude_from_timezone` in
-      # `smithy-editor/src/localtime.rs` is unused. Note *why* before deciding —
-      # it is not an unfinished feature, it is a road already taken and
-      # abandoned. `celestial::todays_sun` documents that deriving longitude
-      # from the timezone meridian made the frame sun and the backdrop sky
-      # disagree by over an hour, and it was replaced by computing both at
-      # `DEFAULT_LOCATION`. So the function lost its argument and should
-      # probably be deleted, not allowed and not rewired.
-      #
-      # The real gap it points at is separate: `DEFAULT_LOCATION` is San
-      # Francisco "until a setting exists for it", and that setting still does
-      # not exist. Until one of those lands, this job is red on purpose.
       - name: Build (warnings are errors)
         run: cargo build --workspace --all-targets
         env:

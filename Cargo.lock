@@ -6213,12 +6213,12 @@ dependencies = [
  "serde",
  "serde_json",
  "similar",
+ "smithy-fisherman",
  "smithy-sky",
  "smithy-voice",
  "streaming-iterator",
  "tempfile",
  "thiserror 2.0.19",
- "tiny-skia 0.11.4",
  "tokio",
  "toml 1.1.4+spec-1.1.0",
  "tree-sitter",
@@ -6234,6 +6234,15 @@ dependencies = [
  "tree-sitter-typescript",
  "vte",
  "which",
+]
+
+[[package]]
+name = "smithy-fisherman"
+version = "0.1.0"
+dependencies = [
+ "kurbo",
+ "peniko",
+ "tiny-skia 0.11.4",
 ]
 
 [[package]]

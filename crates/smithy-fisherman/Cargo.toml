@@ -1,0 +1,27 @@
+[package]
+name = "smithy-fisherman"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The fisherman on the forged rail — routine, poses, and drawing, with no UI"
+
+[lib]
+name = "smithy_fisherman"
+path = "src/lib.rs"
+
+[dependencies]
+# Pinned to exactly what floem resolves today. If these ever diverge from
+# floem's, the editor's `impl Ink for PaintCx` breaks loudly at the glue —
+# which is the right place for it to break.
+kurbo = { workspace = true }
+peniko = { workspace = true }
+
+[dev-dependencies]
+# Headless rasteriser for the preview example, so the silhouette can be
+# rendered to PNG and looked at rather than tuned blind.
+tiny-skia = "0.11"
+
+[[example]]
+name = "fisherman_preview"
+path = "examples/fisherman_preview.rs"
