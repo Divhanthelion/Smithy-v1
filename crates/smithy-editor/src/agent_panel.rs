@@ -1322,9 +1322,60 @@ fn microphone(
 
     // The hover text needs the shortcut too, and both closures outlive us.
     let hover_hotkey = hotkey.clone();
+    let hovered = RwSignal::new(false);
 
-    floem::views::tooltip(
     Stack::horizontal((
+        // The detail, on hover, **above** the row.
+        //
+        // Not `floem::views::tooltip`: it places the overlay at the hover point
+        // plus a hardcoded `(0, 10)` and `TooltipStyle` exposes only a delay, so
+        // it always opens down and to the right. This button sits on the bottom
+        // edge of the window, where down is off-screen — which is exactly where
+        // the first version of this put it. `hover_popup` already establishes
+        // the pattern that works here: an absolutely-positioned container
+        // toggled by a signal, so the app decides where it goes.
+        //
+        // Out of flow, so it cannot move the row it is anchored to.
+        Container::new(
+            Label::derived(move || {
+                let hotkey = hover_hotkey.clone();
+                match state.voice.get() {
+                    Voice::Cold => format!("Dictation. {hotkey} loads the model on first use."),
+                    Voice::Loading => {
+                        "Loading the speech model. The first time takes tens of seconds."
+                            .to_string()
+                    }
+                    Voice::Ready => format!("Dictation. Hold {hotkey} to talk."),
+                    Voice::Listening => "Listening. Release to transcribe.".to_string(),
+                    Voice::Transcribing => "Transcribing what you said.".to_string(),
+                    // The whole reason this hover exists.
+                    Voice::Failed(why) => why,
+                }
+            })
+            .style(|s| {
+                s.font_family(crate::design::SYMBOL.to_string())
+                    .font_size(crate::design::TEXT_SM)
+                    .color(crate::design::FG)
+                    .line_height(1.4)
+            }),
+        )
+        .style(move |s| {
+            if hovered.get() {
+                s.absolute()
+                    // Clear of a row about 24px tall, anchored to its bottom.
+                    .inset_bottom(28.0)
+                    .inset_left(0.0)
+                    .max_width(340.0)
+                    .padding(crate::design::SPACE_2)
+                    .background(crate::design::BG_FLOAT)
+                    .border(1.0)
+                    .border_color(crate::design::BORDER)
+                    .border_radius(crate::design::RADIUS_LG)
+                    .z_index(400)
+            } else {
+                s.display(floem::taffy::Display::None)
+            }
+        }),
         Label::derived(move || {
             match state.voice.get() {
                 // Hollow until there is a model behind it.
@@ -1387,36 +1438,15 @@ fn microphone(
                 })
         }),
     ))
-    .style(|s| s.items_center()),
-    // The detail, on hover. This is the first tooltip in the app, so it styles
-    // itself rather than inheriting one — `TooltipContainerClass` has no theme
-    // entry here and an unstyled tip renders as text on nothing.
-    move || {
-        let hotkey = hover_hotkey.clone();
-        Label::derived(move || match state.voice.get() {
-            Voice::Cold => format!("Dictation. {hotkey} loads the model on first use."),
-            Voice::Loading => {
-                "Loading the speech model. The first time takes tens of seconds.".to_string()
-            }
-            Voice::Ready => format!("Dictation. Hold {hotkey} to talk."),
-            Voice::Listening => "Listening. Release to transcribe.".to_string(),
-            Voice::Transcribing => "Transcribing what you said.".to_string(),
-            // The whole reason this hover exists.
-            Voice::Failed(why) => why,
-        })
-        .style(|s| {
-            s.font_family(crate::design::SYMBOL.to_string())
-                .font_size(crate::design::TEXT_SM)
-                .color(catppuccin::TEXT)
-                .background(catppuccin::CRUST)
-                .border(1.0)
-                .border_color(catppuccin::SURFACE1)
-                .border_radius(6.0)
-                .padding_horiz(8.0)
-                .padding_vert(5.0)
-        })
-    },
-    )
+    .on_event_stop(floem::event::listener::PointerEnter, move |_, _| {
+        hovered.set(true)
+    })
+    .on_event_stop(floem::event::listener::PointerLeave, move |_, _| {
+        hovered.set(false)
+    })
+    // Relative, so the absolute child above anchors to this row rather than
+    // escaping to the panel.
+    .style(|s| s.items_center().position(floem::taffy::Position::Relative))
 }
 
 fn composer(
