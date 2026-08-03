@@ -151,11 +151,26 @@ agent against an architecture that no longer exists.
 
 Each lands independently, is verifiable on its own, and leaves the tree green.
 
-### 1. Spans in the symbol index
-Add `end_line` to `Symbol`; build an interval index per file.
-**Done when:** given `(file, line)`, the enclosing function is returned, with
-tests for nested functions, methods in `impl`, and a line inside no function.
-*Small. No new dependencies.*
+### 1. Spans in the symbol index — **done**
+`Symbol::end_line`, a per-file `FnSpan` index, and
+`SymbolIndex::enclosing(file, line)`. Innermost wins; `None` is a real answer.
+
+Verifiable by hand:
+
+```bash
+cargo run -p smithy-project --example symbols -- <PROJECT> --at src/x.rs:400
+```
+
+Checked against real code: `desktop.rs:400` → `Desktop::restore_session`
+(lines 392–428); `desktop.rs:31`, inside an enum, correctly returns no function.
+
+**It found a bug worth recording.** The walker never descended into function
+*bodies*, so every nested `fn`, `struct` and `const` was invisible to the entire
+index — not just to enclosure. Without the fix, a call inside a nested function
+would have been attributed to the function around it, producing an edge from the
+wrong caller. Descending added 49 symbols here (3,225 → 3,274) for 11 ms
+(469 → 480 ms). `container` is dropped on the way in: an item declared inside a
+method body is not a member of the `impl` type.
 
 ### 2. SCIP reader
 Minimal protobuf walk over `Index.documents[].occurrences[]`.

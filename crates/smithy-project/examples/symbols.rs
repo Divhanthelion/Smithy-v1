@@ -24,8 +24,41 @@ fn main() {
         elapsed.as_secs_f64() * 1000.0
     );
 
+    // `--at path/to/file.rs:42` — which function contains that line?
+    //
+    // The half of the call graph rust-analyzer does not supply: its SCIP output
+    // says an occurrence references definition X, but not which function it sits
+    // inside. This is how that is answered, and how it can be checked by hand.
+    if query.as_deref() == Some("--at") {
+        let Some(spec) = args.next() else {
+            eprintln!("usage: … -- <PROJECT> --at <FILE>:<LINE>");
+            std::process::exit(2);
+        };
+        let (file, line) = match spec.rsplit_once(':') {
+            Some((f, l)) => (f.to_string(), l.parse::<usize>().unwrap_or(0)),
+            None => {
+                eprintln!("expected FILE:LINE, got `{spec}`");
+                std::process::exit(2);
+            }
+        };
+        match index.enclosing(&file, line) {
+            Some(span) => println!(
+                "{file}:{line} is inside {} (lines {}–{})",
+                span.qualified(),
+                span.start_line,
+                span.end_line
+            ),
+            None => println!(
+                "{file}:{line} is inside no function — a call here has no caller to \
+                 attribute an edge to"
+            ),
+        }
+        eprintln!("({} functions indexed in that file)", index.spans_in(&file).len());
+        return;
+    }
+
     let Some(query) = query else {
-        eprintln!("pass a symbol name to look one up");
+        eprintln!("pass a symbol name to look one up, or --at FILE:LINE");
         return;
     };
 

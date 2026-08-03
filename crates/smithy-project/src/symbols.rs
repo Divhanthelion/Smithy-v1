@@ -94,6 +94,15 @@ pub struct Symbol {
     /// `enum Dir { N, S, E, W }` is one line and four variants, and without this
     /// they come back in hash order, which is to say differently each run.
     pub column: usize,
+    /// 1-based line of the item's closing brace.
+    ///
+    /// This is what makes the call graph possible. `rust-analyzer scip` reports
+    /// that an occurrence of `foo` is a reference to definition X, but **not
+    /// which function it happens inside** — its `enclosing_range` field is
+    /// specified for exactly that and rust-analyzer does not emit it (verified
+    /// against 25 documents of real output). Without an enclosing function there
+    /// is no edge, only a scatter of references. So the span comes from here.
+    pub end_line: usize,
     pub is_public: bool,
 }
 
@@ -120,10 +129,48 @@ impl Symbol {
     }
 }
 
+/// The extent of one function, for attributing a line to whatever contains it.
+///
+/// Deliberately not a whole [`Symbol`]: enclosure lookup wants a compact record
+/// it can scan, and duplicating every field of every function would double the
+/// index for no gain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FnSpan {
+    pub name: String,
+    /// The `impl` type or trait, when this is a method.
+    pub container: Option<String>,
+    pub start_line: usize,
+    pub end_line: usize,
+}
+
+impl FnSpan {
+    fn contains(&self, line: usize) -> bool {
+        line >= self.start_line && line <= self.end_line
+    }
+
+    /// How many lines it covers. The tie-break for "innermost".
+    fn width(&self) -> usize {
+        self.end_line.saturating_sub(self.start_line)
+    }
+
+    /// How it is written when naming a call-graph node.
+    pub fn qualified(&self) -> String {
+        match &self.container {
+            Some(container) => format!("{container}::{}", self.name),
+            None => self.name.clone(),
+        }
+    }
+}
+
 /// Every symbol in a project, indexed by bare name.
 #[derive(Debug, Default, Clone)]
 pub struct SymbolIndex {
     by_name: HashMap<String, Vec<Symbol>>,
+    /// Function extents per file, sorted by start line.
+    ///
+    /// The half of the call graph rust-analyzer cannot supply — see
+    /// [`Symbol::end_line`].
+    spans: HashMap<String, Vec<FnSpan>>,
     count: usize,
     files: usize,
 }
@@ -229,9 +276,51 @@ impl SymbolIndex {
         self.files
     }
 
+    /// The function containing `line` in `file`, if any.
+    ///
+    /// **Innermost wins.** A line inside a closure inside a method belongs to
+    /// the method; a line inside a nested `fn` belongs to the nested one. Ties
+    /// are broken by the narrower span, so an outer function never shadows an
+    /// inner one that starts on the same line.
+    ///
+    /// `None` is a real answer, not a failure: `const` initialisers, `static`s,
+    /// `use` statements and struct fields all live outside any function, and a
+    /// reference there has no caller to attribute an edge to.
+    pub fn enclosing(&self, file: &str, line: usize) -> Option<&FnSpan> {
+        self.spans
+            .get(file)?
+            .iter()
+            .filter(|s| s.contains(line))
+            .min_by_key(|s| (s.width(), std::cmp::Reverse(s.start_line)))
+    }
+
+    /// Every function extent in a file, in declaration order.
+    pub fn spans_in(&self, file: &str) -> &[FnSpan] {
+        self.spans.get(file).map(Vec::as_slice).unwrap_or(&[])
+    }
+
     fn insert(&mut self, symbol: Symbol) {
         self.count += 1;
+        // Functions and methods are the only things a call can happen inside.
+        if matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method) {
+            self.spans
+                .entry(symbol.file.clone())
+                .or_default()
+                .push(FnSpan {
+                    name: symbol.name.clone(),
+                    container: symbol.container.clone(),
+                    start_line: symbol.line,
+                    end_line: symbol.end_line,
+                });
+        }
         self.by_name.entry(symbol.name.clone()).or_default().push(symbol);
+    }
+
+    /// Put each file's spans in declaration order. Called once after a build.
+    fn sort_spans(&mut self) {
+        for spans in self.spans.values_mut() {
+            spans.sort_by_key(|s| (s.start_line, s.end_line));
+        }
     }
 
     /// Walk a project and index every Rust file in it.
@@ -274,6 +363,7 @@ impl SymbolIndex {
                 index.insert(symbol);
             }
         }
+        index.sort_spans();
         index
     }
 }
@@ -410,13 +500,25 @@ fn walk(
                     SymbolKind::Function
                 };
                 out.push(make(child, source, &name, kind, container, module, file));
+
+                // Descend into the body. Nested `fn`, `struct` and `const` are
+                // legal Rust and were previously invisible to the entire index —
+                // which matters most for enclosure, where a call inside a nested
+                // function would otherwise be attributed to the function around
+                // it and produce an edge from the wrong caller.
+                //
+                // `container` is dropped on the way in: an item declared inside a
+                // method body is not a member of the `impl` type.
+                if let Some(body) = child.child_by_field_name("body") {
+                    walk(body, source, module, file, None, out);
+                }
             }
             "struct_item" => push_named(child, source, SymbolKind::Struct, module, file, out),
             "type_item" => push_named(child, source, SymbolKind::Type, module, file, out),
             "const_item" => push_named(child, source, SymbolKind::Const, module, file, out),
             "static_item" => push_named(child, source, SymbolKind::Static, module, file, out),
             // Bodies and blocks that hold more items.
-            "declaration_list" | "source_file" => {
+            "declaration_list" | "source_file" | "block" => {
                 walk(child, source, module, file, container, out)
             }
             _ => {}
@@ -464,6 +566,7 @@ fn make(
         // tree-sitter rows are 0-based; editors and `read` offsets are not.
         line: node.start_position().row + 1,
         column: node.start_position().column,
+        end_line: node.end_position().row + 1,
         is_public: has_visibility(node, source),
     }
 }
@@ -693,6 +796,130 @@ mod tests {
     fn nearest_gives_up_rather_than_returning_everything() {
         let index = built();
         assert!(index.nearest("Zq", 5).is_empty());
+    }
+
+    // --- enclosure: the half of the call graph rust-analyzer does not supply ---
+
+    fn indexed(source: &str) -> SymbolIndex {
+        let mut index = SymbolIndex::default();
+        for s in symbols_in(source, "m", "src/m.rs") {
+            index.insert(s);
+        }
+        index.sort_spans();
+        index
+    }
+
+    #[test]
+    fn a_line_inside_a_function_is_attributed_to_it() {
+        // 1 fn outer   2 body   3 }
+        let index = indexed("fn outer() {\n    call_me();\n}\n");
+        assert_eq!(index.enclosing("src/m.rs", 2).unwrap().name, "outer");
+    }
+
+    /// The whole point: a call inside a method must attribute to the method,
+    /// not to nothing and not to the type.
+    #[test]
+    fn a_line_inside_a_method_is_attributed_to_the_method() {
+        let index = indexed(
+            "impl Desktop {\n    fn restore_session(&mut self) {\n        load();\n    }\n}\n",
+        );
+        let found = index.enclosing("src/m.rs", 3).expect("attributed");
+        assert_eq!(found.name, "restore_session");
+        assert_eq!(found.container.as_deref(), Some("Desktop"));
+        assert_eq!(found.qualified(), "Desktop::restore_session");
+    }
+
+    /// Innermost wins. An outer function must not swallow a nested one.
+    #[test]
+    fn a_nested_function_shadows_the_one_around_it() {
+        let index = indexed(
+            "fn outer() {\n    fn inner() {\n        deep();\n    }\n    shallow();\n}\n",
+        );
+        assert_eq!(index.enclosing("src/m.rs", 3).unwrap().name, "inner");
+        assert_eq!(index.enclosing("src/m.rs", 5).unwrap().name, "outer");
+    }
+
+    /// `None` is a real answer. A reference in a `const` initialiser, a `use`
+    /// line or a struct field has no caller — the call-graph builder counts
+    /// these rather than inventing an edge for them.
+    #[test]
+    fn a_line_outside_every_function_has_no_enclosing_one() {
+        let index = indexed("use crate::x;\n\nfn f() {\n    y();\n}\n\nconst K: u8 = 1;\n");
+        assert!(index.enclosing("src/m.rs", 1).is_none(), "a use line");
+        assert!(index.enclosing("src/m.rs", 7).is_none(), "a const");
+        assert!(index.enclosing("src/m.rs", 4).is_some(), "but the body is");
+    }
+
+    /// The walker used to stop at a function's signature, so anything declared
+    /// inside a body was invisible to the whole index — not just to enclosure.
+    #[test]
+    fn items_nested_inside_a_function_body_are_indexed() {
+        let symbols = symbols_in(
+            "fn outer() {\n    fn helper() {}\n    struct Local;\n    const K: u8 = 1;\n}\n",
+            "m",
+            "src/m.rs",
+        );
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        for expected in ["outer", "helper", "Local", "K"] {
+            assert!(names.contains(&expected), "missing {expected}: {names:?}");
+        }
+    }
+
+    /// An item declared inside a method body is not a member of the `impl` type.
+    #[test]
+    fn a_function_nested_in_a_method_is_not_a_method_of_that_type() {
+        let symbols = symbols_in(
+            "impl Desktop {\n    fn m(&self) {\n        fn helper() {}\n    }\n}\n",
+            "m",
+            "src/m.rs",
+        );
+        let helper = symbols.iter().find(|s| s.name == "helper").unwrap();
+        assert_eq!(helper.kind, SymbolKind::Function);
+        assert_eq!(helper.container, None);
+    }
+
+    #[test]
+    fn an_unknown_file_has_no_spans_rather_than_panicking() {
+        let index = indexed("fn f() {}\n");
+        assert!(index.enclosing("src/nowhere.rs", 1).is_none());
+        assert!(index.spans_in("src/nowhere.rs").is_empty());
+    }
+
+    /// Only things a call can happen *inside* get spans. A struct is not a
+    /// caller, and indexing it as one would attribute its fields' types as
+    /// calls from it.
+    #[test]
+    fn only_functions_and_methods_get_spans() {
+        let index = indexed(
+            "pub struct S { a: u8 }\npub enum E { A }\nfn f() {\n    g();\n}\n",
+        );
+        let names: Vec<&str> = index
+            .spans_in("src/m.rs")
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["f"]);
+    }
+
+    #[test]
+    fn spans_come_back_in_declaration_order() {
+        let index = indexed("fn a() {\n}\nfn b() {\n}\nfn c() {\n}\n");
+        let names: Vec<&str> = index
+            .spans_in("src/m.rs")
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
+    }
+
+    /// `end_line` is what the span is built from, so it has to be the closing
+    /// brace and not the signature.
+    #[test]
+    fn end_line_is_the_closing_brace_not_the_signature() {
+        let symbols = symbols_in("fn f() {\n    a();\n    b();\n}\n", "m", "src/m.rs");
+        let f = symbols.iter().find(|s| s.name == "f").unwrap();
+        assert_eq!(f.line, 1);
+        assert_eq!(f.end_line, 4);
     }
 
     #[test]
