@@ -10,18 +10,36 @@ description = "The fisherman on the forged rail — routine, poses, and drawing,
 name = "smithy_fisherman"
 path = "src/lib.rs"
 
+[features]
+# Headless raster + JSON report for the sheets harness and golden tests.
+# Keeps tiny-skia off the floem-free default build; enable for the example
+# and the golden integration test.
+harness = ["dep:tiny-skia", "dep:serde_json"]
+
 [dependencies]
 # Pinned to exactly what floem resolves today. If these ever diverge from
 # floem's, the editor's `impl Ink for PaintCx` breaks loudly at the glue —
 # which is the right place for it to break.
 kurbo = { workspace = true }
 peniko = { workspace = true }
-
-[dev-dependencies]
-# Headless rasteriser for the preview example, so the silhouette can be
-# rendered to PNG and looked at rather than tuned blind.
-tiny-skia = "0.11"
+# Optional: only pulled in behind `harness`. A drawing crate may rasterise
+# itself for checks; it must not pull floem.
+tiny-skia = { version = "0.11", optional = true }
+# Optional: report.json for the harness. Same feature gate as tiny-skia so
+# a default `cargo test -p smithy-fisherman` stays free of both.
+serde_json = { workspace = true, optional = true }
 
 [[example]]
 name = "fisherman_preview"
 path = "examples/fisherman_preview.rs"
+required-features = ["harness"]
+
+[[example]]
+name = "sheets"
+path = "examples/sheets.rs"
+required-features = ["harness"]
+
+[[test]]
+name = "harness_goldens"
+path = "tests/harness_goldens.rs"
+required-features = ["harness"]
