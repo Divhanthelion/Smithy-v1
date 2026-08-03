@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "apps/smithy",
     "crates/smithy-editor",
+    "crates/smithy-fisherman",
     "crates/smithy-tools",
     "crates/smithy-agent",
     "crates/smithy-project",
@@ -28,6 +29,7 @@ rust-version = "1.91"
 [workspace.dependencies]
 # --- Internal crates ---
 smithy-editor = { path = "crates/smithy-editor" }
+smithy-fisherman = { path = "crates/smithy-fisherman" }
 smithy-tools = { path = "crates/smithy-tools" }
 smithy-agent = { path = "crates/smithy-agent" }
 smithy-project = { path = "crates/smithy-project" }
@@ -45,6 +47,11 @@ smithy-voice = { path = "crates/smithy-voice" }
 # agent→UI boundary; with it our existing crossbeam channels drain straight
 # into floem's main thread exactly as before.
 floem = { git = "https://github.com/lapce/floem", rev = "778bb5f2aa08429e579ee2e6ac97e84fbf18b618", features = ["crossbeam"] }
+
+# Exact versions floem resolves today. smithy-fisherman pins these so the
+# editor's `impl Ink for PaintCx` stays a type match, not a silent fork.
+kurbo = "0.13.1"
+peniko = "0.6.1"
 
 # --- Text engine ---
 # `ropey` backs `Buffer` (file loading) and the LSP position conversions. It is

@@ -7,20 +7,21 @@ A brief for models. Short and stable on purpose — session-specific state lives
 
 ## What this is
 
-Smithy: a Rust code editor with a built-in coding agent. Seven crates, one
+Smithy: a Rust code editor with a built-in coding agent. Eight crates, one
 binary.
 
 | Crate | What it is | UI dependency? |
 |---|---|---|
 | `apps/smithy` | the binary — window, menus, panels wired together | yes |
 | `smithy-editor` | panels, syntax styling, LSP client, terminal, file browser | yes (floem) |
+| `smithy-fisherman` | the rail figure: routine, poses, drawing via `Ink` | **no** |
 | `smithy-agent` | agent loop, budgets, session persistence, providers | **no** |
 | `smithy-tools` | the agent's tools and the capability sandbox | **no** |
 | `smithy-project` | project detection, context extraction, call graph, symbols | **no** |
 | `smithy-sky` | astronomy for the backdrop; zero dependencies | **no** |
 | `smithy-voice` | microphone in, string out | **no** |
 
-The four UI-free crates are a deliberate boundary: a different front-end would
+The five UI-free crates are a deliberate boundary: a different front-end would
 be a new consumer, not a rewrite. Do not reach for floem inside them.
 
 ## Build and test

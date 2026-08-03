@@ -1,7 +1,7 @@
 //! Headless renderer for the fisherman: draws him to PNGs so his silhouette
 //! can be *looked at* rather than tuned blind.
 //!
-//!     cargo run -p smithy-editor --example fisherman_preview
+//!     cargo run -p smithy-fisherman --example fisherman_preview
 //!
 //! Writes `/tmp/fisherman/*.png`:
 //!   poses.png   — every activity, large, in a labelled grid order (see stdout)
@@ -12,11 +12,12 @@
 //! Scene sheets call [`fisherman::paint`] directly. Poses/walk sheets are
 //! isolation grids: pose APIs + palette + Ink, not a second copy of the hut.
 
-use floem::peniko::kurbo::{BezPath, Circle, Ellipse, PathEl, Point, Rect, Shape};
-use floem::peniko::Color;
+use kurbo::{BezPath, Circle, Ellipse, PathEl, Point, Rect, Shape};
+use peniko::Color;
 
-use smithy_editor::fisherman::{self as f, Ink, Scene};
-use smithy_editor::routine::{Doing, Place};
+use smithy_fisherman::fisherman::{self as f, Scene};
+use smithy_fisherman::routine::{Doing, Place};
+use smithy_fisherman::Ink;
 
 // The frame's steel, from forged.rs, as a backdrop to judge contrast against.
 // Not fisherman palette — it is the rail he stands on.
