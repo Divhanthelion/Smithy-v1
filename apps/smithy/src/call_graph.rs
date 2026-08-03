@@ -110,10 +110,11 @@ fn graph_summary(graph: &CallGraph, stale: &Staleness) -> String {
     }
     let f = files.len();
     let desc = stale.describe();
+    // ASCII separators only — the mono UI font often lacks middots/arrows.
     if desc.is_empty() {
-        format!("{n} nodes · {e} edges · {f} files")
+        format!("{n} nodes, {e} edges, {f} files")
     } else {
-        format!("{n} nodes · {e} edges · {f} files · {desc}")
+        format!("{n} nodes, {e} edges, {f} files, {desc}")
     }
 }
 
@@ -920,7 +921,7 @@ fn toolbar(ui: CallGraphUi, on_build: impl Fn() + 'static) -> impl IntoView {
             };
             let callers = graph.callers(focus).len();
             let callees = graph.callees(focus).len();
-            format!("{callers}↑ · {callees}↓")
+            format!("{callers} callers / {callees} callees")
         })
         .style(move |s| {
             s.font_size(design::TEXT_XS)
@@ -1165,7 +1166,7 @@ fn jump_hits(graph: &CallGraph, query: &str) -> Vec<(u32, String)> {
             .take(8)
             .map(|(i, d)| {
                 let n = &graph.nodes[i as usize];
-                (i, format!("{} · {d}", n.qualified()))
+                (i, format!("{} ({d})", n.qualified()))
             })
             .collect();
     }
