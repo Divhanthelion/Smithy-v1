@@ -13,7 +13,8 @@ pub struct ModelConfig {
     ///
     /// Handed to `hf-hub` when the model loads. It was set and never read for
     /// as long as this existed, so the weights went to `~/.cache/huggingface`
-    /// while HANDOFF said otherwise.
+    /// while every note about this field claimed they went where it pointed —
+    /// a setting that configured nothing and documentation that agreed with it.
     pub cache_dir: String,
     /// Hugging Face repository.
     pub repo_id: String,

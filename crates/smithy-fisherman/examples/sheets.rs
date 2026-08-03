@@ -13,7 +13,9 @@
 //!   diff/*.png    — only on golden mismatch
 //!
 //! Read report.json first. Open a PNG only when a check fails or the change
-//! was aesthetic. See docs/FISHERMAN_VERIFICATION_PLAN.md.
+//! was aesthetic — the ordering is the budget strategy, not a preference. A
+//! reader with eyes who opens four sheets every iteration spends the whole
+//! budget on images that say "still fine".
 
 use std::path::PathBuf;
 use std::process::ExitCode;

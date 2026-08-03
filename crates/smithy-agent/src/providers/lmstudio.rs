@@ -310,8 +310,8 @@ impl Provider for LmStudio {
     ) -> Result<Completion, ProviderError> {
         // Streaming only. The blocking path and its wire types were removed:
         // `stream` was hardcoded true with no way to set it, so nothing could
-        // reach them — while nine tests exercised them and passed, which is
-        // exactly the shape HANDOFF §8 warns about.
+        // reach them — while nine tests exercised them and passed. A suite that
+        // is green over unreachable code is not reporting on the program.
         self.complete_streaming(request, on_delta).await
     }
 }

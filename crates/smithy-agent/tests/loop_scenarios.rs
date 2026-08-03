@@ -8,14 +8,15 @@
 //! completions, so every scenario here is deterministic and runs in milliseconds —
 //! which is the point. A test that needs LM Studio running is a test nobody runs.
 //!
-//! The scenarios come from `docs/research/05-agent-loop-testing.md` and from
-//! HANDOFF §7's own list: multi-turn, parallel tool calls, hook denial, budget
-//! exhaustion, malformed→recovery, empty→recovery.
+//! The scenarios are the six ways this loop has actually gone wrong: multi-turn,
+//! parallel tool calls, hook denial, budget exhaustion, malformed→recovery,
+//! empty→recovery.
 //!
 //! **Every assertion here is about observable state** — history contents, tool
 //! results, the `Outcome`, files on disk. Never about the model's prose, and never
-//! about its reasoning channel. That rule is why the eval harness in §7 exists and
-//! it applies just as much to these.
+//! about its reasoning channel. Asserting on generated text makes a test that
+//! fails when the model is merely differently right, which teaches you to
+//! delete it.
 
 use std::sync::Arc;
 

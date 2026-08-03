@@ -1,8 +1,9 @@
 //! Automated checks and contact sheets for the fisherman.
 //!
-//! Order is the budget strategy: assert first (`report.json`), open a PNG
-//! only when a number fails or the change was aesthetic. See
-//! `docs/FISHERMAN_VERIFICATION_PLAN.md` §3–4.
+//! Order is the budget strategy: assert first (`report.json`), open a PNG only
+//! when a number fails or the change was aesthetic. Numbers are cheap to read
+//! and catch everything a number can catch; pictures are for the rest, which is
+//! the part no threshold decides.
 //!
 //! Tier A/B run via `cargo run --example sheets --features harness` and as
 //! an integration test behind the same feature, so a regression cannot land

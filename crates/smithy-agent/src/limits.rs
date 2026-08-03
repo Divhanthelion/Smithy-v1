@@ -32,8 +32,11 @@ pub struct Limits {
     /// Per-call caps are fine in isolation (`read` 2000 lines, `web_fetch` 64k
     /// chars) but nothing bound their *sum*. One `web_fetch` at default is
     /// ~16k tokens of uncached history; three greps and two fetches clear the
-    /// soft context warn inside five steps — all permanent, none of it in the
-    /// cached prefix (HANDOFF §5.1). Past this threshold we append a narrowing
+    /// soft context warn inside five steps — all permanent, and none of it in
+    /// the cached prefix. That last part is what makes this worth bounding:
+    /// the frozen head of the prompt measures 76–79% cache hits, so it is
+    /// nearly free to re-send, while tool results are new bytes every turn and
+    /// are billed cold every time. Past this threshold we append a narrowing
     /// hint to the result itself: warn, don't truncate — cutting risks removing
     /// the answer the model needed, and would fail silently.
     #[serde(default = "default_tool_result_warn_chars")]

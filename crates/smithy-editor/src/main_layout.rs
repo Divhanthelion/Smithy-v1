@@ -77,9 +77,9 @@ impl Default for LayoutTheme {
 // with no consumer. That is the same shape as the defect that once let the tab bar
 // and the editor disagree about dirty state, caught before it could diverge.
 //
-// Its tests were the pattern HANDOFF §8 warns about: `test_main_layout_state_toggle_sidebar`
-// asserted that `toggle_sidebar` flipped a boolean. It did, forever, over code
-// nothing called.
+// Its tests were the tautological kind — coverage over code nothing reaches:
+// `test_main_layout_state_toggle_sidebar` asserted that `toggle_sidebar`
+// flipped a boolean. It did, forever, over code nothing called.
 //
 // The layout needs one thing, and takes it directly.
 

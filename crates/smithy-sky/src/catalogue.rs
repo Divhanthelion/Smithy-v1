@@ -16,8 +16,9 @@
 //! The first version shipped a curated list of the brightest named stars,
 //! because fetching the real catalogue needed a network and writing 1,630
 //! entries from memory would have meant inventing most of them — plausible,
-//! confident and wrong, which is the failure `docs/research/README.md` exists
-//! to catch. That reasoning was sound and the conclusion was still worth
+//! confident and wrong, which is the one failure mode a star catalogue cannot
+//! survive: nobody checks a coordinate they cannot see is off. That reasoning
+//! was sound and the conclusion was still worth
 //! revisiting: the catalogue is a single 590 KB request with no authentication,
 //! and once it is a *file* rather than a memory there is nothing to invent.
 //!

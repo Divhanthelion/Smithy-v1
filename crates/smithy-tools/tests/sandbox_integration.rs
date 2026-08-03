@@ -8,13 +8,13 @@
 //! So these drive real tools through [`Registry::execute`], which is the only
 //! dispatch path, against a real temporary workspace on a real filesystem.
 //!
-//! The escape vectors and their priority order come from
-//! `docs/research/07-sandbox-adversarial.md` — vectors 1 (absolute path ingress),
-//! 2 (relative `..` traversal) and 3 (external symlink escapes), which it rates
-//! extreme-to-high risk for minimal effort. Vector 4 is `/proc`, which does not
-//! exist on macOS, and vectors 6 and 7 (TOCTOU races, APFS case aliasing) it rates
-//! high-effort and lower-risk; they are noted in HANDOFF rather than attempted
-//! here.
+//! The escape vectors are ordered by risk-per-unit-of-effort. Covered here:
+//! absolute path ingress, relative `..` traversal, and external symlink escapes
+//! — extreme-to-high risk and cheap to attempt, so they are the ones an attacker
+//! reaches for first. Not covered, deliberately: `/proc`, which does not exist
+//! on macOS; and TOCTOU races and APFS case aliasing, which are high-effort and
+//! lower-risk. Those two remain untested and are the gap to close first if this
+//! sandbox ever faces hostile input rather than a confused model.
 
 use serde_json::{json, Value};
 use smithy_tools::{Registry, ToolCall, ToolCtx, Workspace};

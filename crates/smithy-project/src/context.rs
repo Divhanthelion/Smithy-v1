@@ -117,8 +117,8 @@ pub struct ProjectContext {
     /// running session — whose system prompt is frozen — and offer a new
     /// session. That was designed and never built: the app plumbed the value
     /// through three layers and never compared it against anything, so the
-    /// mechanism the doc described did not exist. The plumbing is gone; see
-    /// HANDOFF §10. What remains is a genuinely useful equality check, and
+    /// mechanism the design described did not exist. The plumbing is gone.
+    /// What remains is a genuinely useful equality check, and
     /// `rendering_is_deterministic` is what reads it.
     pub fingerprint: u64,
     /// Populated when extraction partly failed; the context is still usable.
@@ -161,7 +161,9 @@ impl ProjectContext {
 /// Build the context block for a project.
 ///
 /// `graph` is optional and never built here. The call graph is an explicit,
-/// user-triggered index (AGENTS.md); opening a session must not pay for one.
+/// user-triggered index that costs ~10 s and gigabytes of rust-analyzer;
+/// opening a session must not pay for one, and this is the call site most
+/// likely to make it happen by accident.
 /// When present — even a stale one — public-API rows are ordered by fan-in so
 /// truncation cuts the least-central symbols. A stale graph yields a stale
 /// *ranking*, not a stale *fact*; wrong order is cheap, wrong signatures are

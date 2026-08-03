@@ -879,8 +879,10 @@ pub fn setup_agent_effect(agent: AgentState) {
                 } => {
                     // Stash once per completion — budget_bar only reads this.
                     // Computing ledger (or walking tools/history) inside
-                    // Label::derived would re-run at paint rate; AGENTS.md
-                    // names the prior instances.
+                    // Label::derived would re-run at paint rate. That exact
+                    // mistake has been paid for twice here: an unconditional
+                    // `signal.set` from a paint path, and `CallGraph::staleness`
+                    // computed while painting. Both hung the window.
                     panel.context_tokens.set(prompt_tokens);
                     panel.context_usage.set(Some(snapshot));
                 }

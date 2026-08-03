@@ -979,11 +979,12 @@ fn app_view() -> impl IntoView {
     // rather than replacing it, so nothing about the editor changes when the
     // look does.
     //
-    // The sky goes *under* the circuitry rather than instead of it, which is
-    // the conservative answer to the open question in `docs/CELESTIAL.md`. The
-    // mosaic is sparse translucent tiles rather than a solid ground, so the
-    // star field reads through it. If it turns out to read as noise over the
-    // stars, dropping `draw_mosaic` is one line.
+    // The sky goes *under* the circuitry rather than instead of it. That was
+    // the open question — replace or layer — and layering is the conservative
+    // answer: it keeps both and can be undone, where replacing throws the
+    // circuitry away to find out. The mosaic is sparse translucent tiles rather
+    // than a solid ground, so the star field reads through it. If it turns out
+    // to read as noise over the stars, dropping `draw_mosaic` is one line.
     let editor_view = Stack::new((
         smithy_editor::celestial::sky_backdrop(
             aesthetic,
