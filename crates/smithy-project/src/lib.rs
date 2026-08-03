@@ -25,6 +25,7 @@
 pub mod context;
 pub mod registry;
 pub mod rust;
+pub mod scip;
 pub mod symbols;
 
 use std::path::{Path, PathBuf};

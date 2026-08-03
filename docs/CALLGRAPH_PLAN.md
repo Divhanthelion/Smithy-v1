@@ -172,11 +172,39 @@ wrong caller. Descending added 49 symbols here (3,225 → 3,274) for 11 ms
 (469 → 480 ms). `container` is dropped on the way in: an item declared inside a
 method body is not a member of the `impl` type.
 
-### 2. SCIP reader
-Minimal protobuf walk over `Index.documents[].occurrences[]`.
-**Done when:** parsing `kernelos.scip` yields 14,027 occurrences with 2,445
-carrying `symbol_roles`, matching the Python probe exactly.
-*Isolated and pure — testable against a checked-in fixture.*
+### 2. SCIP reader — **done**
+`smithy_project::scip` — a ~120-line protobuf walk, no `prost`, no `build.rs`.
+
+**Acceptance met exactly.** The counts were fixed by an independent Python parse
+*before* the Rust existed, and it reproduces them: 25 documents, **14,027
+occurrences, 2,445 with roles, 2,445 definitions** — in 10 ms for 1.2 MB.
+
+```bash
+cargo run -p smithy-project --example scip -- /tmp/x.scip [SYMBOL]
+```
+
+Two findings that change milestone 3:
+
+- **rust-analyzer never sets the `Import` role** — 0 of 14,027. So `use`
+  statements cannot be excluded by role. They do not need to be: a `use` line is
+  at file top level, outside every function, so `enclosing()` returns `None` and
+  they fall out naturally. The two halves cover each other.
+- **11,582 of 14,027 occurrences are plain references** (no role at all). That is
+  the raw edge candidate pool, before filtering to functions and attributing
+  callers.
+
+The reader is deliberately tolerant — a truncated index yields the documents that
+parsed, because `rust-analyzer scip` was observed emitting `ERROR Bug:` lines on
+real input and losing a whole graph over two bad entries would be the wrong
+trade. Malformed input terminates rather than looping; this file is written by
+another program and a parser that can hang on it can hang the editor.
+
+**The pipeline is already demonstrable end to end.** SCIP: `restore_session`
+defined at `desktop.rs:392`, referenced at `desktop.rs:112`. Enclosure:
+`desktop.rs:112` is inside `Desktop::create` (76–114). Source confirms
+`desktop.restore_session(session, &on_plugin_notify)` on that line. That is one
+real, compiler-resolved edge — `Desktop::create → Desktop::restore_session` —
+assembled from both halves.
 
 ### 3. Graph builder
 Run `rust-analyzer scip`, parse, attribute each reference to its enclosing
