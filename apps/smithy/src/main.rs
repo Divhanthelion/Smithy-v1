@@ -238,8 +238,9 @@ fn app_view() -> impl IntoView {
     // press the *same* handle, or one of them silently does nothing — which is
     // what happened, and only an unused-`mut` warning gave it away.
     //
-    // `None` when there is no capture device at all, in which case the button
-    // reports that rather than pretending.
+    // Always present. It touches no audio hardware here — the input device is
+    // found at the press that needs one, so a headset connected after launch
+    // works without a restart.
     let voice_control = voice::VoiceControl::new(agent_state.panel.voice, agent_state.panel.input);
     // Read once. A hotkey is a preference, not a live input, and re-reading a
     // file on every keystroke would be a strange thing to do.
@@ -466,11 +467,7 @@ fn app_view() -> impl IntoView {
             on_send,
             on_stop,
             move || signals.agent_visible.set(false),
-            move || {
-                if let Some(voice) = &voice {
-                    voice.press();
-                }
-            },
+            move || voice.press(),
             on_reconnect,
             on_settings,
             on_clear_context,
@@ -1041,9 +1038,7 @@ fn app_view() -> impl IntoView {
                 // per keystroke — the file is a preference, not a live input.
                 if voice_hotkey.matches(key_event) {
                     handled = true;
-                    if let Some(voice) = &voice_control {
-                        voice.press();
-                    }
+                    voice_control.press();
                 }
                 // Save. Cmd on macOS, Ctrl elsewhere — accept either rather than
                 // making the shortcut platform-dependent in a cross-platform app.
