@@ -51,11 +51,28 @@ it keeps working with the network off. Point it at DeepSeek or OpenRouter if you
 would rather. Either way the editor is not a subscription and the code is not
 someone else's training data.
 
-**Honestly, what it is not:** macOS only. The deep features — symbol index, call
-graph — are Rust; other languages get syntax highlighting, LSP and the agent,
-but not the map. It is young, and the [known gaps](#known-gaps) below are the
-real list, not a polite one. If you want the most mature agent IDE, it is not
-this. If you want one whose claims you can verify, that is the whole idea.
+**It leaves room for the model.** Smithy idles around **200 MB**. Measured on
+the same Mac at the same moment, Cursor's processes totalled **3.0 GB** and
+Claude's desktop app **2.2 GB**. That gap is not a benchmark boast — on Apple
+Silicon the memory is *unified*, so the editor, the operating system and your
+local LLM all draw from one pool. Whatever your editor is holding is weights you
+cannot load. On a 16 GB M-series machine, a three-gigabyte editor is the
+difference between running a 13B model and not running one.
+
+**Dictation is built in, and local.** Hold a key and talk; `whisper-large-v3-turbo`
+runs in-process and the audio never leaves the machine. No separate app, no API
+call, no upload. It is the same bet as the rest of the editor — your hardware,
+your data — applied to the part of coding nobody wants to type.
+
+**Honestly, what it is not:** macOS only, and Apple Silicon is where it makes
+sense. The deep features — symbol index, call graph — are Rust; other languages
+get syntax highlighting, LSP and the agent, but not the map. Dictation costs
+what it saves: the editor is 200 MB until you load Whisper, and about 3.2 GB
+after, because the weights are currently loaded at f32 on the CPU. That is a
+known and fixable inefficiency rather than a floor — see
+[known gaps](#known-gaps). It is young, and that list is the real one, not a
+polite one. If you want the most mature agent IDE, it is not this. If you want
+one whose claims you can verify, that is the whole idea.
 
 ---
 
@@ -512,6 +529,12 @@ Honest list, short:
   untried; if you use one, we'd like to hear how it went.
 - **The agent's picture of your project is a snapshot** from when the session
   started. After restructuring a project, start a new conversation.
+- **Whisper costs about 3.2 GB resident, and it should not.** The weights ship
+  as f16 and are loaded as f32 — 809M parameters at four bytes each — on the CPU,
+  while the GPU idles. Loading at f16 halves it; a quantized GGUF
+  (`candle-transformers` already ships `whisper::quantized_model`) should reach
+  roughly 400–600 MB. Until then, dictation is by far the most expensive thing
+  in the editor.
 - Completions aren't implemented yet.
 
 **Found something else?** Please open an issue — that's genuinely the most
