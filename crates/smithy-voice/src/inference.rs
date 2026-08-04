@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use candle_core::{Device, IndexOp, Tensor};
+use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::whisper::{self as m, model::Whisper, Config};
 use std::sync::mpsc;
@@ -7,6 +7,20 @@ use tokenizers::Tokenizer;
 
 use crate::model::ModelConfig;
 use crate::voice_debug;
+
+/// What the weights are held as in memory.
+///
+/// **Not `m::DTYPE`, which is f32.** `whisper-large-v3-turbo` ships f16 on
+/// disk — 1.51 GiB for 809M parameters — and loading it as f32 widened every
+/// weight on the way in for nothing: 809M × 4 bytes ≈ 3.2 GB resident, which is
+/// what the memory meter was reporting and roughly sixteen times the rest of
+/// the editor. Held as it arrives, it is half that.
+///
+/// Speech recognition is not a precision-sensitive workload — the model was
+/// trained in mixed precision and is judged on word error rate, not on the
+/// third decimal place of a logit. The decode loop still argmaxes in f32; see
+/// `transcribe`, which converts the logits back at the one point it matters.
+const DTYPE: DType = DType::F16;
 
 /// What the supervisor is told to do.
 pub enum Command {
@@ -192,7 +206,7 @@ impl WhisperEngine {
 
         // Load model weights
         let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[weights_path], m::DTYPE, &device)
+            VarBuilder::from_mmaped_safetensors(&[weights_path], DTYPE, &device)
                 .context("Failed to load model weights")?
         };
         let model = Whisper::load(&vb, config.clone()).context("Failed to build Whisper model")?;
@@ -314,6 +328,12 @@ impl WhisperEngine {
         let mel = mel
             .narrow(2, 0, encoder_frames(produced))
             .context("Failed to trim the mel spectrogram to the encoder window")?;
+        // `pcm_to_mel` returns f32 and the weights are [`DTYPE`]. candle will
+        // not mix them — the encoder's first matmul fails on the mismatch
+        // rather than converting for you.
+        let mel = mel
+            .to_dtype(DTYPE)
+            .context("Failed to convert the mel spectrogram to the model's dtype")?;
 
         // Encode
         let audio_features = self
@@ -348,7 +368,13 @@ impl WhisperEngine {
                 .decoder
                 .final_linear(&ys.i((..1, seq_len - 1..))?)?
                 .squeeze(0)?
-                .squeeze(0)?;
+                .squeeze(0)?
+                // Back to f32 for the one step that cares. The suppress mask is
+                // f32 and carries `-inf`, which f16 cannot hold as anything but
+                // an overflow, and the argmax below reads `Vec<f32>`. Converting
+                // here keeps both correct and costs one vocab-sized vector.
+                .to_dtype(DType::F32)
+                .context("Failed to convert logits for sampling")?;
 
             // Apply suppress tokens
             let logits = logits.broadcast_add(&self.suppress_tokens)?;
