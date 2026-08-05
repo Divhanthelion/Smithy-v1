@@ -210,7 +210,11 @@ pub fn describe(path: &Path, root: &Path) -> Attachment {
     };
 
     let bytes = meta.len();
-    let kind = if bytes > MAX_FILE_BYTES {
+    let kind = if !meta.file_type().is_file() {
+        // FIFOs and devices can report a tiny size and then block forever when
+        // sniffed. User-selected does not mean safe to open as a byte file.
+        AttachmentKind::Unreadable
+    } else if bytes > MAX_FILE_BYTES {
         AttachmentKind::TooLarge
     } else if looks_binary(path) {
         AttachmentKind::Binary
@@ -323,6 +327,120 @@ pub fn materialize(
     out.push_str("[End of attached files]\n\n");
     out.push_str(task);
     out
+}
+
+/// Materialize real files with bounded, cancellation-aware reads.
+///
+/// Unlike the injectable helper above, this is the production path. It checks
+/// between fixed-size reads and refuses non-regular descriptors, so Stop waits
+/// for a worker that is guaranteed to reach a cooperative boundary rather than
+/// detaching an unbounded `read_to_string`.
+pub fn materialize_controlled(
+    attachments: &[Attachment],
+    task: &str,
+    check: impl Fn() -> Result<(), String>,
+) -> Result<String, String> {
+    let included: Vec<&Attachment> = attachments.iter().filter(|a| a.included).collect();
+    if included.is_empty() {
+        return Ok(task.to_string());
+    }
+
+    let mut out = String::from("[Files attached by the user]\n\n");
+    let mut remaining = MAX_TOTAL_BYTES;
+    for attachment in included {
+        check()?;
+        if !attachment.kind.inlines() {
+            let note = attachment.kind.note().unwrap_or("not shown");
+            out.push_str(&format!(
+                "- `{}` ({note}, {}). Use `read` if you need its contents.\n",
+                attachment.display,
+                human_size(attachment.bytes)
+            ));
+            continue;
+        }
+
+        let cap = MAX_FILE_BYTES.min(remaining);
+        match read_regular_bounded(&attachment.path, cap, &check) {
+            Ok(content) => {
+                remaining = remaining.saturating_sub(content.len() as u64);
+                out.push_str(&format!(
+                    "--- {} ---\n{}\n{}\n{}\n\n",
+                    attachment.display,
+                    fence(&attachment.display),
+                    content.trim_end(),
+                    "```"
+                ));
+            }
+            Err(error) => {
+                check()?;
+                out.push_str(&format!(
+                    "- `{}` could not be read: {error}\n",
+                    attachment.display
+                ));
+            }
+        }
+    }
+    check()?;
+    out.push_str("[End of attached files]\n\n");
+    out.push_str(task);
+    Ok(out)
+}
+
+/// A chunk small enough that Stop cannot be hidden behind a large cold read.
+///
+/// Sixteen KiB is not a throughput tuning knob; it bounds the work between
+/// cancellation checks after the old `read_to_string` could block for the whole
+/// attachment with no checkpoint.
+const MATERIALIZE_CHUNK_BYTES: usize = 16 * 1024;
+
+fn read_regular_bounded(
+    path: &Path,
+    max_bytes: u64,
+    check: &impl Fn() -> Result<(), String>,
+) -> Result<String, String> {
+    use std::io::Read as _;
+
+    check()?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A path can be swapped for a FIFO after metadata. O_NONBLOCK closes
+        // that race; the descriptor's own metadata below remains authority.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("cannot open a regular file: {error}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect the opened file: {error}"))?;
+    if !metadata.file_type().is_file() {
+        return Err("refused a FIFO, device, or other non-regular file".into());
+    }
+    if metadata.len() > max_bytes {
+        return Err(format!("file exceeds the {max_bytes}-byte attachment limit"));
+    }
+
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    let mut chunk = [0u8; MATERIALIZE_CHUNK_BYTES];
+    loop {
+        check()?;
+        let read = file
+            .read(&mut chunk)
+            .map_err(|error| format!("cannot read attachment: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        if bytes.len().saturating_add(read) as u64 > max_bytes {
+            return Err(format!(
+                "file grew past the {max_bytes}-byte attachment limit while being read"
+            ));
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+    String::from_utf8(bytes).map_err(|_| "attachment is not valid UTF-8 text".into())
 }
 
 /// The opening fence, tagged by extension so the model gets the language for
@@ -466,7 +584,7 @@ mod tests {
     fn a_file_already_attached_is_not_attached_again() {
         let tmp = tempfile::tempdir().unwrap();
         let path = write(tmp.path(), "a.rs", b"fn a() {}");
-        let first = collect(&[path.clone()], tmp.path(), &[]);
+        let first = collect(std::slice::from_ref(&path), tmp.path(), &[]);
         let second = collect(&[path], tmp.path(), &first);
         assert!(second.is_empty(), "{second:?}");
     }
@@ -539,6 +657,62 @@ mod tests {
         let out = materialize(&[a], "go", |_| Err("permission denied".into()));
         assert!(out.contains("permission denied"), "{out}");
         assert!(out.ends_with("go"), "{out}");
+    }
+
+    /// A FIFO reports zero bytes but opening it like a file can block forever.
+    /// Attachment materialization accepts only descriptors proven regular.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_is_refused_without_waiting_for_a_writer() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pipe");
+        let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: c_path is a NUL-terminated path valid for this call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        assert_eq!(describe(&path, tmp.path()).kind, AttachmentKind::Unreadable);
+
+        let attachment = Attachment {
+            path,
+            display: "pipe".into(),
+            bytes: 0,
+            kind: AttachmentKind::Text,
+            included: true,
+        };
+        let rendered = materialize_controlled(&[attachment], "go", || Ok(())).unwrap();
+        assert!(rendered.contains("non-regular file"), "{rendered}");
+    }
+
+    /// Stop used to race a detached read_to_string worker. Checking between
+    /// bounded chunks makes the worker itself finish before the turn continues.
+    #[test]
+    fn a_large_attachment_stops_at_a_chunk_boundary() {
+        use std::cell::Cell;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write(
+            tmp.path(),
+            "large.txt",
+            &vec![b'x'; MATERIALIZE_CHUNK_BYTES * 4],
+        );
+        let attachment = describe(&path, tmp.path());
+        let checks = Cell::new(0usize);
+        let result = materialize_controlled(&[attachment], "go", || {
+            let next = checks.get() + 1;
+            checks.set(next);
+            if next >= 4 {
+                Err("stopped by user".into())
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(result.unwrap_err(), "stopped by user");
+        assert!(
+            checks.get() < 10,
+            "the worker ignored cancellation until the whole file was read"
+        );
     }
 
     #[test]

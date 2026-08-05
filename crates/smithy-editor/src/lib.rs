@@ -65,7 +65,7 @@ pub use attachment::{Attachment, AttachmentKind};
 pub use buffer_manager::{BufferManager, BufferState};
 pub use code_editor::{
     code_editor, empty_editor, empty_editor_with_map, external_change_bar, on_external_change,
-    EditorHandle,
+    EditorHandle, EditorSaveError, EditorSessions,
     ExternalChange, OnExternalChange,
 };
 pub use diff_view::{diff_modal, FileDiff};
@@ -73,14 +73,16 @@ pub use file_browser::FileBrowserState;
 pub use file_browser_view::file_browser_view;
 pub use file_watcher::{spawn_file_watcher, FileWatcherEvent, FileWatcherHandle, IdeFileChange};
 pub use forged::{circuit_backdrop, forged_frame, shell_inset, shell_top_inset};
-pub use hover_popup::{hover_popup, HoverState};
-pub use lsp::{LspDiagnostic, LspHandle, LspManager, LspResponse};
+pub use hover_popup::{hover_popup, HoverDocument, HoverState};
+pub use lsp::{ClientDiagnostics, LspDiagnostic, LspHandle, LspManager, LspResponse, LspStamp};
 pub use main_layout::{main_layout_view, LayoutTheme};
 pub use menu_bar::{accel, menu_bar, menu_overlay, Menu, MenuBarState, MenuItem, StatusReadout};
 pub use problems_panel::{is_same_file, problems_panel, DiagnosticsState, ProblemRow};
 pub use review::ChangeStatus;
 pub use settings::{settings_modal, ModelRow, SettingsState, PROVIDERS};
-pub use review::{content_with_accepted_hunks, PendingChangeManager, PendingFileChange};
+pub use review::{
+    content_with_accepted_hunks, PendingChangeManager, PendingFileChange, ReviewKey,
+};
 pub use syntax_styling::{EditSpan, InlineDiagnostic};
 pub use terminal::kill_all_shells;
 pub use terminal_tabs::TerminalTabManager;

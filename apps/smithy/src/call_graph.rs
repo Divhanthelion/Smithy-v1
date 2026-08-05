@@ -19,7 +19,7 @@ use crate::app_state::AgentState;
 use crate::runtime;
 
 /// Overview = Benzi-style whole map; Focus = neighborhood of one symbol.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ViewMode {
     Overview,
     Focus,
@@ -29,6 +29,11 @@ pub enum ViewMode {
 #[derive(Clone, Copy)]
 pub struct CallGraphUi {
     pub graph: RwSignal<Option<Arc<CallGraph>>>,
+    /// Epoch for asynchronous load/build ownership. Every new task and clear
+    /// advances it, so an older callback cannot mutate a newer project's UI.
+    pub task_generation: RwSignal<u64>,
+    /// Changes only when a different prepared graph is installed.
+    pub graph_generation: RwSignal<u64>,
     pub focus: RwSignal<Option<u32>>,
     /// Prior foci — Back pops. Not pushed on the initial default focus.
     pub history: RwSignal<Vec<u32>>,
@@ -48,12 +53,20 @@ pub struct CallGraphUi {
     pub root: RwSignal<PathBuf>,
     /// Cached at build/load — never recomputed on paint (tree walk + hash).
     pub stale: RwSignal<Staleness>,
+    /// Staleness content is part of world geometry (chip styling), while its
+    /// potentially large vectors do not belong in a layout key.
+    pub staleness_generation: RwSignal<u64>,
+    /// One immutable world-space result shared by paint, labels and hit targets.
+    pub snapshot: RwSignal<Option<Arc<CallGraphSnapshot>>>,
+    pub snapshot_generation: RwSignal<u64>,
 }
 
 impl CallGraphUi {
     pub fn new() -> Self {
         Self {
             graph: RwSignal::new(None),
+            task_generation: RwSignal::new(0),
+            graph_generation: RwSignal::new(0),
             focus: RwSignal::new(None),
             history: RwSignal::new(Vec::new()),
             query: RwSignal::new(String::new()),
@@ -67,8 +80,54 @@ impl CallGraphUi {
             size: RwSignal::new((0.0, 0.0)),
             root: RwSignal::new(PathBuf::new()),
             stale: RwSignal::new(Staleness::default()),
+            staleness_generation: RwSignal::new(0),
+            snapshot: RwSignal::new(None),
+            snapshot_generation: RwSignal::new(0),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CallGraphTaskStamp {
+    root: PathBuf,
+    generation: u64,
+}
+
+#[derive(Debug)]
+struct Stamped<T> {
+    stamp: CallGraphTaskStamp,
+    result: T,
+}
+
+fn canonical_root(root: &std::path::Path) -> PathBuf {
+    root.canonicalize().unwrap_or_else(|_| root.to_path_buf())
+}
+
+fn advance_task_generation(ui: CallGraphUi) -> u64 {
+    let generation = ui
+        .task_generation
+        .get_untracked()
+        .checked_add(1)
+        .expect("call-graph task generation exhausted");
+    ui.task_generation.set(generation);
+    generation
+}
+
+fn begin_task(ui: CallGraphUi, root: &std::path::Path) -> CallGraphTaskStamp {
+    let root = canonical_root(root);
+    let generation = advance_task_generation(ui);
+    ui.root.set(root.clone());
+    CallGraphTaskStamp { root, generation }
+}
+
+fn task_is_current(
+    ui: CallGraphUi,
+    current_project_root: &std::path::Path,
+    stamp: &CallGraphTaskStamp,
+) -> bool {
+    ui.task_generation.get_untracked() == stamp.generation
+        && ui.root.get_untracked() == stamp.root
+        && canonical_root(current_project_root) == stamp.root
 }
 
 /// Refocus, remembering where we came from so Back works. Always enters Focus.
@@ -111,20 +170,72 @@ fn graph_summary(graph: &CallGraph, stale: &Staleness) -> String {
     let f = files.len();
     let desc = stale.describe();
     // ASCII separators only — the mono UI font often lacks middots/arrows.
-    if desc.is_empty() {
+    let invalid = graph.invalid_edge_count();
+    let invalid = (invalid > 0).then(|| {
+        format!(
+            "{invalid} invalid edge{} skipped",
+            if invalid == 1 { "" } else { "s" }
+        )
+    });
+    if desc.is_empty() && invalid.is_none() {
         format!("{n} nodes, {e} edges, {f} files")
     } else {
-        format!("{n} nodes, {e} edges, {f} files, {desc}")
+        let detail = [(!desc.is_empty()).then_some(desc), invalid]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{n} nodes, {e} edges, {f} files, {detail}")
     }
+}
+
+type GraphTaskResult = Result<(CallGraph, Staleness), String>;
+
+fn apply_load_result(
+    ui: CallGraphUi,
+    current_project_root: &std::path::Path,
+    stamped: Stamped<GraphTaskResult>,
+) -> bool {
+    if !task_is_current(ui, current_project_root, &stamped.stamp) {
+        return false;
+    }
+    match stamped.result {
+        Ok((graph, stale)) => {
+            ui.status.set(graph_summary(&graph, &stale));
+            ui.stale.set(stale);
+            ui.staleness_generation.update(|generation| *generation += 1);
+            ui.history.set(Vec::new());
+            ui.query.set(String::new());
+            ui.mode.set(ViewMode::Overview);
+            ui.focus.set(default_focus(&graph));
+            ui.graph.set(Some(Arc::new(graph)));
+            ui.graph_generation.update(|generation| *generation += 1);
+        }
+        Err(error) if error == "none" => {
+            ui.graph.set(None);
+            ui.graph_generation.update(|generation| *generation += 1);
+            ui.focus.set(None);
+            ui.history.set(Vec::new());
+            ui.query.set(String::new());
+            ui.mode.set(ViewMode::Overview);
+            ui.status.set(String::new());
+            ui.stale.set(Staleness::default());
+            ui.staleness_generation.update(|generation| *generation += 1);
+        }
+        Err(error) => ui.status.set(error),
+    }
+    true
 }
 
 /// Load a previously saved graph for this project, if any.
 pub fn load_for_project(agent: &AgentState) {
-    let root = agent.project.borrow().root.clone();
-    agent.call_graph.root.set(root.clone());
-    let path = agent.registry.callgraph_path(&root);
     let ui = agent.call_graph;
-    let (tx, rx) = crossbeam_channel::bounded::<Result<(CallGraph, Staleness), String>>(1);
+    let stamp = begin_task(ui, &agent.project.borrow().root);
+    let path = agent.registry.callgraph_path(&stamp.root);
+    let task_root = stamp.root.clone();
+    let task_stamp = stamp.clone();
+    let project = agent.project.clone();
+    let (tx, rx) = crossbeam_channel::bounded::<Stamped<GraphTaskResult>>(1);
 
     runtime::tokio_runtime().spawn(async move {
         let result = tokio::task::spawn_blocking(move || {
@@ -132,38 +243,57 @@ pub fn load_for_project(agent: &AgentState) {
                 return Err("none".into());
             }
             let graph = CallGraph::load(&path)?;
-            let stale = graph.staleness(&root);
+            let stale = graph.staleness(&task_root);
             Ok((graph, stale))
         })
         .await
         .unwrap_or_else(|e| Err(e.to_string()));
-        let _ = tx.send(result);
+        let _ = tx.send(Stamped {
+            stamp: task_stamp,
+            result,
+        });
     });
 
     // `poll_once`, not `Effect::new`: a menu-triggered Effect has no reactive
     // owner and is disposed before the worker finishes — which is how Build
     // looked like a no-op.
-    poll_once(rx, move |result| match result {
+    poll_once(rx, move |stamped| {
+        let current_root = project.borrow().root.clone();
+        apply_load_result(ui, &current_root, stamped);
+    });
+}
+
+fn apply_build_result(
+    ui: CallGraphUi,
+    current_project_root: &std::path::Path,
+    stamped: Stamped<GraphTaskResult>,
+) -> Option<Result<String, String>> {
+    if !task_is_current(ui, current_project_root, &stamped.stamp) {
+        return None;
+    }
+    ui.building.set(false);
+    match stamped.result {
         Ok((graph, stale)) => {
-            ui.status.set(graph_summary(&graph, &stale));
+            let summary = graph_summary(&graph, &stale);
+            ui.status.set(summary.clone());
             ui.stale.set(stale);
+            ui.staleness_generation.update(|generation| *generation += 1);
             ui.history.set(Vec::new());
             ui.query.set(String::new());
             ui.mode.set(ViewMode::Overview);
             ui.focus.set(default_focus(&graph));
             ui.graph.set(Some(Arc::new(graph)));
+            ui.graph_generation.update(|generation| *generation += 1);
+            ui.pan.set((0.0, 0.0));
+            ui.zoom.set(1.0);
+            ui.visible.set(true);
+            Some(Ok(summary))
         }
-        Err(e) if e == "none" => {
-            ui.graph.set(None);
-            ui.focus.set(None);
-            ui.history.set(Vec::new());
-            ui.query.set(String::new());
-            ui.mode.set(ViewMode::Overview);
-            ui.status.set(String::new());
-            ui.stale.set(Staleness::default());
+        Err(error) => {
+            ui.status.set(format!("build failed: {error}"));
+            Some(Err(error))
         }
-        Err(e) => ui.status.set(e),
-    });
+    }
 }
 
 /// Run `rust-analyzer scip`, assemble, save, and show.
@@ -172,8 +302,10 @@ pub fn build(agent: &AgentState) {
     if ui.building.get_untracked() {
         return;
     }
-    let root = agent.project.borrow().root.clone();
-    ui.root.set(root.clone());
+    let stamp = begin_task(ui, &agent.project.borrow().root);
+    if !task_is_current(ui, &agent.project.borrow().root, &stamp) {
+        return;
+    }
     ui.building.set(true);
     ui.status.set("building — ~10 s, ~2 GB…".into());
     ui.visible.set(true);
@@ -181,19 +313,22 @@ pub fn build(agent: &AgentState) {
         "Building call graph — ~10 s, uses ~2 GB…".into(),
     ));
 
-    let path = agent.registry.callgraph_path(&root);
+    let path = agent.registry.callgraph_path(&stamp.root);
     let panel = agent.panel;
-    let (tx, rx) = crossbeam_channel::bounded::<Result<(CallGraph, Staleness), String>>(1);
+    let project = agent.project.clone();
+    let task_root = stamp.root.clone();
+    let task_stamp = stamp.clone();
+    let (tx, rx) = crossbeam_channel::bounded::<Stamped<GraphTaskResult>>(1);
 
     runtime::tokio_runtime().spawn(async move {
         let result = tokio::task::spawn_blocking(move || {
-            eprintln!("[callgraph] building for {}…", root.display());
-            let graph = CallGraph::build(&root)?;
+            eprintln!("[callgraph] building for {}…", task_root.display());
+            let graph = CallGraph::build(&task_root)?;
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
             graph.save(&path)?;
-            let stale = graph.staleness(&root);
+            let stale = graph.staleness(&task_root);
             eprintln!(
                 "[callgraph] done: {} nodes, {} edges → {}",
                 graph.nodes.len(),
@@ -204,34 +339,26 @@ pub fn build(agent: &AgentState) {
         })
         .await
         .unwrap_or_else(|e| Err(e.to_string()));
-        let _ = tx.send(result);
+        let _ = tx.send(Stamped {
+            stamp: task_stamp,
+            result,
+        });
     });
 
-    poll_once(rx, move |result| {
-        ui.building.set(false);
-        match result {
-            Ok((graph, stale)) => {
-                let summary = graph_summary(&graph, &stale);
-                ui.status.set(summary.clone());
-                ui.stale.set(stale);
-                ui.history.set(Vec::new());
-                ui.query.set(String::new());
-                ui.mode.set(ViewMode::Overview);
-                ui.focus.set(default_focus(&graph));
-                ui.graph.set(Some(Arc::new(graph)));
-                ui.pan.set((0.0, 0.0));
-                ui.zoom.set(1.0);
-                ui.visible.set(true);
+    poll_once(rx, move |stamped| {
+        let current_root = project.borrow().root.clone();
+        match apply_build_result(ui, &current_root, stamped) {
+            Some(Ok(summary)) => {
                 panel.push(smithy_editor::AgentEntry::Notice(format!(
                     "Call graph ready — {summary}"
                 )));
             }
-            Err(e) => {
-                ui.status.set(format!("build failed: {e}"));
+            Some(Err(error)) => {
                 panel.push(smithy_editor::AgentEntry::Error(format!(
-                    "Call graph build failed: {e}"
+                    "Call graph build failed: {error}"
                 )));
             }
+            None => {}
         }
     });
 }
@@ -259,11 +386,10 @@ fn default_focus(graph: &CallGraph) -> Option<u32> {
     }
     // Prefer a readable neighborhood over the global hub. Degree ~6 is the
     // sweet spot; `execute_command`-style dispatchers score low on purpose.
-    let degree = |i: u32| graph.callers(i).len() + graph.callees(i).len();
     let mut best = 0u32;
     let mut best_score = i32::MIN;
     for i in 0..graph.nodes.len() as u32 {
-        let d = degree(i) as i32;
+        let d = graph.degree(i) as i32;
         if d == 0 {
             continue;
         }
@@ -288,7 +414,9 @@ fn default_focus(graph: &CallGraph) -> Option<u32> {
 
 /// Clear on project switch so the previous tree's map cannot linger.
 pub fn clear(ui: CallGraphUi) {
+    advance_task_generation(ui);
     ui.graph.set(None);
+    ui.graph_generation.update(|generation| *generation += 1);
     ui.focus.set(None);
     ui.history.set(Vec::new());
     ui.query.set(String::new());
@@ -299,6 +427,9 @@ pub fn clear(ui: CallGraphUi) {
     ui.zoom.set(1.0);
     ui.root.set(PathBuf::new());
     ui.stale.set(Staleness::default());
+    ui.staleness_generation.update(|generation| *generation += 1);
+    ui.snapshot.set(None);
+    ui.snapshot_generation.update(|generation| *generation += 1);
 }
 
 // --- layout -----------------------------------------------------------------
@@ -316,7 +447,7 @@ const FIT_MARGIN: f64 = 36.0;
 /// World-space row width when the pane size is not yet known.
 const DEFAULT_ROW_WIDTH: f64 = 640.0;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct LaidOut {
     index: u32,
     label: String,
@@ -376,16 +507,14 @@ fn layout(
     };
 
     let mut callers: Vec<(u32, u32)> = graph
-        .edges
+        .incoming(focus)
         .iter()
-        .filter(|e| e.to == focus)
-        .map(|e| (e.from, e.sites))
+        .map(|edge| (edge.node, edge.sites))
         .collect();
     let mut callees: Vec<(u32, u32)> = graph
-        .edges
+        .outgoing(focus)
         .iter()
-        .filter(|e| e.from == focus)
-        .map(|e| (e.to, e.sites))
+        .map(|edge| (edge.node, edge.sites))
         .collect();
 
     callers.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
@@ -401,16 +530,16 @@ fn layout(
             .chain(std::iter::once(focus))
             .collect();
         for &(c, _) in &callers {
-            for e in graph.edges.iter().filter(|e| e.to == c) {
-                if !hop1.contains(&e.from) {
-                    hop2_callers.push((e.from, e.sites));
+            for edge in graph.incoming(c) {
+                if !hop1.contains(&edge.node) {
+                    hop2_callers.push((edge.node, edge.sites));
                 }
             }
         }
         for &(c, _) in &callees {
-            for e in graph.edges.iter().filter(|e| e.from == c) {
-                if !hop1.contains(&e.to) {
-                    hop2_callees.push((e.to, e.sites));
+            for edge in graph.outgoing(c) {
+                if !hop1.contains(&edge.node) {
+                    hop2_callees.push((edge.node, edge.sites));
                 }
             }
         }
@@ -601,6 +730,9 @@ fn fit_camera(nodes: &[LaidOut], pane_w: f64, pane_h: f64) -> ((f64, f64), f64) 
     fit_bounds(min_x, max_x, min_y, max_y, pane_w, pane_h, 0.55, 1.35)
 }
 
+// Bounds, viewport, and zoom limits are kept explicit because tests vary each
+// independently; grouping them would make those geometry cases less legible.
+#[allow(clippy::too_many_arguments)]
 fn fit_bounds(
     min_x: f64,
     max_x: f64,
@@ -646,7 +778,7 @@ const OV_MIN_COL: f64 = 135.0;
 /// Below this zoom, chips render as dots (labels only on titles).
 const OV_LABEL_ZOOM: f64 = 0.55;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct ClusterBox {
     title: String,
     x: f64,
@@ -655,7 +787,7 @@ struct ClusterBox {
     h: f64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct OverviewChip {
     index: u32,
     label: String,
@@ -765,7 +897,7 @@ fn overview_layout(
         let mut ranked: Vec<(u32, usize)> = indices
             .iter()
             .map(|&i| {
-                let d = graph.callers(i).len() + graph.callees(i).len();
+                let d = graph.degree(i);
                 (i, d)
             })
             .collect();
@@ -914,6 +1046,246 @@ fn fit_overview(
     fit_bounds(min_x, max_x, min_y, max_y, pane_w, pane_h, 0.28, 1.2)
 }
 
+/// Inputs that can change world-space call-graph geometry.
+///
+/// Camera state is deliberately absent: panning and zooming only transform an
+/// existing snapshot. Pane dimensions are bucketed to ignore subpixel layout
+/// noise that otherwise rebuilt thousands of labels for identical geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallGraphLayoutKey {
+    graph_generation: u64,
+    mode: ViewMode,
+    focus: Option<u32>,
+    hops: u8,
+    staleness_generation: u64,
+    pane_width: u32,
+    pane_height: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct WorldEdge {
+    from: Point,
+    to: Point,
+    sites: u32,
+    stale: bool,
+    same_file: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct HitTarget {
+    index: u32,
+    rect: Rect,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct OverviewSnapshot {
+    clusters: Vec<ClusterBox>,
+    chips: Vec<OverviewChip>,
+    edges: Vec<WorldEdge>,
+    hits: Vec<HitTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct FocusSnapshot {
+    nodes: Vec<LaidOut>,
+    edges: Vec<WorldEdge>,
+    hits: Vec<HitTarget>,
+    hidden: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum SnapshotContent {
+    Overview(OverviewSnapshot),
+    Focus(FocusSnapshot),
+}
+
+/// Immutable world-space geometry consumed by every visual and hit layer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallGraphSnapshot {
+    key: CallGraphLayoutKey,
+    content: SnapshotContent,
+    fit_pan: (f64, f64),
+    fit_zoom: f64,
+}
+
+fn pane_bucket(value: f64) -> u32 {
+    ((value.max(0.0) / 2.0).round() * 2.0) as u32
+}
+
+fn layout_key(ui: CallGraphUi) -> CallGraphLayoutKey {
+    let (width, height) = ui.size.get();
+    CallGraphLayoutKey {
+        graph_generation: ui.graph_generation.get(),
+        mode: ui.mode.get(),
+        focus: ui.focus.get(),
+        hops: ui.hops.get(),
+        staleness_generation: ui.staleness_generation.get(),
+        pane_width: pane_bucket(width),
+        pane_height: pane_bucket(height),
+    }
+}
+
+fn build_snapshot(
+    graph: &CallGraph,
+    stale: &Staleness,
+    key: CallGraphLayoutKey,
+) -> Option<CallGraphSnapshot> {
+    let pane_w = key.pane_width as f64;
+    let pane_h = key.pane_height as f64;
+    if pane_w < 40.0 || pane_h < 40.0 {
+        return None;
+    }
+    match key.mode {
+        ViewMode::Overview => {
+            let (clusters, chips) =
+                overview_layout(graph, stale, overview_grid_width(pane_w));
+            let mut centers = vec![None; graph.nodes.len()];
+            let hits = chips
+                .iter()
+                .map(|chip| {
+                    centers[chip.index as usize] =
+                        Some(Point::new(chip.x + chip.w / 2.0, chip.y + chip.h / 2.0));
+                    HitTarget {
+                        index: chip.index,
+                        rect: Rect::new(
+                            chip.x,
+                            chip.y,
+                            chip.x + chip.w,
+                            chip.y + chip.h,
+                        ),
+                    }
+                })
+                .collect();
+            let edges = graph
+                .edges
+                .iter()
+                .filter_map(|edge| {
+                    let from = *centers.get(edge.from as usize)?.as_ref()?;
+                    let to = *centers.get(edge.to as usize)?.as_ref()?;
+                    let from_node = graph.nodes.get(edge.from as usize)?;
+                    let to_node = graph.nodes.get(edge.to as usize)?;
+                    Some(WorldEdge {
+                        from,
+                        to,
+                        sites: edge.sites,
+                        stale: false,
+                        same_file: from_node.file == to_node.file,
+                    })
+                })
+                .collect();
+            let (fit_pan, fit_zoom) = fit_overview(&clusters, pane_w, pane_h);
+            Some(CallGraphSnapshot {
+                key,
+                content: SnapshotContent::Overview(OverviewSnapshot {
+                    clusters,
+                    chips,
+                    edges,
+                    hits,
+                }),
+                fit_pan,
+                fit_zoom,
+            })
+        }
+        ViewMode::Focus => {
+            let focus = key.focus.or_else(|| default_focus(graph))?;
+            let (nodes, hidden) = layout(
+                graph,
+                focus,
+                key.hops,
+                stale,
+                row_width_for_pane(pane_w),
+            );
+            let focus_node = nodes.iter().find(|node| node.layer == Layer::Focus)?;
+            let focus_top = Point::new(focus_node.x + focus_node.w / 2.0, focus_node.y);
+            let focus_bottom = Point::new(
+                focus_node.x + focus_node.w / 2.0,
+                focus_node.y + focus_node.h,
+            );
+            let mut edges = Vec::new();
+            for (layer, focus_point, toward_down) in [
+                (Layer::Caller, focus_top, false),
+                (Layer::Callee, focus_bottom, true),
+            ] {
+                let group: Vec<&LaidOut> =
+                    nodes.iter().filter(|node| node.layer == layer).collect();
+                if group.is_empty() {
+                    continue;
+                }
+                let endpoints: Vec<Point> = group
+                    .iter()
+                    .map(|node| {
+                        Point::new(
+                            node.x + node.w / 2.0,
+                            if toward_down { node.y } else { node.y + node.h },
+                        )
+                    })
+                    .collect();
+                let bus_y = if toward_down {
+                    (focus_point.y
+                        + endpoints.iter().map(|point| point.y).fold(f64::INFINITY, f64::min))
+                        / 2.0
+                } else {
+                    (focus_point.y
+                        + endpoints
+                            .iter()
+                            .map(|point| point.y)
+                            .fold(f64::NEG_INFINITY, f64::max))
+                        / 2.0
+                };
+                let min_x = endpoints.iter().map(|point| point.x).fold(f64::INFINITY, f64::min);
+                let max_x = endpoints
+                    .iter()
+                    .map(|point| point.x)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                edges.push(WorldEdge {
+                    from: focus_point,
+                    to: Point::new(focus_point.x, bus_y),
+                    sites: 0,
+                    stale: false,
+                    same_file: false,
+                });
+                if (max_x - min_x).abs() > 1.0 {
+                    edges.push(WorldEdge {
+                        from: Point::new(min_x, bus_y),
+                        to: Point::new(max_x, bus_y),
+                        sites: 0,
+                        stale: false,
+                        same_file: false,
+                    });
+                }
+                for (node, endpoint) in group.into_iter().zip(endpoints) {
+                    edges.push(WorldEdge {
+                        from: Point::new(endpoint.x, bus_y),
+                        to: endpoint,
+                        sites: node.sites,
+                        stale: node.stale,
+                        same_file: false,
+                    });
+                }
+            }
+            let hits = nodes
+                .iter()
+                .map(|node| HitTarget {
+                    index: node.index,
+                    rect: Rect::new(node.x, node.y, node.x + node.w, node.y + node.h),
+                })
+                .collect();
+            let (fit_pan, fit_zoom) = fit_camera(&nodes, pane_w, pane_h);
+            Some(CallGraphSnapshot {
+                key,
+                content: SnapshotContent::Focus(FocusSnapshot {
+                    nodes,
+                    edges,
+                    hits,
+                    hidden,
+                }),
+                fit_pan,
+                fit_zoom,
+            })
+        }
+    }
+}
+
 // --- view -------------------------------------------------------------------
 
 /// The center-pane call graph.
@@ -924,6 +1296,46 @@ pub fn call_graph_view(
     on_build: impl Fn() + 'static + Clone,
 ) -> impl IntoView {
     let on_build_empty = on_build.clone();
+
+    // The sole world-layout owner. It lives above mode-specific subtrees, so
+    // switching panes cannot dispose it. Pan/zoom are untracked and therefore
+    // only transform the immutable result.
+    floem::reactive::Effect::new(move |_| {
+        let key = layout_key(ui);
+        if key.pane_width < 40 || key.pane_height < 40 {
+            return;
+        }
+        if ui
+            .snapshot
+            .get_untracked()
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.key == key)
+        {
+            return;
+        }
+        let Some(graph) = ui.graph.get_untracked() else {
+            ui.snapshot.set(None);
+            return;
+        };
+        let stale = ui.stale.get_untracked();
+        let Some(snapshot) = build_snapshot(&graph, &stale, key) else {
+            return;
+        };
+        let fit_pan = snapshot.fit_pan;
+        let fit_zoom = snapshot.fit_zoom;
+        ui.snapshot.set(Some(Arc::new(snapshot)));
+        ui.snapshot_generation.update(|generation| *generation += 1);
+
+        let current_pan = ui.pan.get_untracked();
+        let current_zoom = ui.zoom.get_untracked();
+        if (current_pan.0 - fit_pan.0).abs() > 0.5
+            || (current_pan.1 - fit_pan.1).abs() > 0.5
+            || (current_zoom - fit_zoom).abs() > 0.01
+        {
+            ui.pan.set(fit_pan);
+            ui.zoom.set(fit_zoom);
+        }
+    });
 
     Stack::vertical((
         toolbar(ui, on_build),
@@ -952,6 +1364,18 @@ pub fn call_graph_view(
                 }
             },
         )
+        .on_event_cont(floem::context::LayoutChangedListener, move |_, layout| {
+            let size = layout.new_box.size();
+            if size.width <= 0.0 || size.height <= 0.0 {
+                return;
+            }
+            let previous = ui.size.get_untracked();
+            if pane_bucket(previous.0) != pane_bucket(size.width)
+                || pane_bucket(previous.1) != pane_bucket(size.height)
+            {
+                ui.size.set((size.width, size.height));
+            }
+        })
         .style(|s| {
             s.flex_grow(1.0)
                 .width_full()
@@ -993,8 +1417,8 @@ fn toolbar(ui: CallGraphUi, on_build: impl Fn() + 'static) -> impl IntoView {
             let Some(focus) = ui.focus.get().or_else(|| default_focus(&graph)) else {
                 return String::new();
             };
-            let callers = graph.callers(focus).len();
-            let callees = graph.callees(focus).len();
+            let callers = graph.incoming(focus).len();
+            let callees = graph.outgoing(focus).len();
             format!("{callers} callers / {callees} callees")
         })
         .style(move |s| {
@@ -1228,10 +1652,7 @@ fn jump_hits(graph: &CallGraph, query: &str) -> Vec<(u32, String)> {
     let q = query.trim().to_lowercase();
     if q.is_empty() {
         let mut scored: Vec<(u32, usize)> = (0..graph.nodes.len() as u32)
-            .map(|i| {
-                let d = graph.callers(i).len() + graph.callees(i).len();
-                (i, d)
-            })
+            .map(|i| (i, graph.degree(i)))
             .filter(|(_, d)| *d >= 4)
             .collect();
         scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
@@ -1320,45 +1741,19 @@ fn message_pane(title: &'static str, detail: &'static str) -> impl IntoView {
 }
 
 fn overview_pane(ui: CallGraphUi) -> impl IntoView {
-    floem::reactive::Effect::new(move |_| {
-        let _mode = ui.mode.get();
-        let (pw, ph) = ui.size.get();
-        let Some(graph) = ui.graph.get() else {
-            return;
-        };
-        if pw < 40.0 || ph < 40.0 {
-            return;
-        }
-        let stale = ui.stale.get_untracked();
-        let (clusters, _) = overview_layout(&graph, &stale, overview_grid_width(pw));
-        let (pan, zoom) = fit_overview(&clusters, pw, ph);
-        let cur = ui.pan.get_untracked();
-        let cz = ui.zoom.get_untracked();
-        if (cur.0 - pan.0).abs() > 0.5
-            || (cur.1 - pan.1).abs() > 0.5
-            || (cz - zoom).abs() > 0.01
-        {
-            ui.pan.set(pan);
-            ui.zoom.set(zoom);
-        }
-    });
-
     let edges = canvas(move |cx, size| {
         let (w, h) = (size.width, size.height);
-        let prev = ui.size.get_untracked();
-        if (prev.0 - w).abs() > 0.5 || (prev.1 - h).abs() > 0.5 {
-            ui.size.set((w, h));
-        }
         if w < 8.0 || h < 8.0 {
             return;
         }
         cx.fill(&Rect::new(0.0, 0.0, w, h), design::BG_BASE, 0.0);
 
-        let Some(graph) = ui.graph.get() else {
+        let Some(snapshot) = ui.snapshot.get() else {
             return;
         };
-        let stale = ui.stale.get();
-        let (clusters, chips) = overview_layout(&graph, &stale, overview_grid_width(w));
+        let SnapshotContent::Overview(overview) = &snapshot.content else {
+            return;
+        };
         let (pan_x, pan_y) = ui.pan.get();
         let zoom = ui.zoom.get().clamp(0.2, 2.5);
         let ox = w / 2.0 + pan_x;
@@ -1368,7 +1763,7 @@ fn overview_pane(ui: CallGraphUi) -> impl IntoView {
 
         // Cluster frames.
         let frame = Stroke::new((1.0 * zoom).clamp(0.7, 1.5));
-        for c in &clusters {
+        for c in &overview.clusters {
             let r = Rect::new(
                 ox + c.x * zoom,
                 oy + c.y * zoom,
@@ -1381,10 +1776,7 @@ fn overview_pane(ui: CallGraphUi) -> impl IntoView {
 
         // When zoomed out, draw chips as dots in the canvas (labels would smear).
         if !show_labels {
-            for chip in &chips {
-                if chip.index == u32::MAX {
-                    continue;
-                }
+            for chip in &overview.chips {
                 let p = to_screen(chip.x + chip.w / 2.0, chip.y + chip.h / 2.0);
                 let r = 2.5 * zoom.max(0.5);
                 let dot = floem::kurbo::Circle::new(p, r);
@@ -1397,64 +1789,49 @@ fn overview_pane(ui: CallGraphUi) -> impl IntoView {
             }
         }
 
-        // Call edges between chip centers (skip +N markers).
-        let pos: std::collections::HashMap<u32, Point> = chips
-            .iter()
-            .filter(|c| c.index != u32::MAX)
-            .map(|c| (c.index, to_screen(c.x + c.w / 2.0, c.y + c.h / 2.0)))
-            .collect();
-        for e in &graph.edges {
-            let Some(&a) = pos.get(&e.from) else {
-                continue;
-            };
-            let Some(&b) = pos.get(&e.to) else {
-                continue;
-            };
-            let same_file = graph.nodes[e.from as usize].file == graph.nodes[e.to as usize].file;
-            let color = if same_file {
+        for edge in &overview.edges {
+            let color = if edge.same_file {
                 design::BORDER.with_alpha(if show_labels { 0.15 } else { 0.08 })
             } else {
                 design::ACCENT.with_alpha(if show_labels { 0.4 } else { 0.25 })
             };
-            let thickness = if same_file { 0.6 } else { 1.0 } * zoom.max(0.45);
-            cx.stroke(&Line::new(a, b), color, &Stroke::new(thickness));
+            let thickness = if edge.same_file { 0.6 } else { 1.0 } * zoom.max(0.45);
+            cx.stroke(
+                &Line::new(
+                    to_screen(edge.from.x, edge.from.y),
+                    to_screen(edge.to.x, edge.to.y),
+                ),
+                color,
+                &Stroke::new(thickness),
+            );
         }
     })
     .style(|s| s.absolute().inset(0.0).width_full().height_full().pointer_events_none());
 
     let chips_layer = dyn_container(
-        move || {
-            (
-                ui.pan.get(),
-                ui.zoom.get(),
-                ui.size.get(),
-                ui.graph.get().as_ref().map(|g| g.nodes.len()),
-                ui.stale.get().file_count(),
-            )
-        },
+        move || ui.snapshot_generation.get(),
         move |_| {
-            let Some(graph) = ui.graph.get_untracked() else {
+            let Some(snapshot) = ui.snapshot.get_untracked() else {
                 return Empty::new().into_any();
             };
-            let stale = ui.stale.get_untracked();
-            let (pw, ph) = ui.size.get_untracked();
-            let (clusters, chips) =
-                overview_layout(&graph, &stale, overview_grid_width(pw));
-            let (pan_x, pan_y) = ui.pan.get_untracked();
-            let zoom = ui.zoom.get_untracked().clamp(0.2, 2.5);
-            let ox = pw / 2.0 + pan_x;
-            let oy = ph / 2.0 + pan_y;
-            let show_labels = zoom >= OV_LABEL_ZOOM;
+            let SnapshotContent::Overview(overview) = &snapshot.content else {
+                return Empty::new().into_any();
+            };
 
-            let mut children: Vec<_> = clusters
+            let mut children: Vec<_> = overview
+                .clusters
                 .iter()
                 .map(|c| {
                     let title = c.title.clone();
-                    let left = ox + c.x * zoom;
-                    let top = oy + c.y * zoom;
-                    let width = c.w * zoom;
+                    let (x, y, w) = (c.x, c.y, c.w);
                     Label::derived(move || title.clone())
                         .style(move |s| {
+                            let (pane_w, pane_h) = ui.size.get();
+                            let (pan_x, pan_y) = ui.pan.get();
+                            let zoom = ui.zoom.get().clamp(0.2, 2.5);
+                            let left = pane_w / 2.0 + pan_x + x * zoom;
+                            let top = pane_h / 2.0 + pan_y + y * zoom;
+                            let width = w * zoom;
                             s.absolute()
                                 .inset_left(left + 6.0 * zoom)
                                 .inset_top(top + 2.0 * zoom)
@@ -1467,61 +1844,61 @@ fn overview_pane(ui: CallGraphUi) -> impl IntoView {
                 })
                 .collect();
 
-            if show_labels {
-                for chip in chips {
-                    let idx = chip.index;
-                    let label = chip.label.clone();
-                    let stale_chip = chip.stale;
-                    let left = ox + chip.x * zoom;
-                    let top = oy + chip.y * zoom;
-                    let width = chip.w * zoom;
-                    let height = chip.h * zoom;
-                    let is_more = idx == u32::MAX;
-                    children.push(
-                        Label::derived(move || label.clone())
-                            .on_event_stop(floem::event::listener::Click, move |_, _| {
-                                if !is_more {
-                                    focus_on(ui, idx);
-                                }
-                            })
-                            .style(move |s| {
-                                s.absolute()
-                                    .inset_left(left)
-                                    .inset_top(top)
-                                    .width(width)
-                                    .height(height)
-                                    .font_size((9.0 * zoom).clamp(7.5, 12.0) as f32)
-                                    .font_family(design::MONO.to_string())
-                                    .color(if is_more {
-                                        design::FG_FAINT
-                                    } else if stale_chip {
-                                        design::FG_GHOST
-                                    } else {
-                                        design::FG_MUTED
-                                    })
-                                    .items_center()
-                                    .justify_center()
-                                    .background(design::BG_FLOAT.with_alpha(if stale_chip {
-                                        0.4
-                                    } else {
-                                        0.9
-                                    }))
-                                    .border(1.0)
-                                    .border_color(if stale_chip {
-                                        design::FG_GHOST
-                                    } else {
-                                        design::BORDER
-                                    })
-                                    .border_radius(3.0)
-                                    .cursor(if is_more {
-                                        floem::style::CursorStyle::Default
-                                    } else {
-                                        floem::style::CursorStyle::Pointer
-                                    })
-                            })
-                            .into_any(),
-                    );
-                }
+            for (chip, hit) in overview.chips.iter().zip(&overview.hits) {
+                let idx = chip.index;
+                let label = chip.label.clone();
+                let stale_chip = chip.stale;
+                debug_assert_eq!(idx, hit.index);
+                let (x, y, w, h) = (
+                    hit.rect.x0,
+                    hit.rect.y0,
+                    hit.rect.width(),
+                    hit.rect.height(),
+                );
+                children.push(
+                    Label::derived(move || label.clone())
+                        .on_event_stop(floem::event::listener::Click, move |_, _| {
+                            focus_on(ui, idx);
+                        })
+                        .style(move |s| {
+                            let (pane_w, pane_h) = ui.size.get();
+                            let (pan_x, pan_y) = ui.pan.get();
+                            let zoom = ui.zoom.get().clamp(0.2, 2.5);
+                            let left = pane_w / 2.0 + pan_x + x * zoom;
+                            let top = pane_h / 2.0 + pan_y + y * zoom;
+                            s.absolute()
+                                .inset_left(left)
+                                .inset_top(top)
+                                .width(w * zoom)
+                                .height(h * zoom)
+                                .font_size((9.0 * zoom).clamp(7.5, 12.0) as f32)
+                                .font_family(design::MONO.to_string())
+                                .color(if stale_chip {
+                                    design::FG_GHOST
+                                } else {
+                                    design::FG_MUTED
+                                })
+                                .items_center()
+                                .justify_center()
+                                .background(design::BG_FLOAT.with_alpha(if stale_chip {
+                                    0.4
+                                } else {
+                                    0.9
+                                }))
+                                .border(1.0)
+                                .border_color(if stale_chip {
+                                    design::FG_GHOST
+                                } else {
+                                    design::BORDER
+                                })
+                                .border_radius(3.0)
+                                .cursor(floem::style::CursorStyle::Pointer)
+                                .apply_if(zoom < OV_LABEL_ZOOM, |s| {
+                                    s.display(floem::taffy::Display::None)
+                                })
+                        })
+                        .into_any(),
+                );
             }
 
             Stack::new(children)
@@ -1562,177 +1939,89 @@ fn focus_pane(
     project_root: RwSignal<PathBuf>,
     on_open: impl Fn(PathBuf, usize) + 'static + Clone,
 ) -> impl IntoView {
-    // Refit when the neighborhood or pane changes — not when the user pans.
-    floem::reactive::Effect::new(move |_| {
-        let focus = ui.focus.get();
-        let hops = ui.hops.get();
-        let (pw, ph) = ui.size.get();
-        let Some(graph) = ui.graph.get() else {
-            return;
-        };
-        let Some(f) = focus.or_else(|| default_focus(&graph)) else {
-            return;
-        };
-        if pw < 40.0 || ph < 40.0 {
-            return;
-        }
-        let stale = ui.stale.get_untracked();
-        let (nodes, _) = layout(&graph, f, hops, &stale, row_width_for_pane(pw));
-        let (pan, zoom) = fit_camera(&nodes, pw, ph);
-        let cur = ui.pan.get_untracked();
-        let cz = ui.zoom.get_untracked();
-        if (cur.0 - pan.0).abs() > 0.5
-            || (cur.1 - pan.1).abs() > 0.5
-            || (cz - zoom).abs() > 0.01
-        {
-            ui.pan.set(pan);
-            ui.zoom.set(zoom);
-        }
-    });
-
     let edges = canvas(move |cx, size| {
         let (w, h) = (size.width, size.height);
-        let prev = ui.size.get_untracked();
-        if (prev.0 - w).abs() > 0.5 || (prev.1 - h).abs() > 0.5 {
-            ui.size.set((w, h));
-        }
         if w < 8.0 || h < 8.0 {
             return;
         }
         cx.fill(&Rect::new(0.0, 0.0, w, h), design::BG_BASE, 0.0);
 
-        let Some(graph) = ui.graph.get() else {
+        let Some(snapshot) = ui.snapshot.get() else {
             return;
         };
-        let Some(focus) = ui.focus.get().or_else(|| default_focus(&graph)) else {
+        let SnapshotContent::Focus(focus) = &snapshot.content else {
             return;
         };
-        let stale = ui.stale.get();
-        let (nodes, _) = layout(&graph, focus, ui.hops.get(), &stale, row_width_for_pane(w));
         let (pan_x, pan_y) = ui.pan.get();
         let zoom = ui.zoom.get().clamp(0.4, 3.0);
         let ox = w / 2.0 + pan_x;
         let oy = h / 2.0 + pan_y;
         let to_screen = |x: f64, y: f64| Point::new(ox + x * zoom, oy + y * zoom);
 
-        let Some(focus_laid) = nodes.iter().find(|n| n.layer == Layer::Focus) else {
-            return;
-        };
-        let f_top = to_screen(focus_laid.x + focus_laid.w / 2.0, focus_laid.y);
-        let f_bot = to_screen(
-            focus_laid.x + focus_laid.w / 2.0,
-            focus_laid.y + focus_laid.h,
-        );
-
-        let mut draw_bus = |layer: Layer, focus_pt: Point, toward_down: bool| {
-            let group: Vec<&LaidOut> = nodes.iter().filter(|n| n.layer == layer).collect();
-            if group.is_empty() {
-                return;
-            }
-            let centers: Vec<Point> = group
-                .iter()
-                .map(|n| {
-                    let cx = n.x + n.w / 2.0;
-                    let ey = if toward_down { n.y } else { n.y + n.h };
-                    to_screen(cx, ey)
-                })
-                .collect();
-            let bus_y = if toward_down {
-                (focus_pt.y + centers.iter().map(|p| p.y).fold(f64::INFINITY, f64::min)) / 2.0
+        for edge in &focus.edges {
+            let thickness = if edge.sites == 0 {
+                1.25 * zoom
             } else {
-                (focus_pt.y + centers.iter().map(|p| p.y).fold(f64::NEG_INFINITY, f64::max)) / 2.0
+                (1.0 + (edge.sites as f64).ln().max(0.0)).clamp(1.0, 3.5) * zoom
             };
-            let min_x = centers.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
-            let max_x = centers.iter().map(|p| p.x).fold(f64::NEG_INFINITY, f64::max);
-
-            let spine = Stroke::new(1.25 * zoom);
-            let color = design::BORDER.with_alpha(0.75);
+            let color = if edge.stale {
+                design::FG_GHOST.with_alpha(0.5)
+            } else if edge.sites == 0 {
+                design::BORDER.with_alpha(0.75)
+            } else {
+                design::BORDER.with_alpha(0.9)
+            };
+            let stroke = if edge.stale {
+                Stroke::new(thickness).with_dashes(0.0, [4.0, 4.0])
+            } else {
+                Stroke::new(thickness)
+            };
             cx.stroke(
-                &Line::new(focus_pt, Point::new(focus_pt.x, bus_y)),
+                &Line::new(
+                    to_screen(edge.from.x, edge.from.y),
+                    to_screen(edge.to.x, edge.to.y),
+                ),
                 color,
-                &spine,
+                &stroke,
             );
-            if (max_x - min_x).abs() > 1.0 {
-                cx.stroke(
-                    &Line::new(Point::new(min_x, bus_y), Point::new(max_x, bus_y)),
-                    color,
-                    &spine,
-                );
-            }
-            for (n, p) in group.iter().zip(centers.iter()) {
-                let thickness = (1.0 + (n.sites as f64).ln().max(0.0)).clamp(1.0, 3.5) * zoom;
-                let c = if n.stale {
-                    design::FG_GHOST.with_alpha(0.5)
-                } else {
-                    design::BORDER.with_alpha(0.9)
-                };
-                let stroke = if n.stale {
-                    Stroke::new(thickness).with_dashes(0.0, [4.0, 4.0])
-                } else {
-                    Stroke::new(thickness)
-                };
-                cx.stroke(&Line::new(Point::new(p.x, bus_y), *p), c, &stroke);
-            }
-        };
-
-        draw_bus(Layer::Caller, f_top, false);
-        draw_bus(Layer::Callee, f_bot, true);
+        }
     })
     .style(|s| s.absolute().inset(0.0).width_full().height_full().pointer_events_none());
 
     let nodes_layer = dyn_container(
-        move || {
-            (
-                ui.focus.get(),
-                ui.hops.get(),
-                ui.pan.get(),
-                ui.zoom.get(),
-                ui.size.get(),
-                ui.graph.get().as_ref().map(|g| g.nodes.len()),
-            )
-        },
+        move || ui.snapshot_generation.get(),
         move |_| {
-            let Some(graph) = ui.graph.get_untracked() else {
+            let Some(snapshot) = ui.snapshot.get_untracked() else {
                 return Empty::new().into_any();
             };
-            let focus = ui
-                .focus
-                .get_untracked()
-                .or_else(|| default_focus(&graph))
-                .unwrap_or(0);
-            let stale = ui.stale.get_untracked();
-            let (pw, ph) = ui.size.get_untracked();
-            let (nodes, hidden) = layout(
-                &graph,
-                focus,
-                ui.hops.get_untracked(),
-                &stale,
-                row_width_for_pane(pw),
-            );
-            let (pan_x, pan_y) = ui.pan.get_untracked();
-            let zoom = ui.zoom.get_untracked().clamp(0.4, 3.0);
-            let ox = pw / 2.0 + pan_x;
-            let oy = ph / 2.0 + pan_y;
-            let _ = ph;
+            let SnapshotContent::Focus(focus) = &snapshot.content else {
+                return Empty::new().into_any();
+            };
 
-            let mut children: Vec<_> = nodes
-                .into_iter()
-                .map(|n| {
+            let mut children: Vec<_> = focus
+                .nodes
+                .iter()
+                .zip(&focus.hits)
+                .map(|(n, hit)| {
                     let idx = n.index;
                     let label = n.label.clone();
                     let location = n.location.clone();
                     let is_focus = n.layer == Layer::Focus;
                     let stale = n.stale;
-                    let left = ox + n.x * zoom;
-                    let top = oy + n.y * zoom;
-                    let width = n.w * zoom;
-                    let height = n.h * zoom;
+                    debug_assert_eq!(idx, hit.index);
+                    let (x, y, w, h) = (
+                        hit.rect.x0,
+                        hit.rect.y0,
+                        hit.rect.width(),
+                        hit.rect.height(),
+                    );
                     let on_open = on_open.clone();
                     let last = RwSignal::new(
                         std::time::Instant::now() - std::time::Duration::from_secs(1),
                     );
 
                     let name = Label::derived(move || label.clone()).style(move |s| {
+                        let zoom = ui.zoom.get().clamp(0.4, 3.0);
                         s.font_size((design::TEXT_XS as f64 * zoom).clamp(10.0, 14.0) as f32)
                             .font_family(design::MONO.to_string())
                             .color(if stale {
@@ -1744,6 +2033,7 @@ fn focus_pane(
                             })
                     });
                     let loc = Label::derived(move || location.clone()).style(move |s| {
+                        let zoom = ui.zoom.get().clamp(0.4, 3.0);
                         s.font_size((9.0 * zoom).clamp(8.0, 11.0) as f32)
                             .font_family(design::MONO.to_string())
                             .color(design::FG_FAINT)
@@ -1768,11 +2058,16 @@ fn focus_pane(
                             }
                         })
                         .style(move |s| {
+                            let (pane_w, pane_h) = ui.size.get();
+                            let (pan_x, pan_y) = ui.pan.get();
+                            let zoom = ui.zoom.get().clamp(0.4, 3.0);
+                            let left = pane_w / 2.0 + pan_x + x * zoom;
+                            let top = pane_h / 2.0 + pan_y + y * zoom;
                             s.absolute()
                                 .inset_left(left)
                                 .inset_top(top)
-                                .width(width)
-                                .height(height)
+                                .width(w * zoom)
+                                .height(h * zoom)
                                 .items_center()
                                 .justify_center()
                                 .padding_horiz(4.0)
@@ -1796,7 +2091,8 @@ fn focus_pane(
                 })
                 .collect();
 
-            if hidden > 0 {
+            if focus.hidden > 0 {
+                let hidden = focus.hidden;
                 children.push(
                     Label::derived(move || format!("+{hidden} more"))
                         .style(|s| {
@@ -1846,12 +2142,61 @@ fn focus_pane(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smithy_project::callgraph::{BuildStats, Edge};
+    use smithy_project::callgraph::Edge;
+
+    #[derive(Default)]
+    struct SnapshotMemo {
+        current: Option<Arc<CallGraphSnapshot>>,
+        builds: usize,
+    }
+
+    impl SnapshotMemo {
+        fn update(
+            &mut self,
+            graph: &CallGraph,
+            stale: &Staleness,
+            key: CallGraphLayoutKey,
+        ) -> Arc<CallGraphSnapshot> {
+            if let Some(current) = &self.current {
+                if current.key == key {
+                    return current.clone();
+                }
+            }
+            let snapshot = Arc::new(build_snapshot(graph, stale, key).unwrap());
+            self.current = Some(snapshot.clone());
+            self.builds += 1;
+            snapshot
+        }
+    }
+
+    fn key(mode: ViewMode) -> CallGraphLayoutKey {
+        CallGraphLayoutKey {
+            graph_generation: 1,
+            mode,
+            focus: Some(1),
+            hops: 1,
+            staleness_generation: 1,
+            pane_width: 800,
+            pane_height: 600,
+        }
+    }
+
+    fn one_node_graph(name: &str, file: &str) -> CallGraph {
+        CallGraph::from_parts(
+            vec![Node {
+                name: name.into(),
+                container: None,
+                file: file.into(),
+                line: 1,
+                end_line: 2,
+            }],
+            Vec::new(),
+        )
+    }
 
     fn tiny_graph() -> CallGraph {
-        CallGraph {
-            version: 1,
-            nodes: vec![
+        CallGraph::from_parts(
+            vec![
                 Node {
                     name: "a".into(),
                     container: None,
@@ -1874,7 +2219,7 @@ mod tests {
                     end_line: 8,
                 },
             ],
-            edges: vec![
+            vec![
                 Edge {
                     from: 0,
                     to: 1,
@@ -1886,10 +2231,7 @@ mod tests {
                     sites: 1,
                 },
             ],
-            stats: BuildStats::default(),
-            built_at: 0,
-            sources: Default::default(),
-        }
+        )
     }
 
     fn hub_graph(callees: usize) -> CallGraph {
@@ -1915,14 +2257,7 @@ mod tests {
                 sites: 1,
             });
         }
-        CallGraph {
-            version: 1,
-            nodes,
-            edges,
-            stats: BuildStats::default(),
-            built_at: 0,
-            sources: Default::default(),
-        }
+        CallGraph::from_parts(nodes, edges)
     }
 
     #[test]
@@ -2020,14 +2355,7 @@ mod tests {
                 sites: 1,
             });
         }
-        let g = CallGraph {
-            version: 1,
-            nodes,
-            edges,
-            stats: BuildStats::default(),
-            built_at: 0,
-            sources: Default::default(),
-        };
+        let g = CallGraph::from_parts(nodes, edges);
         assert_eq!(default_focus(&g), Some(1));
     }
 
@@ -2076,14 +2404,7 @@ mod tests {
                 }
             }
         }
-        let g = CallGraph {
-            version: 1,
-            nodes,
-            edges,
-            stats: BuildStats::default(),
-            built_at: 0,
-            sources: Default::default(),
-        };
+        let g = CallGraph::from_parts(nodes, edges);
         let grid_w = overview_grid_width(1100.0);
         let (clusters, chips) = overview_layout(&g, &Staleness::default(), grid_w);
         assert_eq!(clusters.len(), 24);
@@ -2124,5 +2445,235 @@ mod tests {
         let s = graph_summary(&g, &Staleness::default());
         assert!(s.contains("3 files"), "{s}");
         assert!(s.contains("3 nodes"), "{s}");
+    }
+
+    /// Corrupt persisted endpoints are skipped by the prepared index, but the
+    /// status line must make that loss visible instead of presenting a clean map.
+    #[test]
+    fn overview_summary_reports_invalid_edges() {
+        let graph = CallGraph::from_parts(
+            vec![Node {
+                name: "a".into(),
+                container: None,
+                file: "a.rs".into(),
+                line: 1,
+                end_line: 2,
+            }],
+            vec![Edge {
+                from: 0,
+                to: 8,
+                sites: 1,
+            }],
+        );
+        let summary = graph_summary(&graph, &Staleness::default());
+        assert!(summary.contains("1 invalid edge skipped"), "{summary}");
+    }
+
+    /// Snapshotting is a lifecycle change, not a visual one: the cached
+    /// overview and focus geometry must be byte-for-byte the old pure layouts.
+    #[test]
+    fn snapshots_preserve_the_existing_world_geometry() {
+        let graph = tiny_graph();
+        let stale = Staleness::default();
+
+        let overview = build_snapshot(&graph, &stale, key(ViewMode::Overview)).unwrap();
+        let SnapshotContent::Overview(cached_overview) = overview.content else {
+            panic!("expected overview");
+        };
+        let (clusters, chips) = overview_layout(&graph, &stale, overview_grid_width(800.0));
+        assert_eq!(cached_overview.clusters, clusters);
+        assert_eq!(cached_overview.chips, chips);
+
+        let focus = build_snapshot(&graph, &stale, key(ViewMode::Focus)).unwrap();
+        let SnapshotContent::Focus(cached_focus) = focus.content else {
+            panic!("expected focus");
+        };
+        let (nodes, hidden) = layout(&graph, 1, 1, &stale, row_width_for_pane(800.0));
+        assert_eq!(cached_focus.nodes, nodes);
+        assert_eq!(cached_focus.hidden, hidden);
+    }
+
+    /// Camera changes are intentionally absent from `CallGraphLayoutKey`; a
+    /// wheel gesture must transform cached geometry, not rebuild the world.
+    #[test]
+    fn pan_and_zoom_do_not_rebuild_world_geometry() {
+        let graph = tiny_graph();
+        let mut memo = SnapshotMemo::default();
+        let layout_key = key(ViewMode::Overview);
+        let first = memo.update(&graph, &Staleness::default(), layout_key);
+        let _camera_after_pan_and_zoom = ((83.0, -41.0), 1.7);
+        let second = memo.update(&graph, &Staleness::default(), layout_key);
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(memo.builds, 1);
+    }
+
+    /// Focus, hop count, and pane geometry all alter world placement and must
+    /// invalidate exactly once each.
+    #[test]
+    fn focus_hops_and_size_rebuild_world_geometry() {
+        let graph = tiny_graph();
+        let mut memo = SnapshotMemo::default();
+        let mut layout_key = key(ViewMode::Focus);
+        memo.update(&graph, &Staleness::default(), layout_key);
+        layout_key.focus = Some(0);
+        memo.update(&graph, &Staleness::default(), layout_key);
+        layout_key.hops = 2;
+        memo.update(&graph, &Staleness::default(), layout_key);
+        layout_key.pane_width = 900;
+        memo.update(&graph, &Staleness::default(), layout_key);
+        assert_eq!(memo.builds, 4);
+    }
+
+    /// Floem can report fractional size jitter for unchanged geometry. Bucketing
+    /// prevents that from recreating every chip and writing the same fit camera.
+    #[test]
+    fn equivalent_pane_geometry_does_not_rebuild() {
+        let graph = tiny_graph();
+        let mut memo = SnapshotMemo::default();
+        let mut first_key = key(ViewMode::Overview);
+        first_key.pane_width = pane_bucket(800.1);
+        first_key.pane_height = pane_bucket(599.9);
+        let first = memo.update(&graph, &Staleness::default(), first_key);
+        let mut second_key = first_key;
+        second_key.pane_width = pane_bucket(800.8);
+        second_key.pane_height = pane_bucket(600.7);
+        let second = memo.update(&graph, &Staleness::default(), second_key);
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(memo.builds, 1);
+    }
+
+    /// The clickable rectangles and edge endpoints are derived in the same
+    /// immutable snapshot consumed by paint; parallel recomputation used to let
+    /// labels and lines disagree during resize.
+    #[test]
+    fn paint_edges_and_hit_targets_share_one_snapshot() {
+        let graph = tiny_graph();
+        let snapshot =
+            build_snapshot(&graph, &Staleness::default(), key(ViewMode::Overview)).unwrap();
+        let SnapshotContent::Overview(overview) = snapshot.content else {
+            panic!("expected overview");
+        };
+        for (chip, hit) in overview.chips.iter().zip(&overview.hits) {
+            assert_eq!(chip.index, hit.index);
+            assert_eq!(
+                hit.rect,
+                Rect::new(chip.x, chip.y, chip.x + chip.w, chip.y + chip.h)
+            );
+        }
+        let edge = overview.edges.first().unwrap();
+        let from = overview
+            .chips
+            .iter()
+            .find(|chip| chip.index == 0)
+            .unwrap();
+        let to = overview
+            .chips
+            .iter()
+            .find(|chip| chip.index == 1)
+            .unwrap();
+        assert_eq!(
+            edge.from,
+            Point::new(from.x + from.w / 2.0, from.y + from.h / 2.0)
+        );
+        assert_eq!(
+            edge.to,
+            Point::new(to.x + to.w / 2.0, to.y + to.h / 2.0)
+        );
+    }
+
+    /// Project B can load faster than project A even though A started first.
+    /// A's late graph must not replace B's graph, because its relative node
+    /// paths would then be joined to B's root when the user double-clicked.
+    #[test]
+    fn out_of_order_cross_project_load_drops_the_old_graph() {
+        let old = tempfile::tempdir().unwrap();
+        let new = tempfile::tempdir().unwrap();
+        let old_root = old.path().canonicalize().unwrap();
+        let new_root = new.path().canonicalize().unwrap();
+        let ui = CallGraphUi::new();
+
+        let old_stamp = begin_task(ui, &old_root);
+        let new_stamp = begin_task(ui, &new_root);
+        assert!(apply_load_result(
+            ui,
+            &new_root,
+            Stamped {
+                stamp: new_stamp,
+                result: Ok((
+                    one_node_graph("new", "src/new.rs"),
+                    Staleness::default()
+                )),
+            },
+        ));
+        assert!(!apply_load_result(
+            ui,
+            &new_root,
+            Stamped {
+                stamp: old_stamp,
+                result: Ok((
+                    one_node_graph("old", "src/old.rs"),
+                    Staleness::default()
+                )),
+            },
+        ));
+
+        let graph = ui.graph.get_untracked().unwrap();
+        assert_eq!(graph.nodes[0].name, "new");
+        assert_eq!(ui.root.get_untracked(), new_root);
+        assert_eq!(
+            ui.root.get_untracked().join(&graph.nodes[0].file),
+            new_root.join("src/new.rs")
+        );
+    }
+
+    /// A build error from the retired project must not stop the current build,
+    /// replace its status, hide its graph, or reset its camera.
+    #[test]
+    fn out_of_order_cross_project_build_drops_the_old_callback() {
+        let old = tempfile::tempdir().unwrap();
+        let new = tempfile::tempdir().unwrap();
+        let old_root = old.path().canonicalize().unwrap();
+        let new_root = new.path().canonicalize().unwrap();
+        let ui = CallGraphUi::new();
+
+        let old_stamp = begin_task(ui, &old_root);
+        ui.building.set(true);
+        clear(ui);
+        let new_stamp = begin_task(ui, &new_root);
+        ui.building.set(true);
+        assert!(apply_build_result(
+            ui,
+            &new_root,
+            Stamped {
+                stamp: new_stamp,
+                result: Ok((
+                    one_node_graph("new", "src/new.rs"),
+                    Staleness::default()
+                )),
+            },
+        )
+        .is_some());
+        ui.pan.set((17.0, -9.0));
+        ui.zoom.set(1.8);
+        let status = ui.status.get_untracked();
+
+        assert!(apply_build_result(
+            ui,
+            &new_root,
+            Stamped {
+                stamp: old_stamp,
+                result: Err("old project failed".into()),
+            },
+        )
+        .is_none());
+        assert_eq!(ui.status.get_untracked(), status);
+        assert_eq!(ui.pan.get_untracked(), (17.0, -9.0));
+        assert_eq!(ui.zoom.get_untracked(), 1.8);
+        assert!(ui.visible.get_untracked());
+        assert!(!ui.building.get_untracked());
+        assert_eq!(
+            ui.graph.get_untracked().unwrap().nodes[0].name,
+            "new"
+        );
     }
 }

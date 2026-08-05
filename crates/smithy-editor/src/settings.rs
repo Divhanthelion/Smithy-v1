@@ -572,9 +572,7 @@ fn model_row(
         Label::derived(move || context.clone())
             .style(|s| s.font_size(9.0).color(catppuccin::SURFACE2).margin_right(8.0)),
         Label::derived(move || badge.clone()).style(move |s| {
-            s.font_size(9.0).color(if row.free {
-                catppuccin::GREEN
-            } else if row.loaded {
+            s.font_size(9.0).color(if row.free || row.loaded {
                 catppuccin::GREEN
             } else {
                 catppuccin::SURFACE2

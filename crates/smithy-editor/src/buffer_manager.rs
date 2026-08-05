@@ -117,9 +117,14 @@ impl BufferManager {
         }
     }
 
-    /// Force close a buffer, discarding any unsaved changes
-    pub fn force_close_buffer(&mut self, id: BufferId) -> Option<Buffer> {
-        let buffer_rc = self.buffers.remove(&id)?;
+    /// Remove a buffer after the caller has resolved any unsaved work.
+    ///
+    /// This is deliberately a commit operation, not a policy decision. The UI's
+    /// close intent is the only place allowed to choose save, discard or cancel.
+    pub fn commit_close_buffer(&mut self, id: BufferId) -> bool {
+        let Some(buffer_rc) = self.buffers.remove(&id) else {
+            return false;
+        };
 
         // Clean up path mapping
         // We need to borrow the buffer to get the path
@@ -149,9 +154,11 @@ impl BufferManager {
             }
         }
 
-        // Try to unwrap the Rc. If failed (other refs exist), we can't return the Buffer.
-        // This changes the signature effectively, or we return None if still shared.
-        Rc::try_unwrap(buffer_rc).ok().map(|cell| cell.into_inner())
+        // Removal is the result. Returning the `Buffer` made a successful close
+        // report `None` whenever another temporary `Rc` existed, which could
+        // suppress didClose even though the tab was already gone.
+        drop(buffer_rc);
+        true
     }
 
     /// Every open buffer, in the order they were opened.
@@ -249,14 +256,14 @@ mod tests {
         );
 
         manager.set_active(Some(middle));
-        manager.force_close_buffer(middle);
+        manager.commit_close_buffer(middle);
         assert_eq!(
             manager.active_id(),
             Some(last),
             "closing a middle tab should focus the one to its right"
         );
 
-        manager.force_close_buffer(last);
+        manager.commit_close_buffer(last);
         assert_eq!(
             manager.active_id(),
             Some(first),
@@ -270,7 +277,7 @@ mod tests {
         let mut manager = BufferManager::new();
         let (first, second) = (manager.create_buffer(), manager.create_buffer());
         manager.set_active(Some(second));
-        manager.force_close_buffer(first);
+        manager.commit_close_buffer(first);
         assert_eq!(manager.active_id(), Some(second));
     }
 
@@ -383,7 +390,7 @@ mod tests {
         assert!(manager.get_buffer_by_path(&temp_path).is_some());
 
         // Close the buffer
-        manager.force_close_buffer(id);
+        manager.commit_close_buffer(id);
 
         // Path mapping should be removed
         assert!(manager.get_buffer_by_path(&temp_path).is_none());

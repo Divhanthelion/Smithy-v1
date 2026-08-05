@@ -11,6 +11,10 @@ serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
+# A turn's stop lease must remain tied to its exact cancellation token while
+# clones cross provider, hook, and blocking-tool boundaries. Tokio's token is
+# race-safe and wakeable; an AtomicBool would require polling every async wait.
+tokio-util.workspace = true
 cap-std.workspace = true
 similar.workspace = true
 ignore.workspace = true

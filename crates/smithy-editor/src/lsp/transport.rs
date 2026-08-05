@@ -7,7 +7,7 @@ use std::io;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 
 /// Errors that can occur during LSP transport operations
 #[derive(Debug, Error)]
@@ -57,7 +57,7 @@ fn is_stream_end(error: &TransportError) -> bool {
 
 /// LSP transport for JSON-RPC over stdio
 pub struct LspTransport {
-    writer_tx: mpsc::Sender<String>,
+    writer_tx: Mutex<Option<mpsc::Sender<String>>>,
 }
 
 impl LspTransport {
@@ -90,15 +90,34 @@ impl LspTransport {
             }
         });
 
-        (Self { writer_tx }, incoming_rx)
+        (
+            Self {
+                writer_tx: Mutex::new(Some(writer_tx)),
+            },
+            incoming_rx,
+        )
     }
 
     /// Send a message to the language server
     pub async fn send(&self, message: String) -> Result<(), TransportError> {
-        self.writer_tx
+        // Clone under the transport guard and release it before channel
+        // backpressure can suspend this task. Shutdown must always be able to
+        // take the sender even while another request is waiting to write.
+        let writer = self
+            .writer_tx
+            .lock()
+            .await
+            .clone()
+            .ok_or(TransportError::ChannelClosed)?;
+        writer
             .send(message)
             .await
             .map_err(|_| TransportError::ChannelClosed)
+    }
+
+    /// Close the server's stdin after queued messages have been written.
+    pub async fn close_writer(&self) {
+        self.writer_tx.lock().await.take();
     }
 
     /// Read loop: reads messages from stdout and forwards to channel

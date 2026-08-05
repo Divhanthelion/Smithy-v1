@@ -3,13 +3,15 @@
 **A native Rust IDE with a coding agent that runs on your own machine.**
 
 Open a project, edit files, and ask an agent to do the work — against a model
-you host yourself. Nothing is uploaded, no API key is needed, and it keeps
-working with the network off.
+you host yourself or a hosted provider you choose. LM Studio works without an
+API key and can stay offline after setup; OpenRouter, DeepSeek, model downloads,
+and the web tools use the network.
 
 The agent can read your code, search it, run commands and write files. Every
 write comes back as a diff you approve hunk by hunk, and every shell command
-waits for your go-ahead. It never touches anything outside the project you have
-open.
+waits for your go-ahead. Filesystem tools are capability-confined to the
+project; approved shell commands run with your user permissions and are not
+confined to it.
 
 ![Smithy showing a compiler-resolved call graph beside the agent panel](assets/smithy.png)
 
@@ -35,10 +37,11 @@ from the provider's cache rather than being paid for again. On a recent session
 that was 76–79%. Most tools show you a spend figure; this one shows you where
 it went.
 
-**The sandbox is a capability, not a path check.** The tool layer holds a
-`cap-std` directory handle for your project root, so the operating system itself
-refuses to let the agent out — symlinks included. There is no string comparison
-to outwit.
+**Filesystem confinement is a capability, not a path check.** Read, search,
+edit, and write hold a `cap-std` directory handle for your project root, so the
+operating system itself refuses to let those tools out — symlinks included.
+Approved Bash is intentionally different: it runs with your user permissions.
+Hosted providers and web tools also use the network.
 
 **The call graph is resolved by the compiler.** Edges come from rust-analyzer
 via SCIP, not from matching names. Name matching was tried first and measured:
@@ -67,11 +70,11 @@ your data — applied to the part of coding nobody wants to type.
 **Honestly, what it is not:** macOS only, and Apple Silicon is where it makes
 sense. The deep features — symbol index, call graph — are Rust; other languages
 get syntax highlighting, LSP and the agent, but not the map. Dictation costs
-what it saves: the editor is 200 MB until you load Whisper, and about 3.2 GB
-after, because the weights are currently loaded at f32 on the CPU. That is a
-known and fixable inefficiency rather than a floor — see
-[known gaps](#known-gaps). It is young, and that list is the real one, not a
-polite one. If you want the most mature agent IDE, it is not this. If you want
+what it saves: the editor is about 200 MB until you load Whisper. Its 809M
+weights are now kept at their shipped f16 width on the CPU (about 1.6 GB of
+weights, plus inference overhead), rather than being widened to roughly 3.2 GB
+at f32. It is young, and the [known gaps](#known-gaps) are the real ones, not a
+polite list. If you want the most mature agent IDE, it is not this. If you want
 one whose claims you can verify, that is the whole idea.
 
 ---
@@ -251,8 +254,11 @@ cargo run -p smithy-project --example symbols -- . DesktopMsg
 
 With a Brave Search API key set under Backend Settings, the agent gets
 `web_search`. Without one it still gets `web_fetch`, so it can read any URL you
-or it names — it just can't discover URLs. `web_fetch` refuses non-http schemes
-and private/loopback addresses, including after a redirect.
+or it names — it just can't discover URLs. `web_fetch` accepts only HTTP(S),
+requires every resolved address to be public, rejects mixed public/private DNS
+answers, and pins each connection to the addresses it validated. Redirects are
+followed manually so every hop is revalidated (at most five), and response
+bodies are capped at 8 MiB before rendering.
 
 It also gets `explore`: a read-only sub-agent that answers one bounded question
 by searching on its own and returning a short written answer with `path:line`
@@ -312,7 +318,10 @@ you kept are written, and the agent is told exactly what you decided.
 When it wants to **run a command**, you see the command and approve or decline.
 Declining tells it why so it can try something else.
 
-**Stop** ends the current turn at its next step.
+**Stop** cancels the current turn. It withdraws pending approvals and interrupts
+network and filesystem tools; on Unix it kills a running Bash process group.
+Some blocking library work cannot be preempted internally, but its result is
+discarded after cancellation.
 
 ### Keyboard
 
@@ -347,6 +356,8 @@ in the editor, a Problems panel listing them, hover, and go-to-definition.
 Files changed outside the editor are picked up automatically. If the file is
 clean it reloads silently; if you have unsaved edits you get a bar offering to
 keep yours or take the version on disk. Nothing is discarded without asking.
+Closing a dirty tab or window likewise asks you to keep editing, save and close,
+or discard and close; a failed save leaves the document open and dirty.
 
 ### Dictation
 
@@ -422,6 +433,12 @@ Every conversation is written to
 every tool call and result. The model's **reasoning** is stored beside the
 messages rather than inside them, so the transcript still replays byte-for-byte
 into a warm prefix cache while the thinking survives the session.
+
+Automatic resume is bound to the canonical workspace, provider family,
+normalized endpoint, configured model, credential/account, and exact tool
+schema. Smithy picks the newest exact match. Older unbound formats and
+mismatches remain readable but start fresh with a notice rather than replaying
+history to the wrong provider or account.
 
 ```bash
 cargo run -p smithy-agent --example transcript -- list
@@ -502,9 +519,6 @@ empty it is. If rust-analyzer isn't installed it names the fix; if nothing has
 analysed the project yet, it says that instead of claiming a clean bill of
 health.
 
-**Stop doesn't stop it.** Stop takes effect between steps. A shell command
-waiting on your approval, or a long-running tool, finishes first.
-
 **The microphone button does nothing.** Run with `SMITHY_VOICE_DEBUG=1` — it
 reports which input device was chosen, how much audio was captured, and how long
 decoding took. On macOS, check microphone permission in System Settings; the
@@ -524,17 +538,13 @@ outside: `SMITHY_KEY_DEBUG`, `SMITHY_SQUIGGLE_DEBUG`, `SMITHY_SKY_DEBUG`,
 Honest list, short:
 
 - **Reconnect doesn't notice a model unloaded underneath it.** Restart to clear.
-- **A running tool can't be interrupted** — Stop applies between steps.
 - **Only rust-analyzer is exercised.** Other language servers are configured but
   untried; if you use one, we'd like to hear how it went.
 - **The agent's picture of your project is a snapshot** from when the session
   started. After restructuring a project, start a new conversation.
-- **Whisper costs about 3.2 GB resident, and it should not.** The weights ship
-  as f16 and are loaded as f32 — 809M parameters at four bytes each — on the CPU,
-  while the GPU idles. Loading at f16 halves it; a quantized GGUF
-  (`candle-transformers` already ships `whisper::quantized_model`) should reach
-  roughly 400–600 MB. Until then, dictation is by far the most expensive thing
-  in the editor.
+- **Whisper still runs on the CPU.** Keeping its weights at f16 removed the
+  accidental f32 doubling, but dictation remains the editor's largest optional
+  memory load and does not use the GPU.
 - Completions aren't implemented yet.
 
 **Found something else?** Please open an issue — that's genuinely the most
@@ -546,9 +556,10 @@ or LSP layer, the output from the relevant debug flag above.
 ## Building on it
 
 ```bash
-cargo test --workspace     # 963 passing
-cargo build --workspace    # 0 warnings, and it stays 0
-cargo clippy --workspace --all-targets
+RUSTFLAGS="-D warnings" cargo build --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace                              # 1,174 default tests
+cargo test -p smithy-fisherman --features harness   # 31: 29 default + 2 harness-only
 ```
 
 Eight crates. `apps/smithy` is the binary; the rest are libraries:
@@ -563,13 +574,19 @@ Eight crates. `apps/smithy` is the binary; the rest are libraries:
 | `smithy-sky` | astronomy for the backdrop. No dependencies at all |
 | `smithy-voice` | microphone in, string out |
 
-`smithy-agent`, `smithy-tools`, `smithy-fisherman`, `smithy-sky` and
-`smithy-voice` have **no UI dependency**, so a different front-end would be a
-new consumer of the same core rather than a rewrite.
+`smithy-agent`, `smithy-tools`, `smithy-project`, `smithy-fisherman`,
+`smithy-sky` and `smithy-voice` have **no UI dependency**, so a different
+front-end would be a new consumer of the same core rather than a rewrite.
 
-The sandbox is a capability, not a path check: the tool layer holds a `cap-std`
-directory handle for your project root, so the OS itself refuses to let the
-agent out — symlinks included.
+Filesystem confinement is a capability, not a path check: filesystem tools hold
+a `cap-std` directory handle for your project root, so the OS refuses to let
+those tools out — symlinks included. Cargo workspace members outside the
+selected root are omitted from project context. Bash is separately guarded by
+explicit approval and then runs with user permissions. Untrusted repository,
+shell, and web results are labelled for the model, but those labels are
+defense-in-depth guidance, not a security boundary; capabilities and approvals
+are the controls. Shell output keeps bounded head/tail capture and returns at
+most 30,000 characters.
 
 ## Licence
 

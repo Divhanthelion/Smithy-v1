@@ -3,11 +3,11 @@
 //! This module provides the main `LspClient` struct for communicating
 //! with a single language server instance.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use lsp_types::*;
@@ -15,12 +15,48 @@ use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Value};
 use std::str::FromStr;
 use thiserror::Error;
-use tokio::process::{Child, Command};
+use tokio::io::AsyncReadExt;
+use tokio::process::{Child, ChildStderr, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::timeout;
 
 use super::transport::LspTransport;
 use super::types::{LspCompletion, LspDiagnostic, LspHover, PositionEncoding};
+
+/// A bounded tail is enough to explain a failed startup without allowing a
+/// chatty server to retain memory forever. Before stderr was drained at all,
+/// rust-analyzer could fill the OS pipe and block its entire process.
+const STDERR_TAIL_BYTES: usize = 16 * 1024;
+/// Shutdown cannot inherit the ordinary 30-second interactive request timeout:
+/// the window used to remain resident after the user had already quit.
+const SHUTDOWN_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+/// Servers normally reap immediately after `exit`; this grace catches that path
+/// without leaving a wedged child behind at application termination.
+const SHUTDOWN_EXIT_GRACE: Duration = Duration::from_millis(500);
+
+/// Identity and diagnostics captured when one exact server process disconnects.
+#[derive(Debug, Clone)]
+pub struct ClientCrash {
+    pub client_id: u64,
+    pub language_id: String,
+    pub root_path: PathBuf,
+    pub stderr_tail: String,
+}
+
+/// Identity of one exact server process within one registry generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspStamp {
+    pub root_path: PathBuf,
+    pub generation: u64,
+    pub client_id: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClientDiagnostics {
+    pub stamp: LspStamp,
+    pub uri: String,
+    pub diagnostics: Vec<LspDiagnostic>,
+}
 
 /// Convert a file path to a URI string
 fn path_to_uri(path: &Path) -> Result<Uri, LspError> {
@@ -65,6 +101,9 @@ pub enum LspError {
 
     #[error("Unexpected response type")]
     UnexpectedResponse,
+
+    #[error("Language server startup failed: {0}")]
+    Startup(String),
 }
 
 /// Configuration for an LSP client
@@ -137,7 +176,7 @@ pub struct LspClient {
     /// Configuration
     config: LspClientConfig,
     /// Child process handle
-    _child: Child,
+    child: Mutex<Option<Child>>,
     /// Transport layer
     transport: LspTransport,
     /// Counter for request IDs
@@ -151,20 +190,24 @@ pub struct LspClient {
     /// Whether the server has been initialized
     initialized: Arc<Mutex<bool>>,
     /// Channel for diagnostics notifications
-    diagnostics_tx: mpsc::Sender<(String, Vec<LspDiagnostic>)>,
+    diagnostics_tx: mpsc::Sender<ClientDiagnostics>,
     /// Health status of the server
     health: Arc<Mutex<ServerHealth>>,
     /// Crash notification channel
-    crash_tx: mpsc::Sender<u64>,
+    crash_tx: mpsc::Sender<ClientCrash>,
+    /// Continuously-drained, fixed-size stderr suffix.
+    stderr_tail: Arc<StdMutex<VecDeque<u8>>>,
+    stamp: LspStamp,
 }
 
 impl LspClient {
     /// Spawn a new language server and create a client
     pub async fn spawn(
         id: u64,
+        generation: u64,
         config: LspClientConfig,
-        diagnostics_tx: mpsc::Sender<(String, Vec<LspDiagnostic>)>,
-        crash_tx: mpsc::Sender<u64>,
+        diagnostics_tx: mpsc::Sender<ClientDiagnostics>,
+        crash_tx: mpsc::Sender<ClientCrash>,
     ) -> Result<Self, LspError> {
         let mut child = Command::new(&config.command)
             .args(&config.args)
@@ -177,15 +220,25 @@ impl LspClient {
 
         let stdin = child.stdin.take().expect("Failed to open stdin");
         let stdout = child.stdout.take().expect("Failed to open stdout");
+        let stderr = child.stderr.take().expect("Failed to open stderr");
 
         let (transport, incoming_rx) = LspTransport::new(stdin, stdout);
         let pending_requests = Arc::new(Mutex::new(HashMap::new()));
         let health = Arc::new(Mutex::new(ServerHealth::Healthy));
+        let stderr_tail = Arc::new(StdMutex::new(VecDeque::with_capacity(
+            STDERR_TAIL_BYTES,
+        )));
+        Self::spawn_stderr_drain(stderr, stderr_tail.clone());
 
+        let stamp = LspStamp {
+            root_path: config.root_path.clone(),
+            generation,
+            client_id: Some(id),
+        };
         let client = Self {
             id,
             config,
-            _child: child,
+            child: Mutex::new(Some(child)),
             transport,
             request_id: AtomicU64::new(1),
             pending_requests: pending_requests.clone(),
@@ -195,6 +248,8 @@ impl LspClient {
             diagnostics_tx,
             health,
             crash_tx,
+            stderr_tail,
+            stamp,
         };
 
         // Spawn message handler
@@ -213,6 +268,10 @@ impl LspClient {
         self.id
     }
 
+    pub fn stamp(&self) -> LspStamp {
+        self.stamp.clone()
+    }
+
     /// Get the language ID
     pub fn language_id(&self) -> &str {
         &self.config.language_id
@@ -228,6 +287,11 @@ impl LspClient {
         self.position_encoding
     }
 
+    /// Recent server stderr for startup and crash diagnostics.
+    pub fn stderr_tail(&self) -> String {
+        Self::stderr_tail_string(&self.stderr_tail)
+    }
+
     /// Spawn message handler task
     fn spawn_message_handler(&self, mut rx: mpsc::Receiver<String>) {
         let pending = self.pending_requests.clone();
@@ -235,13 +299,23 @@ impl LspClient {
         let client_id = self.id;
         let health = self.health.clone();
         let crash_tx = self.crash_tx.clone();
+        let language_id = self.config.language_id.clone();
+        let root_path = self.config.root_path.clone();
+        let stderr_tail = self.stderr_tail.clone();
+        let stamp = self.stamp.clone();
 
         tokio::spawn(async move {
             while let Some(message) = rx.recv().await {
-                if let Err(e) = Self::handle_message(&pending, &diagnostics_tx, &message).await {
+                if let Err(e) =
+                    Self::handle_message(&pending, &diagnostics_tx, &stamp, &message).await
+                {
                     eprintln!("LSP message handler error: {}", e);
                 }
             }
+
+            // No response can arrive after stdout closes. Leaving these senders
+            // in the map made callers wait until their individual timeouts.
+            Self::fail_all_pending(&pending).await;
 
             // Channel closed - server likely crashed
             let mut health_guard = health.lock().await;
@@ -254,15 +328,65 @@ impl LspClient {
                 drop(health_guard);
 
                 // Notify about the crash
-                let _ = crash_tx.send(client_id).await;
+                let tail = Self::stderr_tail_string(&stderr_tail);
+                let _ = crash_tx
+                    .send(ClientCrash {
+                        client_id,
+                        language_id,
+                        root_path,
+                        stderr_tail: tail,
+                    })
+                    .await;
             }
         });
+    }
+
+    fn spawn_stderr_drain(mut stderr: ChildStderr, tail: Arc<StdMutex<VecDeque<u8>>>) {
+        tokio::spawn(async move {
+            let mut chunk = [0u8; 4096];
+            loop {
+                match stderr.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => {
+                        let mut tail = tail.lock().unwrap_or_else(|e| e.into_inner());
+                        Self::append_stderr(&mut tail, &chunk[..read]);
+                    }
+                }
+            }
+        });
+    }
+
+    fn append_stderr(tail: &mut VecDeque<u8>, bytes: &[u8]) {
+        for byte in bytes {
+            if tail.len() == STDERR_TAIL_BYTES {
+                tail.pop_front();
+            }
+            tail.push_back(*byte);
+        }
+    }
+
+    fn stderr_tail_string(tail: &StdMutex<VecDeque<u8>>) -> String {
+        let bytes: Vec<_> = tail
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .copied()
+            .collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    async fn fail_all_pending(pending: &Arc<Mutex<HashMap<u64, PendingRequest>>>) {
+        let requests: Vec<_> = pending.lock().await.drain().map(|(_, p)| p).collect();
+        for request in requests {
+            let _ = request.response_tx.send(Err(LspError::ChannelClosed));
+        }
     }
 
     /// Handle an incoming message from the server
     async fn handle_message(
         pending: &Arc<Mutex<HashMap<u64, PendingRequest>>>,
-        diagnostics_tx: &mpsc::Sender<(String, Vec<LspDiagnostic>)>,
+        diagnostics_tx: &mpsc::Sender<ClientDiagnostics>,
+        stamp: &LspStamp,
         message: &str,
     ) -> Result<(), LspError> {
         let value: Value = serde_json::from_str(message)?;
@@ -301,7 +425,13 @@ impl LspClient {
                                 .into_iter()
                                 .map(LspDiagnostic::from)
                                 .collect();
-                            let _ = diagnostics_tx.send((uri, diagnostics)).await;
+                            let _ = diagnostics_tx
+                                .send(ClientDiagnostics {
+                                    stamp: stamp.clone(),
+                                    uri,
+                                    diagnostics,
+                                })
+                                .await;
                         }
                     }
                 }
@@ -328,6 +458,16 @@ impl LspClient {
         method: &str,
         params: P,
     ) -> Result<R, LspError> {
+        self.request_with_timeout(method, params, self.config.request_timeout)
+            .await
+    }
+
+    async fn request_with_timeout<P: Serialize, R: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: P,
+        request_timeout: Duration,
+    ) -> Result<R, LspError> {
         let id = self.request_id.fetch_add(1, Ordering::SeqCst);
 
         let request = json!({
@@ -347,16 +487,48 @@ impl LspClient {
         }
 
         // Send request
-        self.transport.send(message).await?;
+        match timeout(request_timeout, self.transport.send(message)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                self.pending_requests.lock().await.remove(&id);
+                return Err(error.into());
+            }
+            Err(_) => {
+                self.pending_requests.lock().await.remove(&id);
+                return Err(LspError::Timeout(request_timeout));
+            }
+        }
 
         // Wait for response with timeout
-        let result = timeout(self.config.request_timeout, response_rx)
-            .await
-            .map_err(|_| LspError::Timeout(self.config.request_timeout))?
-            .map_err(|_| LspError::ChannelClosed)??;
+        let result = Self::await_response(
+            &self.pending_requests,
+            id,
+            response_rx,
+            request_timeout,
+        )
+        .await?;
 
         // Deserialize response
         serde_json::from_value(result).map_err(LspError::from)
+    }
+
+    async fn await_response(
+        pending: &Arc<Mutex<HashMap<u64, PendingRequest>>>,
+        id: u64,
+        response_rx: oneshot::Receiver<Result<Value, LspError>>,
+        request_timeout: Duration,
+    ) -> Result<Value, LspError> {
+        match timeout(request_timeout, response_rx).await {
+            Ok(Ok(result)) => Ok(result?),
+            Ok(Err(_)) => {
+                pending.lock().await.remove(&id);
+                Err(LspError::ChannelClosed)
+            }
+            Err(_) => {
+                pending.lock().await.remove(&id);
+                Err(LspError::Timeout(request_timeout))
+            }
+        }
     }
 
     /// Send a notification (no response expected)
@@ -452,14 +624,20 @@ impl LspClient {
     }
 
     /// Notify the server that a document was opened
-    pub async fn did_open(&self, uri: &str, language_id: &str, text: &str) -> Result<(), LspError> {
+    pub async fn did_open(
+        &self,
+        uri: &str,
+        language_id: &str,
+        version: i32,
+        text: &str,
+    ) -> Result<(), LspError> {
         self.ensure_initialized().await?;
 
         let params = DidOpenTextDocumentParams {
             text_document: TextDocumentItem {
                 uri: parse_uri(uri)?,
                 language_id: language_id.to_string(),
-                version: 1,
+                version,
                 text: text.to_string(),
             },
         };
@@ -598,13 +776,39 @@ impl LspClient {
         *health = ServerHealth::ShuttingDown;
         drop(health);
 
-        // Send shutdown request
-        let _: Value = self.request("shutdown", Value::Null).await?;
+        // `exit` is attempted even when `shutdown` times out. Several servers
+        // stop answering requests while still accepting the final notification.
+        let shutdown_result = timeout(
+            SHUTDOWN_REQUEST_TIMEOUT,
+            self.request_with_timeout::<_, Value>(
+                "shutdown",
+                Value::Null,
+                SHUTDOWN_REQUEST_TIMEOUT,
+            ),
+        )
+        .await
+        .map_err(|_| LspError::Timeout(SHUTDOWN_REQUEST_TIMEOUT))
+        .and_then(|result| result);
+        let exit_result = timeout(
+            SHUTDOWN_REQUEST_TIMEOUT,
+            self.notify("exit", Value::Null),
+        )
+        .await
+        .map_err(|_| LspError::Timeout(SHUTDOWN_REQUEST_TIMEOUT))
+        .and_then(|result| result);
+        self.transport.close_writer().await;
 
-        // Send exit notification
-        self.notify("exit", Value::Null).await?;
+        let mut child = self.child.lock().await.take();
+        if let Some(mut child) = child.take() {
+            if timeout(SHUTDOWN_EXIT_GRACE, child.wait()).await.is_err() {
+                let _ = timeout(SHUTDOWN_EXIT_GRACE, child.kill()).await;
+                // `kill` requests termination; `wait` is still required to reap
+                // the process and avoid zombies during repeated project switches.
+                let _ = timeout(SHUTDOWN_EXIT_GRACE, child.wait()).await;
+            }
+        }
 
-        Ok(())
+        shutdown_result.and(exit_result)
     }
 
     /// Ensure the server is initialized
@@ -655,5 +859,117 @@ mod tests {
 
         assert!(uri.as_str().ends_with("/src/events.rs"), "{}", uri.as_str());
         assert!(!uri.as_str().contains(' '));
+    }
+
+    /// A request that timed out used to leave its sender in the pending map
+    /// forever. Repeated hovers then grew the map even though none could ever
+    /// receive another response.
+    #[tokio::test]
+    async fn a_timed_out_request_removes_its_pending_entry() {
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = oneshot::channel();
+        pending
+            .lock()
+            .await
+            .insert(7, PendingRequest { response_tx: tx });
+
+        let result =
+            LspClient::await_response(&pending, 7, rx, Duration::from_millis(1)).await;
+
+        assert!(matches!(result, Err(LspError::Timeout(_))));
+        assert!(pending.lock().await.is_empty());
+    }
+
+    /// When stdout closes there is no future response to wait for. Previously
+    /// every in-flight request sat for its full timeout instead of failing at
+    /// the instant the transport ended.
+    #[tokio::test]
+    async fn transport_closure_fails_every_pending_sender() {
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = oneshot::channel();
+        pending
+            .lock()
+            .await
+            .insert(9, PendingRequest { response_tx: tx });
+
+        LspClient::fail_all_pending(&pending).await;
+
+        assert!(matches!(rx.await, Ok(Err(LspError::ChannelClosed))));
+        assert!(pending.lock().await.is_empty());
+    }
+
+    /// rust-analyzer can print indefinitely during a build. The pipe must be
+    /// drained, but retaining all of it merely moves the unbounded failure from
+    /// the kernel pipe into Smithy's heap.
+    #[test]
+    fn server_stderr_is_bounded_to_the_most_recent_tail() {
+        let mut tail = VecDeque::new();
+        let bytes = vec![b'x'; STDERR_TAIL_BYTES + 37];
+        LspClient::append_stderr(&mut tail, &bytes);
+        assert_eq!(tail.len(), STDERR_TAIL_BYTES);
+    }
+
+    /// A server that accepts `initialize` but never answers `shutdown` used to
+    /// keep the application alive for the ordinary 30-second request timeout.
+    /// Exit must still be attempted, then the child killed and reaped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_timeout_still_kills_reaps_and_returns_boundedly() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut script = tempfile::NamedTempFile::new().unwrap();
+        script
+            .write_all(
+                br#"#!/bin/sh
+read_message() {
+  length=
+  while IFS= read -r line; do
+    line=$(printf '%s' "$line" | tr -d '\r')
+    [ -z "$line" ] && break
+    case "$line" in Content-Length:*) length=${line#Content-Length: };; esac
+  done
+  dd bs=1 count="$length" of=/dev/null 2>/dev/null
+}
+read_message
+body='{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}'
+printf 'Content-Length: %s\r\n\r\n%s' "${#body}" "$body"
+read_message
+read_message
+sleep 10
+"#,
+            )
+            .unwrap();
+        let mut permissions = script.as_file().metadata().unwrap().permissions();
+        permissions.set_mode(0o755);
+        script.as_file().set_permissions(permissions).unwrap();
+
+        let (diagnostics_tx, _diagnostics_rx) = mpsc::channel(1);
+        let (crash_tx, _crash_rx) = mpsc::channel(1);
+        let client = LspClient::spawn(
+            1,
+            1,
+            LspClientConfig {
+                command: script.path().to_string_lossy().into_owned(),
+                args: Vec::new(),
+                root_path: std::env::temp_dir(),
+                request_timeout: Duration::from_secs(2),
+                language_id: "test".into(),
+                initialization_options: None,
+            },
+            diagnostics_tx,
+            crash_tx,
+        )
+        .await
+        .unwrap();
+        client.initialize().await.unwrap();
+
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            client.shutdown().await,
+            Err(LspError::Timeout(_))
+        ));
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(client.child.lock().await.is_none(), "child was reaped");
     }
 }

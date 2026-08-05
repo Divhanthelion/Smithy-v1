@@ -13,6 +13,10 @@ tree-sitter.workspace = true
 tree-sitter-rust.workspace = true
 streaming-iterator.workspace = true
 ignore.workspace = true
+# Cargo metadata reports ambient paths supplied by project manifests. A root
+# capability is what prevents the later source walk/read from following one of
+# those paths (or an in-tree symlink) outside the selected project.
+cap-std.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

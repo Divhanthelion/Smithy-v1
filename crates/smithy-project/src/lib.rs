@@ -30,6 +30,7 @@ pub mod scip;
 pub mod symbols;
 
 use std::path::{Path, PathBuf};
+use std::{fs, io::ErrorKind};
 
 pub use context::{ContextBudget, ProjectContext};
 pub use registry::{ProjectRegistry, RecentProject};
@@ -75,13 +76,34 @@ impl Project {
         }
 
         let manifest = root.join("Cargo.toml");
-        let kind = if manifest.is_file() {
-            let text = std::fs::read_to_string(&manifest).unwrap_or_default();
-            ProjectKind::Rust {
-                workspace: declares_workspace(&text),
+        let kind = match fs::symlink_metadata(&manifest) {
+            Err(error) if error.kind() == ErrorKind::NotFound => ProjectKind::Generic,
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect Rust manifest {}: {error}",
+                    manifest.display()
+                ))
             }
-        } else {
-            ProjectKind::Generic
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "Rust manifest {} is a symlink; select a project with a regular Cargo.toml",
+                    manifest.display()
+                ))
+            }
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(format!(
+                    "Rust manifest {} is not a regular file",
+                    manifest.display()
+                ))
+            }
+            Ok(_) => {
+                let text = fs::read_to_string(&manifest).map_err(|error| {
+                    format!("cannot read Rust manifest {}: {error}", manifest.display())
+                })?;
+                ProjectKind::Rust {
+                    workspace: declares_workspace(&text),
+                }
+            }
         };
 
         let name = root
@@ -104,10 +126,27 @@ impl Project {
 
         let mut candidate: Option<PathBuf> = None;
         for dir in start.ancestors() {
-            if dir.join("Cargo.toml").is_file() {
-                // Keep walking: an inner crate inside a workspace should ground
-                // at the workspace root, which is the outermost manifest.
-                candidate = Some(dir.to_path_buf());
+            let manifest = dir.join("Cargo.toml");
+            match fs::symlink_metadata(&manifest) {
+                Ok(metadata)
+                    if metadata.is_file() && !metadata.file_type().is_symlink() =>
+                {
+                    // Keep walking: an inner crate inside a workspace should ground
+                    // at the workspace root, which is the outermost manifest.
+                    candidate = Some(dir.to_path_buf());
+                }
+                Ok(_) => {
+                    // Do not walk past a malformed manifest entry and let an
+                    // outer workspace make it disappear.
+                    return Project::open(dir);
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "cannot inspect possible Rust manifest {}: {error}",
+                        manifest.display()
+                    ))
+                }
             }
             if dir.join(".git").exists() {
                 // A repository boundary is a hard stop — never ground above it.
@@ -141,6 +180,20 @@ impl Project {
         graph: Option<&callgraph::CallGraph>,
     ) -> ProjectContext {
         context::extract(self, budget, graph)
+    }
+
+    /// Build context while a session generation remains current.
+    ///
+    /// Returns `None` only when cancelled. Read-only OS calls already in flight
+    /// may finish, but their results are discarded before any context can be
+    /// installed.
+    pub fn context_with_graph_controlled(
+        &self,
+        budget: ContextBudget,
+        graph: Option<&callgraph::CallGraph>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Option<ProjectContext> {
+        context::extract_controlled(self, budget, graph, cancelled)
     }
 
     /// A short structural outline for the empty-editor backdrop.
@@ -210,6 +263,28 @@ mod tests {
             Project::open(tmp.path()).unwrap().kind,
             ProjectKind::Generic
         );
+    }
+
+    /// A directory named Cargo.toml used to make a broken Rust project silently
+    /// generic, hiding the trust/discovery failure until unrelated tools ran.
+    #[test]
+    fn a_manifest_directory_is_a_project_discovery_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("Cargo.toml")).unwrap();
+        let error = Project::discover(tmp.path()).unwrap_err();
+        assert!(error.contains("not a regular file"), "{error}");
+    }
+
+    /// A dangling manifest symlink looks absent to `is_file`, but it is an
+    /// attacker-controlled path entry rather than a genuinely absent manifest.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_manifest_symlink_is_a_project_discovery_error() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        symlink("missing-manifest", tmp.path().join("Cargo.toml")).unwrap();
+        let error = Project::discover(tmp.path()).unwrap_err();
+        assert!(error.contains("symlink"), "{error}");
     }
 
     #[test]

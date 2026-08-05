@@ -11,6 +11,38 @@
 //! looking at the diff.
 
 use crate::diff_view::FileDiff;
+use std::path::{Path, PathBuf};
+
+use smithy_tools::{FileSnapshot, WorkspaceIdentity};
+
+/// Lifecycle-qualified identity of one reviewed tool call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewKey {
+    pub generation: u64,
+    pub turn: u64,
+    pub call_id: String,
+}
+
+impl ReviewKey {
+    pub fn new(generation: u64, turn: u64, call_id: impl Into<String>) -> Self {
+        Self {
+            generation,
+            turn,
+            call_id: call_id.into(),
+        }
+    }
+
+    /// Preserve the established generation/turn-qualified responder key.
+    pub fn registration(&self) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            self.generation,
+            self.turn,
+            self.call_id.len(),
+            self.call_id
+        )
+    }
+}
 
 /// A per-hunk review decision.
 ///
@@ -26,19 +58,32 @@ pub enum ChangeStatus {
 
 /// A queued write, waiting for the user to review it.
 ///
-/// Deliberately just an id and a diff. It previously also carried `path`,
-/// `old_content` and `new_content` — all three of which [`FileDiff`] already
-/// holds — plus a `status` and a `hunk_statuses` vector that nothing outside its
-/// own tests ever read.
+/// The diff is presentation. The lifecycle key, root identity, normalized path
+/// and exact expected base are publication authority: acceptance must use these
+/// captured facts rather than reconstructing them from current UI state.
 ///
 /// The per-hunk decisions are **not** stored here on purpose. They belong to the
 /// modal displaying the change, and a second copy on this side is precisely how
 /// the tab bar and the editor once came to disagree about dirty state.
 #[derive(Debug, Clone)]
 pub struct PendingFileChange {
-    /// The `tool_call_id` this change came from. Reviews are matched on it, never
-    /// on the path — one turn can queue two writes to the same file.
+    /// The opaque registration assigned by the caller.
+    ///
+    /// Smithy's app boundary encodes generation, turn and tool-call id here so
+    /// cleanup from a retired turn cannot remove a successor review whose
+    /// provider reused the same call id. Reviews are matched on this id, never on
+    /// the path — one turn can queue two writes to the same file.
     pub id: String,
+    /// The lifecycle stamp this review belongs to.
+    pub key: ReviewKey,
+    /// The directory object against which preview was computed.
+    pub workspace: WorkspaceIdentity,
+    /// Lexically normalized and workspace-relative; never resolved from UI state.
+    pub relative_path: PathBuf,
+    /// Missing is distinct from a present empty file.
+    pub expected: FileSnapshot,
+    /// The direct tool's success message, used when every hunk is accepted.
+    pub success_message: String,
     /// The change itself, including the path and both sides of the content.
     pub diff: FileDiff,
 }
@@ -46,21 +91,41 @@ pub struct PendingFileChange {
 impl PendingFileChange {
     /// Create a new pending change from old and new content.
     pub fn new(
-        id: impl Into<String>,
-        path: impl Into<String>,
-        old_content: String,
+        key: ReviewKey,
+        workspace: WorkspaceIdentity,
+        relative_path: PathBuf,
+        expected: FileSnapshot,
         new_content: String,
+        success_message: String,
     ) -> Self {
-        let path = path.into();
+        let path = relative_path.display().to_string();
+        let old_content = match &expected {
+            FileSnapshot::Missing => "",
+            FileSnapshot::Present(base) => &base.content,
+        };
+        let diff = if matches!(expected, FileSnapshot::Missing) && new_content.is_empty() {
+            FileDiff::empty_creation(&path)
+        } else {
+            FileDiff::from_content(&path, old_content, &new_content)
+        };
         Self {
-            id: id.into(),
-            diff: FileDiff::from_content(&path, &old_content, &new_content),
+            id: key.registration(),
+            key,
+            workspace,
+            relative_path,
+            expected,
+            success_message,
+            diff,
         }
     }
 
     /// The path under review, relative to the workspace root.
     pub fn path(&self) -> &str {
         &self.diff.path
+    }
+
+    pub fn workspace_root(&self) -> &Path {
+        self.workspace.canonical_root()
     }
 }
 
@@ -138,7 +203,7 @@ impl PendingChangeManager {
         self.changes.push(change);
     }
 
-    /// Take a change out of the queue by its tool-call id.
+    /// Take a change out of the queue by its opaque registration id.
     pub fn remove(&mut self, id: &str) -> Option<PendingFileChange> {
         let idx = self.changes.iter().position(|c| c.id == id)?;
         Some(self.changes.remove(idx))
@@ -151,10 +216,9 @@ impl PendingChangeManager {
 
     /// Abandon every queued review.
     ///
-    /// For a project switch. A queued change carries a workspace-*relative*
-    /// path and is written through whichever root is live when it is accepted,
-    /// so one that outlives its project resolves into the next one — which is
-    /// how a `README.md` proposed in one repository lands in another.
+    /// For a project switch. Publication also validates the captured generation,
+    /// turn and workspace identity, but clearing stale UI state keeps an expired
+    /// Apply button from being offered in the first place.
     pub fn clear(&mut self) {
         self.changes.clear();
     }
@@ -168,50 +232,64 @@ impl PendingChangeManager {
 mod tests {
     use super::*;
 
+    fn pending(id: &str, path: &str, old: &str, new: &str) -> PendingFileChange {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = smithy_tools::Workspace::open(root.path()).unwrap();
+        let expected = if old.is_empty() {
+            FileSnapshot::Missing
+        } else {
+            FileSnapshot::Present(smithy_tools::FileBase {
+                content: old.to_string(),
+                identity: None,
+            })
+        };
+        PendingFileChange::new(
+            ReviewKey::new(1, 2, id),
+            workspace.identity().clone(),
+            PathBuf::from(path),
+            expected,
+            new.to_string(),
+            "written".into(),
+        )
+    }
+
     /// Constructing a change derives the diff from the two sides — the path and
     /// both contents live in the diff, not alongside it.
     #[test]
     fn a_change_carries_its_id_and_derives_its_diff() {
-        let change = PendingFileChange::new(
+        let change = pending(
             "call_1",
             "test.rs",
-            "fn main() {}\n".to_string(),
-            "fn main() {\n    println!(\"hello\");\n}\n".to_string(),
+            "fn main() {}\n",
+            "fn main() {\n    println!(\"hello\");\n}\n",
         );
 
-        assert_eq!(change.id, "call_1");
+        assert_eq!(change.id, "1:2:6:call_1");
         assert_eq!(change.path(), "test.rs");
         assert!(change.diff.has_changes());
     }
 
-    /// Reviews are matched on the tool-call id, not the path: one turn can queue
-    /// two writes to the same file, and removing "the one for a.rs" would then
-    /// drop the wrong review.
+    /// Reviews are matched on their registration id, not the path: one turn can
+    /// queue two writes to the same file, and removing "the one for a.rs" would
+    /// then drop the wrong review.
     #[test]
     fn two_changes_to_one_path_are_queued_and_removed_independently() {
         let mut mgr = PendingChangeManager::new();
-        mgr.add(PendingFileChange::new(
-            "c1",
-            "a.rs",
-            String::new(),
-            "first".into(),
-        ));
-        mgr.add(PendingFileChange::new(
-            "c2",
-            "a.rs",
-            String::new(),
-            "second".into(),
-        ));
+        mgr.add(pending("c1", "a.rs", "", "first"));
+        mgr.add(pending("c2", "a.rs", "", "second"));
 
         assert_eq!(mgr.queued().len(), 2);
 
-        let removed = mgr.remove("c1").expect("c1 was queued");
-        assert_eq!(removed.id, "c1");
+        let removed = mgr.remove("1:2:2:c1").expect("c1 was queued");
+        assert_eq!(removed.id, "1:2:2:c1");
         assert_eq!(mgr.queued().len(), 1);
-        assert_eq!(mgr.queued()[0].id, "c2");
+        assert_eq!(mgr.queued()[0].id, "1:2:2:c2");
 
-        assert!(mgr.remove("c1").is_none(), "removing twice is not an error");
-        assert!(mgr.remove("c2").is_some());
+        assert!(
+            mgr.remove("1:2:2:c1").is_none(),
+            "removing twice is not an error"
+        );
+        assert!(mgr.remove("1:2:2:c2").is_some());
         assert!(mgr.is_empty());
     }
 
@@ -320,6 +398,20 @@ mod tests {
         );
         assert_eq!(
             content_with_accepted_hunks(&diff, &vec![ChangeStatus::Rejected; diff.hunks.len()]),
+            ""
+        );
+    }
+
+    /// Missing and present-empty have identical bytes but different filesystem
+    /// meaning. Creation of a zero-byte file needs one explicit decision hunk.
+    #[test]
+    fn creating_an_empty_file_is_an_explicit_reviewable_change() {
+        let change = pending("empty.txt", "empty.txt", "", "");
+        assert!(matches!(change.expected, FileSnapshot::Missing));
+        assert_eq!(change.diff.hunks.len(), 1);
+        assert!(change.diff.hunks[0].has_change());
+        assert_eq!(
+            content_with_accepted_hunks(&change.diff, &[ChangeStatus::Accepted]),
             ""
         );
     }

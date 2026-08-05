@@ -173,9 +173,19 @@ pub fn extract(
     budget: ContextBudget,
     graph: Option<&crate::callgraph::CallGraph>,
 ) -> ProjectContext {
+    extract_controlled(project, budget, graph, &|| false)
+        .expect("an always-live project scan cannot cancel")
+}
+
+pub fn extract_controlled(
+    project: &Project,
+    budget: ContextBudget,
+    graph: Option<&crate::callgraph::CallGraph>,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<ProjectContext> {
     match project.kind {
-        ProjectKind::Rust { .. } => extract_rust(project, budget, graph),
-        ProjectKind::Generic => extract_generic(project, budget),
+        ProjectKind::Rust { .. } => extract_rust(project, budget, graph, cancelled),
+        ProjectKind::Generic => extract_generic_controlled(project, budget, cancelled),
     }
 }
 
@@ -242,22 +252,44 @@ fn extract_rust(
     project: &Project,
     budget: ContextBudget,
     graph: Option<&crate::callgraph::CallGraph>,
-) -> ProjectContext {
-    let mut warnings = Vec::new();
-    let crates = match rust::crates(&project.root) {
-        Ok(c) => c,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<ProjectContext> {
+    let scan = match rust::crates_controlled(&project.root, cancelled) {
+        Ok(Some(scan)) => scan,
+        Ok(None) => return None,
         Err(e) => {
-            // A Rust project whose metadata will not read is still workable —
-            // fall back rather than leaving the agent with nothing.
-            warnings.push(format!(
-                "could not read cargo metadata ({e}); falling back to a file listing"
-            ));
-            let mut context = extract_generic(project, budget);
-            context.warnings = warnings;
-            return context;
+            // Listing arbitrary files after trusted Rust ingestion failed hid
+            // the boundary failure and could put a sentinel from an excluded
+            // path into the prompt. Keep the context explicitly Rust-shaped
+            // and report why it is incomplete.
+            let warnings = vec![format!("could not read cargo metadata ({e}); Rust sources omitted")];
+            let mut rendered = format!(
+                "# Project: {} ({})\nRoot: {}\n\n## Crates\n",
+                project.name,
+                project.kind.label(),
+                project.root.display()
+            );
+            append_warnings(&mut rendered, &warnings);
+            return Some(ProjectContext {
+                fingerprint: fingerprint_str(&rendered),
+                rendered,
+                layers: vec![Layer::Layout],
+                warnings,
+            });
         }
     };
+    render_rust_scan(project, budget, graph, scan, cancelled)
+}
 
+fn render_rust_scan(
+    project: &Project,
+    budget: ContextBudget,
+    graph: Option<&crate::callgraph::CallGraph>,
+    scan: rust::CrateScan,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<ProjectContext> {
+    let crates = scan.crates;
+    let warnings = scan.warnings;
     let mut out = String::new();
     let mut layers = Vec::new();
 
@@ -271,6 +303,9 @@ fn extract_rust(
     let _ = writeln!(out, "Root: {}", project.root.display());
     let _ = writeln!(out, "\n## Crates");
     for c in &crates {
+        if cancelled() {
+            return None;
+        }
         let path = if c.path.as_os_str().is_empty() {
             ".".to_string()
         } else {
@@ -286,6 +321,7 @@ fn extract_rust(
             c.edition
         );
     }
+    append_warnings(&mut out, &warnings);
     layers.push(Layer::Layout);
 
     // --- Layer 2: dependencies. ---
@@ -322,11 +358,24 @@ fn extract_rust(
     }
 
     let fingerprint = fingerprint_of(&crates);
-    ProjectContext {
+    if cancelled() {
+        return None;
+    }
+    Some(ProjectContext {
         rendered: out,
         layers,
         fingerprint,
         warnings,
+    })
+}
+
+fn append_warnings(out: &mut String, warnings: &[String]) {
+    if warnings.is_empty() {
+        return;
+    }
+    out.push_str("\n## Ingestion warnings\n");
+    for warning in warnings {
+        let _ = writeln!(out, "- {warning}");
     }
 }
 
@@ -407,7 +456,7 @@ fn fan_in(graph: &crate::callgraph::CallGraph, item: &rust::ApiItem) -> usize {
                     && (container == item.module
                         || container.ends_with(&item.module)
                         || item.module.ends_with(container));
-            (module_hit as usize, graph.callers(id).len())
+            (module_hit as usize, graph.incoming(id).len())
         })
         .max()
         .map(|(_, degree)| degree)
@@ -593,7 +642,11 @@ fn pending_len(pending: &[(String, String)]) -> usize {
 }
 
 /// Fallback for non-Cargo projects: a bounded top-level file listing.
-fn extract_generic(project: &Project, budget: ContextBudget) -> ProjectContext {
+fn extract_generic_controlled(
+    project: &Project,
+    budget: ContextBudget,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<ProjectContext> {
     let mut out = String::new();
     let _ = writeln!(out, "# Project: {}", project.name);
     let _ = writeln!(out, "Root: {}", project.root.display());
@@ -616,6 +669,9 @@ fn extract_generic(project: &Project, budget: ContextBudget) -> ProjectContext {
     entries.sort();
 
     for entry in entries {
+        if cancelled() {
+            return None;
+        }
         if out.chars().count() + entry.len() + 3 > budget.max_chars {
             out.push_str("… (listing truncated)\n");
             break;
@@ -623,12 +679,12 @@ fn extract_generic(project: &Project, budget: ContextBudget) -> ProjectContext {
         let _ = writeln!(out, "- {entry}");
     }
 
-    ProjectContext {
+    Some(ProjectContext {
         rendered: out,
         layers: vec![Layer::Layout],
         fingerprint: fingerprint_str(&project.root.display().to_string()),
         warnings: Vec::new(),
-    }
+    })
 }
 
 /// A stable hash of the extracted structure.
@@ -732,6 +788,19 @@ mod window_budget_tests {
 mod tests {
     use super::*;
     use crate::Project;
+
+    fn write_crate(root: &std::path::Path, relative: &str, name: &str, source: &str) {
+        let dir = root.join(relative);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/lib.rs"), source).unwrap();
+    }
 
     fn our_workspace() -> Project {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -885,13 +954,13 @@ mod tests {
         assert_eq!(context.layers, vec![Layer::Layout]);
     }
 
-    /// A broken manifest should degrade to a listing, with the reason recorded,
-    /// rather than leaving the agent with no context at all.
+    /// A malformed Cargo manifest once fell back to an ambient file listing.
+    /// That hid the failed trust boundary and admitted unrelated sentinel text.
     #[test]
-    fn a_broken_manifest_falls_back_with_a_warning() {
+    fn a_broken_manifest_reports_the_failure_without_generic_fallback() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("Cargo.toml"), "this is not valid toml {{{").unwrap();
-        std::fs::write(tmp.path().join("stray.rs"), "").unwrap();
+        std::fs::write(tmp.path().join("stray.rs"), "GENERIC_FALLBACK_SENTINEL").unwrap();
 
         let context = Project::open(tmp.path())
             .unwrap()
@@ -901,9 +970,217 @@ mod tests {
             "the failure should be reported"
         );
         assert!(
-            context.rendered.contains("stray.rs"),
-            "should still list files"
+            !context.rendered.contains("GENERIC_FALLBACK_SENTINEL")
+                && !context.rendered.contains("stray.rs"),
+            "failed Rust ingestion must not become a generic ambient listing: {}",
+            context.rendered
         );
+        assert!(context.rendered.contains("Rust sources omitted"));
+    }
+
+    /// Cargo allows a workspace to declare `../member`. Cargo may inspect that
+    /// manifest before returning metadata, but Smithy must omit it while keeping
+    /// valid in-root crates, and its sentinel must never enter the model prompt.
+    #[test]
+    fn an_external_workspace_member_is_omitted_while_in_root_crates_remain() {
+        use cap_std::{ambient_authority, fs::Dir};
+
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        write_crate(&root, "inside", "inside", "pub fn kept() {}");
+        write_crate(
+            parent.path(),
+            "outside",
+            "outside",
+            "pub fn EXTERNAL_MEMBER_SENTINEL() {}",
+        );
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"inside\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+
+        // Current Cargo rejects this declaration before emitting metadata. The
+        // fixture exercises the hostile metadata shape directly because older
+        // Cargo versions and alternate metadata producers can still report it.
+        let metadata = serde_json::json!({
+            "workspace_members": ["inside-id", "outside-id"],
+            "packages": [
+                {
+                    "id": "outside-id",
+                    "name": "outside",
+                    "manifest_path": parent.path().join("outside/Cargo.toml"),
+                    "version": "0.1.0",
+                    "edition": "2021",
+                    "targets": [{"kind": ["lib"]}],
+                    "dependencies": []
+                },
+                {
+                    "id": "inside-id",
+                    "name": "inside",
+                    "manifest_path": root.join("inside/Cargo.toml"),
+                    "version": "0.1.0",
+                    "edition": "2021",
+                    "targets": [{"kind": ["lib"]}],
+                    "dependencies": []
+                }
+            ]
+        });
+        let dir = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
+        let scan = rust::scan_metadata(&root, &dir, &metadata, &|| false)
+            .unwrap()
+            .unwrap();
+        let project = Project::open(&root).unwrap();
+        let context = render_rust_scan(
+            &project,
+            ContextBudget::standard(),
+            None,
+            scan,
+            &|| false,
+        )
+        .unwrap();
+        assert!(context.rendered.contains("inside"), "{}", context.rendered);
+        assert!(context.rendered.contains("kept"), "{}", context.rendered);
+        assert!(!context.rendered.contains("EXTERNAL_MEMBER_SENTINEL"));
+        assert!(!context.rendered.contains("### outside"));
+        assert_eq!(context.warnings.len(), 1, "{:?}", context.warnings);
+        assert!(context.warnings[0].contains("outside the selected root"));
+    }
+
+    /// A member whose `src` is a symlink can point at readable Rust outside the
+    /// workspace. Omitting only that member preserves a useful map of the rest.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_src_escape_is_omitted_without_losing_valid_crates() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        write_crate(&root, "valid", "valid", "pub fn safe() {}");
+
+        let escaped = parent.path().join("escaped-src");
+        std::fs::create_dir(&escaped).unwrap();
+        std::fs::write(
+            escaped.join("lib.rs"),
+            "pub fn SYMLINK_SOURCE_SENTINEL() {}",
+        )
+        .unwrap();
+        let linked = root.join("linked");
+        std::fs::create_dir(&linked).unwrap();
+        std::fs::write(
+            linked.join("Cargo.toml"),
+            "[package]\nname=\"linked\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+        )
+        .unwrap();
+        symlink(&escaped, linked.join("src")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers=[\"valid\", \"linked\"]\nresolver=\"2\"\n",
+        )
+        .unwrap();
+
+        let context = Project::open(&root)
+            .unwrap()
+            .context(ContextBudget::standard());
+        assert!(context.rendered.contains("safe"), "{}", context.rendered);
+        assert!(!context.rendered.contains("SYMLINK_SOURCE_SENTINEL"));
+        assert!(!context.rendered.contains("### linked"));
+        assert_eq!(context.warnings.len(), 1, "{:?}", context.warnings);
+        assert!(context.warnings[0].contains("crosses symlink"));
+    }
+
+    /// A metadata producer can preserve the lexical `root/linked/Cargo.toml`
+    /// spelling even when `linked` is a symlink. Component validation must
+    /// reject that intermediate escape before opening the manifest or source.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_member_escape_is_omitted_before_any_source_read() {
+        use cap_std::{ambient_authority, fs::Dir};
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        write_crate(&root, "valid", "valid", "pub fn safe() {}");
+        write_crate(
+            parent.path(),
+            "escaped-member",
+            "escaped_member",
+            "pub fn SYMLINK_MEMBER_SENTINEL() {}",
+        );
+        symlink(parent.path().join("escaped-member"), root.join("linked")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers=[\"valid\"]\nresolver=\"2\"\n",
+        )
+        .unwrap();
+        let metadata = serde_json::json!({
+            "workspace_members": ["valid-id", "linked-id"],
+            "packages": [
+                {
+                    "id": "linked-id", "name": "linked",
+                    "manifest_path": root.join("linked/Cargo.toml"),
+                    "version": "0.1.0", "edition": "2021",
+                    "targets": [{"kind": ["lib"]}], "dependencies": []
+                },
+                {
+                    "id": "valid-id", "name": "valid",
+                    "manifest_path": root.join("valid/Cargo.toml"),
+                    "version": "0.1.0", "edition": "2021",
+                    "targets": [{"kind": ["lib"]}], "dependencies": []
+                }
+            ]
+        });
+        let dir = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
+        let scan = rust::scan_metadata(&root, &dir, &metadata, &|| false)
+            .unwrap()
+            .unwrap();
+        let context = render_rust_scan(
+            &Project::open(&root).unwrap(),
+            ContextBudget::standard(),
+            None,
+            scan,
+            &|| false,
+        )
+        .unwrap();
+        assert!(context.rendered.contains("safe"), "{}", context.rendered);
+        assert!(!context.rendered.contains("SYMLINK_MEMBER_SENTINEL"));
+        assert!(!context.rendered.contains("### linked"));
+        assert_eq!(context.warnings.len(), 1, "{:?}", context.warnings);
+        assert!(context.warnings[0].contains("crosses symlink"));
+    }
+
+    /// Filesystem enumeration order varies. Multiple rejected source symlinks
+    /// must produce the same sorted warning bytes on every extraction.
+    #[cfg(unix)]
+    #[test]
+    fn ingestion_warning_order_is_deterministic() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        write_crate(&root, "valid", "valid", "pub fn safe() {}");
+        symlink(parent.path(), root.join("valid/src/z_escape.rs")).unwrap();
+        symlink(parent.path(), root.join("valid/src/a_escape.rs")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers=[\"valid\"]\nresolver=\"2\"\n",
+        )
+        .unwrap();
+        let project = Project::open(&root).unwrap();
+        let first = project.context(ContextBudget::standard());
+        let second = project.context(ContextBudget::standard());
+        assert_eq!(first.warnings, second.warnings);
+        let mut sorted = first.warnings.clone();
+        sorted.sort();
+        assert_eq!(first.warnings, sorted);
+        assert_eq!(first.rendered, second.rendered);
+        assert_eq!(first.warnings.len(), 2, "{:?}", first.warnings);
+        assert!(first.warnings[0].contains("a_escape.rs"));
+        assert!(first.warnings[1].contains("z_escape.rs"));
     }
 
     #[test]

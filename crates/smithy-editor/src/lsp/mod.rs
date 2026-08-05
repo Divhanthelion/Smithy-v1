@@ -10,11 +10,13 @@ mod transport;
 mod types;
 mod uri;
 
-pub use client::{LspClient, LspClientConfig, LspError, ServerHealth};
+pub use client::{
+    ClientCrash, ClientDiagnostics, LspClient, LspClientConfig, LspError, LspStamp, ServerHealth,
+};
 pub use integration::{LspHandle, LspManager, LspRequest, LspResponse};
 pub use registry::{
     rust_initialization_options, LanguageServerConfig, LspRegistry, ServerAvailability, ServerKey,
-    SharedLspRegistry,
+    RestartOutcome, SharedLspRegistry,
 };
 pub use transport::LspTransport;
 pub use types::{

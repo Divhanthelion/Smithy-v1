@@ -68,6 +68,24 @@ pub struct Edge {
     pub sites: u32,
 }
 
+/// One prepared adjacency entry.
+///
+/// The persisted edge list stays compact; this is rebuilt after assembly or
+/// load so every interactive lookup is proportional to that node's degree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Adjacent {
+    pub node: u32,
+    pub sites: u32,
+}
+
+/// Derived, non-persisted lookup tables for both edge directions.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AdjacencyIndex {
+    incoming: Vec<Vec<Adjacent>>,
+    outgoing: Vec<Vec<Adjacent>>,
+    invalid_edges: usize,
+}
+
 /// What did and did not become an edge.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildStats {
@@ -106,7 +124,7 @@ pub struct BuildStats {
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// A resolved call graph.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallGraph {
     #[serde(default)]
     pub version: u32,
@@ -128,6 +146,21 @@ pub struct CallGraph {
     /// from nodes would not notice.
     #[serde(default)]
     pub sources: HashMap<String, u64>,
+    /// Rebuilt from `edges` after load/build. Serializing this would duplicate
+    /// the graph on disk and make the schema depend on an implementation detail.
+    #[serde(skip)]
+    adjacency: AdjacencyIndex,
+}
+
+impl PartialEq for CallGraph {
+    fn eq(&self, other: &Self) -> bool {
+        self.version == other.version
+            && self.nodes == other.nodes
+            && self.edges == other.edges
+            && self.stats == other.stats
+            && self.built_at == other.built_at
+            && self.sources == other.sources
+    }
 }
 
 impl Default for CallGraph {
@@ -139,6 +172,7 @@ impl Default for CallGraph {
             stats: BuildStats::default(),
             built_at: 0,
             sources: HashMap::new(),
+            adjacency: AdjacencyIndex::default(),
         }
     }
 }
@@ -183,21 +217,103 @@ impl Staleness {
 }
 
 impl CallGraph {
+    /// Construct an in-memory graph and immediately prepare its derived index.
+    pub fn from_parts(nodes: Vec<Node>, edges: Vec<Edge>) -> Self {
+        let mut graph = CallGraph {
+            nodes,
+            edges,
+            ..CallGraph::default()
+        };
+        graph.prepare();
+        graph
+    }
+
+    /// Build the derived adjacency tables and return the number of malformed
+    /// persisted edges that were skipped.
+    ///
+    /// A damaged edge must not take the editor down. It remains in `edges` so a
+    /// save does not silently rewrite evidence, while the prepared index omits
+    /// it and exposes the count to status UI.
+    pub fn prepare(&mut self) -> usize {
+        let mut adjacency = AdjacencyIndex {
+            incoming: vec![Vec::new(); self.nodes.len()],
+            outgoing: vec![Vec::new(); self.nodes.len()],
+            invalid_edges: 0,
+        };
+        for edge in &self.edges {
+            let Some(outgoing) = adjacency.outgoing.get_mut(edge.from as usize) else {
+                adjacency.invalid_edges += 1;
+                continue;
+            };
+            if edge.to as usize >= adjacency.incoming.len() {
+                adjacency.invalid_edges += 1;
+                continue;
+            }
+            outgoing.push(Adjacent {
+                node: edge.to,
+                sites: edge.sites,
+            });
+            adjacency.incoming[edge.to as usize].push(Adjacent {
+                node: edge.from,
+                sites: edge.sites,
+            });
+        }
+        for entries in adjacency.incoming.iter_mut().chain(adjacency.outgoing.iter_mut()) {
+            entries.sort_by_key(|entry| entry.node);
+        }
+        let invalid = adjacency.invalid_edges;
+        self.adjacency = adjacency;
+        invalid
+    }
+
+    /// Prepared outgoing node/site pairs. Invalid node ids safely look empty.
+    pub fn outgoing(&self, node: u32) -> &[Adjacent] {
+        self.adjacency
+            .outgoing
+            .get(node as usize)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Prepared incoming node/site pairs. Invalid node ids safely look empty.
+    pub fn incoming(&self, node: u32) -> &[Adjacent] {
+        self.adjacency
+            .incoming
+            .get(node as usize)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    pub fn degree(&self, node: u32) -> usize {
+        self.incoming(node).len() + self.outgoing(node).len()
+    }
+
+    /// Edges whose endpoints do not exist in `nodes`.
+    pub fn invalid_edge_count(&self) -> usize {
+        self.adjacency.invalid_edges
+    }
+
     /// Everything `node` calls.
     pub fn callees(&self, node: u32) -> Vec<(&Node, u32)> {
-        self.edges
+        self.outgoing(node)
             .iter()
-            .filter(|e| e.from == node)
-            .filter_map(|e| self.nodes.get(e.to as usize).map(|n| (n, e.sites)))
+            .filter_map(|edge| {
+                self.nodes
+                    .get(edge.node as usize)
+                    .map(|node| (node, edge.sites))
+            })
             .collect()
     }
 
     /// Everything that calls `node`.
     pub fn callers(&self, node: u32) -> Vec<(&Node, u32)> {
-        self.edges
+        self.incoming(node)
             .iter()
-            .filter(|e| e.to == node)
-            .filter_map(|e| self.nodes.get(e.from as usize).map(|n| (n, e.sites)))
+            .filter_map(|edge| {
+                self.nodes
+                    .get(edge.node as usize)
+                    .map(|node| (node, edge.sites))
+            })
             .collect()
     }
 
@@ -308,6 +424,7 @@ impl CallGraph {
         // Deterministic order, so a persisted graph round-trips byte-identically
         // and two runs over an unchanged tree produce the same file.
         graph.edges.sort_by_key(|e| (e.from, e.to));
+        graph.prepare();
         graph
     }
 
@@ -410,7 +527,7 @@ impl CallGraph {
     pub fn load(path: &Path) -> Result<CallGraph, String> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let graph: CallGraph = serde_json::from_str(&text)
+        let mut graph: CallGraph = serde_json::from_str(&text)
             .map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
         if graph.version > SCHEMA_VERSION {
             return Err(format!(
@@ -420,6 +537,7 @@ impl CallGraph {
                 SCHEMA_VERSION
             ));
         }
+        graph.prepare();
         Ok(graph)
     }
 
@@ -629,6 +747,70 @@ fn callee() {
         assert_eq!(graph.stats.edges_kept, 2, "both sites are counted");
     }
 
+    /// Both directions must carry the same site count; rebuilding either one by
+    /// scanning `edges` in the UI brought the old O(V*E) paint cost back.
+    #[test]
+    fn the_prepared_index_preserves_direction_and_sites() {
+        let graph = CallGraph::from_parts(
+            vec![
+                Node {
+                    name: "caller".into(),
+                    container: None,
+                    file: "a.rs".into(),
+                    line: 1,
+                    end_line: 2,
+                },
+                Node {
+                    name: "callee".into(),
+                    container: None,
+                    file: "b.rs".into(),
+                    line: 1,
+                    end_line: 2,
+                },
+            ],
+            vec![Edge {
+                from: 0,
+                to: 1,
+                sites: 7,
+            }],
+        );
+        assert_eq!(graph.outgoing(0), &[Adjacent { node: 1, sites: 7 }]);
+        assert_eq!(graph.incoming(1), &[Adjacent { node: 0, sites: 7 }]);
+        assert!(graph.incoming(0).is_empty());
+        assert!(graph.outgoing(1).is_empty());
+    }
+
+    /// Isolated nodes are ordinary empty adjacency lists. Corrupt endpoint
+    /// indices are counted and skipped rather than indexing `nodes` and panicking.
+    #[test]
+    fn isolated_and_invalid_edges_are_safe_and_visible() {
+        let graph = CallGraph::from_parts(
+            vec![Node {
+                name: "alone".into(),
+                container: None,
+                file: "a.rs".into(),
+                line: 1,
+                end_line: 2,
+            }],
+            vec![
+                Edge {
+                    from: 0,
+                    to: 9,
+                    sites: 2,
+                },
+                Edge {
+                    from: 8,
+                    to: 0,
+                    sites: 3,
+                },
+            ],
+        );
+        assert!(graph.incoming(0).is_empty());
+        assert!(graph.outgoing(0).is_empty());
+        assert_eq!(graph.invalid_edge_count(), 2);
+        assert_eq!(graph.degree(99), 0);
+    }
+
     #[test]
     fn recursion_is_kept_and_counted() {
         let symbols = symbols_for("fn f() {\n    f();\n}\n");
@@ -818,6 +1000,23 @@ fn callee() {
         let path = tmp.path().join("callgraph.json");
         graph.save(&path).unwrap();
         assert_eq!(CallGraph::load(&path).unwrap(), graph);
+    }
+
+    /// Version-0 files predate `built_at` and `sources`; the derived index must
+    /// not become a required JSON field when those old files are loaded.
+    #[test]
+    fn an_old_persisted_graph_loads_and_prepares_its_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("callgraph.json");
+        std::fs::write(
+            &path,
+            r#"{"nodes":[{"name":"a","container":null,"file":"a.rs","line":1,"end_line":2},{"name":"b","container":null,"file":"b.rs","line":1,"end_line":2}],"edges":[{"from":0,"to":1,"sites":4}],"stats":{"occurrences":0,"definitions":0,"references":0,"edges_kept":0,"unattributed":0,"external":0,"self_edges":0,"locals":0}}"#,
+        )
+        .unwrap();
+        let graph = CallGraph::load(&path).unwrap();
+        assert_eq!(graph.version, 0);
+        assert_eq!(graph.outgoing(0), &[Adjacent { node: 1, sites: 4 }]);
+        assert_eq!(graph.incoming(1), &[Adjacent { node: 0, sites: 4 }]);
     }
 
     #[test]

@@ -19,10 +19,17 @@
 //! `http://169.254.169.254/…`" is the oldest way to turn that into a credential
 //! leak. Nothing in this editor needs to fetch its own localhost.
 
+use std::collections::HashSet;
+use std::future::Future;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
+use std::sync::Arc;
+
 use async_trait::async_trait;
+use reqwest::{StatusCode, Url};
 use serde_json::Value;
 
-use crate::registry::{Tool, ToolCtx};
+use crate::registry::{ExecutionControl, Tool, ToolCtx};
 use crate::schema::{arg_i64, arg_str, ToolDefinition, ToolOutput, ToolParameter};
 
 /// Ceiling on the text handed back, in characters.
@@ -38,6 +45,7 @@ const HARD_MAX_CHARS: usize = 200_000;
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const MAX_REDIRECTS: usize = 5;
 
 /// A browser-ish agent string. Some documentation hosts serve a JavaScript
 /// challenge to unrecognised clients, which renders as an empty page — an
@@ -45,23 +53,16 @@ const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const USER_AGENT: &str = concat!("Smithy/", env!("CARGO_PKG_VERSION"), " (+agent)");
 
 pub struct WebFetch {
-    http: reqwest::Client,
+    resolver: Arc<dyn Resolver>,
 }
 
 impl WebFetch {
     pub fn new() -> Self {
         Self {
-            http: reqwest::Client::builder()
-                .timeout(TIMEOUT)
-                .user_agent(USER_AGENT)
-                // Redirects are followed, but every hop is re-checked below —
-                // an allowed first URL that redirects to loopback is exactly
-                // the case a scheme check on the input alone would miss.
-                .redirect(reqwest::redirect::Policy::limited(5))
-                .build()
-                .unwrap_or_default(),
+            resolver: Arc::new(SystemResolver),
         }
     }
+
 }
 
 impl Default for WebFetch {
@@ -95,33 +96,344 @@ impl Tool for WebFetch {
         )
     }
 
-    async fn run(&self, args: &Value, _ctx: &ToolCtx) -> ToolOutput {
-        let url = match arg_str(args, "url") {
+    async fn run(&self, args: &Value, ctx: &ToolCtx) -> ToolOutput {
+        self.run_controlled(args, ctx, &ExecutionControl::default())
+            .await
+    }
+
+    async fn run_controlled(
+        &self,
+        args: &Value,
+        _ctx: &ToolCtx,
+        control: &ExecutionControl,
+    ) -> ToolOutput {
+        let input = match arg_str(args, "url") {
             Ok(u) => u.trim(),
             Err(e) => return ToolOutput::err(e),
         };
-        if let Err(e) = check_url(url) {
-            return ToolOutput::err(e);
-        }
+        let url = match parse_url(input) {
+            Ok(url) => url,
+            Err(error) => return ToolOutput::err(error),
+        };
         let max_chars = arg_i64(args, "max_chars")
             .map(|n| (n.max(500) as usize).min(HARD_MAX_CHARS))
             .unwrap_or(DEFAULT_MAX_CHARS);
 
-        let response = match self.http.get(url).send().await {
-            Ok(r) => r,
-            Err(e) => return ToolOutput::err(format!("could not fetch `{url}`: {e}")),
-        };
+        let control = control.bounded_by(TIMEOUT);
+        let (bytes, content_type, final_url) =
+            match fetch_bytes(url.clone(), self.resolver.as_ref(), &control).await {
+                Ok(result) => result,
+                Err(error) => return ToolOutput::err(error),
+            };
+        let requested_url = url.to_string();
+        match controlled_blocking(&control, move || {
+            render_download(
+                bytes,
+                content_type,
+                final_url,
+                requested_url,
+                max_chars,
+            )
+        })
+        .await
+        {
+            Ok(text) => ToolOutput::ok(text),
+            Err(error) => ToolOutput::err(error),
+        }
+    }
+}
 
-        // The URL actually reached, after redirects. Checked again because a
-        // permitted URL is allowed to redirect anywhere, including inward.
-        let final_url = response.url().clone();
-        if let Err(e) = check_url(final_url.as_str()) {
-            return ToolOutput::err(format!("`{url}` redirected somewhere it may not go: {e}"));
+#[derive(Clone, Copy, Debug)]
+struct ResolvedAddress {
+    validated: IpAddr,
+    connect: SocketAddr,
+}
+
+type ResolveFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Vec<ResolvedAddress>, String>> + Send + 'a>>;
+
+trait Resolver: Send + Sync {
+    fn resolve<'a>(&'a self, host: &'a str, port: u16) -> ResolveFuture<'a>;
+}
+
+struct SystemResolver;
+
+impl Resolver for SystemResolver {
+    fn resolve<'a>(&'a self, host: &'a str, port: u16) -> ResolveFuture<'a> {
+        Box::pin(async move {
+            tokio::net::lookup_host((host, port))
+                .await
+                .map_err(|error| format!("DNS lookup for `{host}` failed: {error}"))
+                .map(|answers| {
+                    answers
+                        .map(|connect| ResolvedAddress {
+                            validated: connect.ip(),
+                            connect,
+                        })
+                        .collect()
+                })
+        })
+    }
+}
+
+fn parse_url(input: &str) -> Result<Url, String> {
+    let url = Url::parse(input).map_err(|error| format!("`{input}` is not a valid URL: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!(
+            "`{input}` is not an http:// or https:// URL. This tool only fetches web pages; use \
+             `read` for files on disk."
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(format!("`{input}` contains user information, which is not allowed."));
+    }
+    if url.host().is_none() {
+        return Err(format!("`{input}` has no host"));
+    }
+    Ok(url)
+}
+
+pub fn check_url(input: &str) -> Result<(), String> {
+    let url = parse_url(input)?;
+    let host = url.host_str().expect("parse_url requires a host");
+    if host == "localhost" || host.ends_with(".localhost") || host.ends_with(".internal") {
+        return Err(format!(
+            "`{host}` is a private or loopback host, which this tool will not fetch."
+        ));
+    }
+    let literal = host.strip_prefix('[').and_then(|host| host.strip_suffix(']')).unwrap_or(host);
+    match literal.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) if !is_public_ipv4(ip) => private_address_error(ip.into()),
+        Ok(IpAddr::V6(ip)) if !is_public_ipv6(ip) => private_address_error(ip.into()),
+        _ => Ok(()),
+    }
+}
+
+fn private_address_error(ip: IpAddr) -> Result<(), String> {
+    Err(format!(
+        "`{ip}` is a special, private, or non-routable address, which this tool will not fetch."
+    ))
+}
+
+fn is_public_ipv4(ip: Ipv4Addr) -> bool {
+    let [a, b, c, _] = ip.octets();
+    !(a == 0
+        || a == 10
+        || a == 100 && (64..=127).contains(&b)
+        || a == 127
+        || a == 169 && b == 254
+        || a == 172 && (16..=31).contains(&b)
+        // Blanket-denying 192/8 blocked ordinary public sites. These are the
+        // IANA special-purpose allocations inside it; whole allocation blocks
+        // are denied so future use of an anycast exception cannot become an
+        // accidental route inward.
+        || a == 192
+            && ((b == 0 && (c == 0 || c == 2))
+                || (b == 31 && c == 196)
+                || (b == 52 && c == 193)
+                || (b == 88 && c == 99)
+                || b == 168
+                || (b == 175 && c == 48))
+        || a == 198 && (b == 18 || b == 19 || b == 51 && c == 100)
+        || a == 203 && b == 0 && c == 113
+        || a >= 224)
+}
+
+fn is_public_ipv6(ip: Ipv6Addr) -> bool {
+    if let Some(v4) = embedded_ipv4(ip) {
+        return is_public_ipv4(v4);
+    }
+    let segments = ip.segments();
+    (segments[0] & 0xe000 == 0x2000)
+        && !(ip.is_unspecified()
+        || ip.is_loopback()
+        || segments[0] & 0xfe00 == 0xfc00
+        || segments[0] & 0xff00 == 0xfe00
+        || segments[0] & 0xff00 == 0xff00
+        || segments[0] == 0x0100 && segments[1..].iter().all(|segment| *segment == 0)
+        || segments[0] == 0x0064 && segments[1] == 0xff9b
+        || segments[0] == 0x2001 && segments[1] <= 0x01ff
+        || segments[0] == 0x2001 && segments[1] == 0x0db8
+        || segments[0] == 0x2002
+        || segments[0] == 0x3fff && segments[1] & 0xf000 == 0)
+}
+
+fn embedded_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    let octets = ip.octets();
+    if octets[..10] == [0; 10] && (octets[10..12] == [0, 0] || octets[10..12] == [0xff, 0xff]) {
+        Some(Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ))
+    } else {
+        None
+    }
+}
+
+fn validate_answers(host: &str, answers: Vec<ResolvedAddress>) -> Result<Vec<SocketAddr>, String> {
+    if answers.is_empty() {
+        return Err(format!("DNS lookup for `{host}` returned no addresses."));
+    }
+    let mut public = Vec::new();
+    let mut rejected = Vec::new();
+    for answer in answers {
+        let allowed = match answer.validated {
+            IpAddr::V4(ip) => is_public_ipv4(ip),
+            IpAddr::V6(ip) => is_public_ipv6(ip),
+        };
+        if allowed {
+            public.push(answer.connect);
+        } else {
+            rejected.push(answer.validated);
+        }
+    }
+    if !rejected.is_empty() {
+        let kind = if public.is_empty() {
+            "only non-public"
+        } else {
+            "a mixture of public and non-public"
+        };
+        return Err(format!(
+            "DNS lookup for `{host}` returned {kind} addresses ({rejected:?}); refusing the entire \
+             answer set."
+        ));
+    }
+    public.sort_unstable();
+    public.dedup();
+    Ok(public)
+}
+
+async fn controlled<T>(
+    control: &ExecutionControl,
+    future: impl Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    tokio::select! {
+        biased;
+        reason = control.cancelled() => Err(reason),
+        result = future => result,
+    }
+}
+
+async fn controlled_blocking<T: Send + 'static>(
+    control: &ExecutionControl,
+    job: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    control.check()?;
+    let task = tokio::task::spawn_blocking(job);
+    tokio::select! {
+        biased;
+        reason = control.cancelled() => Err(reason),
+        result = task => result
+            .map_err(|error| format!("web rendering task failed: {error}"))?,
+    }
+}
+
+fn render_download(
+    bytes: Vec<u8>,
+    content_type: String,
+    final_url: Url,
+    requested_url: String,
+    max_chars: usize,
+) -> Result<String, String> {
+    let body = String::from_utf8_lossy(&bytes);
+    let text = if is_html(&content_type, &body) {
+        render_html(&body)
+    } else {
+        body.to_string()
+    };
+    let text = collapse_blank_lines(text.trim());
+    if text.is_empty() {
+        return Err(format!(
+            "`{requested_url}` returned no readable text. It may require JavaScript; try the \
+             project's raw documentation or repository instead."
+        ));
+    }
+    Ok(truncate(&text, max_chars, final_url.as_str()))
+}
+
+async fn fetch_bytes(
+    mut url: Url,
+    resolver: &dyn Resolver,
+    control: &ExecutionControl,
+) -> Result<(Vec<u8>, String, Url), String> {
+    let original = url.clone();
+    let mut visited = HashSet::new();
+    let mut redirects = 0;
+    loop {
+        control.check()?;
+        check_url(url.as_str())?;
+        let mut loop_key = url.clone();
+        loop_key.set_fragment(None);
+        if !visited.insert(loop_key.to_string()) {
+            return Err(format!("redirect loop detected at `{url}`."));
         }
 
+        let raw_host = url
+            .host_str()
+            .ok_or_else(|| format!("`{url}` has no host"))?;
+        let host = raw_host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(raw_host)
+            .to_string();
+        let port = url
+            .port_or_known_default()
+            .ok_or_else(|| format!("`{url}` has no usable port"))?;
+        let literal = host.parse::<IpAddr>().ok();
+        let answers = if let Some(ip) = literal {
+            vec![ResolvedAddress {
+                validated: ip,
+                connect: SocketAddr::new(ip, port),
+            }]
+        } else {
+            controlled(control, resolver.resolve(&host, port)).await?
+        };
+        let addresses = validate_answers(&host, answers)?;
+
+        let mut builder = reqwest::Client::builder()
+            .user_agent(USER_AGENT)
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy();
+        if literal.is_none() {
+            builder = builder.resolve_to_addrs(&host, &addresses);
+        }
+        let client = builder
+            .build()
+            .map_err(|error| format!("could not prepare request for `{url}`: {error}"))?;
+        let request = client
+            .get(url.clone())
+            .header(reqwest::header::ACCEPT_ENCODING, "identity");
+        let mut response = controlled(control, async {
+            request
+                .send()
+                .await
+                .map_err(|error| format!("could not fetch `{url}`: {error}"))
+        })
+        .await?;
         let status = response.status();
+
+        if is_redirect(status) {
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .ok_or_else(|| format!("`{url}` returned HTTP {status} without a Location header."))?
+                .to_str()
+                .map_err(|_| format!("`{url}` returned a non-text Location header."))?;
+            if redirects == MAX_REDIRECTS {
+                return Err(format!(
+                    "`{original}` exceeded the limit of {MAX_REDIRECTS} redirects."
+                ));
+            }
+            let next = url
+                .join(location)
+                .map_err(|error| format!("`{url}` returned an invalid redirect `{location}`: {error}"))?;
+            parse_url(next.as_str())?;
+            url = next;
+            redirects += 1;
+            continue;
+        }
+
         if !status.is_success() {
-            return ToolOutput::err(format!(
+            return Err(format!(
                 "`{url}` returned HTTP {}. {}",
                 status.as_u16(),
                 match status.as_u16() {
@@ -133,107 +445,61 @@ impl Tool for WebFetch {
             ));
         }
 
+        if let Some(encoding) = response.headers().get(reqwest::header::CONTENT_ENCODING) {
+            let encoding = encoding
+                .to_str()
+                .map_err(|_| format!("`{url}` returned an invalid Content-Encoding header."))?;
+            if !encoding.trim().is_empty() && !encoding.eq_ignore_ascii_case("identity") {
+                return Err(format!(
+                    "`{url}` returned unsupported Content-Encoding `{encoding}`; only identity is \
+                     accepted."
+                ));
+            }
+        }
+        if response.content_length().is_some_and(|length| length > MAX_BODY_BYTES as u64) {
+            return Err(too_large(&url, response.content_length().unwrap()));
+        }
         let content_type = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
+            .and_then(|value| value.to_str().ok())
             .unwrap_or("")
             .to_lowercase();
-
-        let bytes = match response.bytes().await {
-            Ok(b) => b,
-            Err(e) => return ToolOutput::err(format!("could not read `{url}`: {e}")),
-        };
-        if bytes.len() > MAX_BODY_BYTES {
-            return ToolOutput::err(format!(
-                "`{url}` is {} MB, which is too large to read. Fetch a more specific page.",
-                bytes.len() / (1024 * 1024)
-            ));
+        let mut bytes = Vec::new();
+        while let Some(chunk) = controlled(control, async {
+            response
+                .chunk()
+                .await
+                .map_err(|error| format!("could not read `{url}`: {error}"))
+        })
+        .await?
+        {
+            if chunk.len() > MAX_BODY_BYTES - bytes.len() {
+                return Err(too_large(&url, bytes.len() as u64 + chunk.len() as u64));
+            }
+            bytes.extend_from_slice(&chunk);
         }
-        let body = String::from_utf8_lossy(&bytes);
-
-        let text = if is_html(&content_type, &body) {
-            render_html(&body)
-        } else {
-            body.to_string()
-        };
-
-        let text = collapse_blank_lines(text.trim());
-        if text.is_empty() {
-            return ToolOutput::err(format!(
-                "`{url}` returned no readable text. It may require JavaScript; try the project's \
-                 raw documentation or repository instead."
-            ));
-        }
-
-        ToolOutput::ok(truncate(&text, max_chars, final_url.as_str()))
+        return Ok((bytes, content_type, url));
     }
 }
 
-/// Refuse anything that is not a public http/https URL.
-///
-/// Written as a deny of the specific shapes that matter rather than an allow of
-/// hostname patterns, because the latter cannot be got right — the point is to
-/// close the obvious holes, not to claim the tool is safe against a host that is
-/// actively trying to be reached.
-pub fn check_url(url: &str) -> Result<(), String> {
-    let lowered = url.to_lowercase();
-    if !lowered.starts_with("http://") && !lowered.starts_with("https://") {
-        return Err(format!(
-            "`{url}` is not an http:// or https:// URL. This tool only fetches web pages; use \
-             `read` for files on disk."
-        ));
-    }
-
-    let host = host_of(&lowered).ok_or_else(|| format!("`{url}` has no host"))?;
-
-    if host == "localhost"
-        || host == "0.0.0.0"
-        || host.ends_with(".localhost")
-        || host.ends_with(".internal")
-        || host.starts_with("127.")
-        || host.starts_with("10.")
-        || host.starts_with("192.168.")
-        || host.starts_with("169.254.")
-        || host == "[::1]"
-        || is_private_172(host)
-    {
-        return Err(format!(
-            "`{host}` is a private or loopback address, which this tool will not fetch."
-        ));
-    }
-    Ok(())
+fn is_redirect(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::MOVED_PERMANENTLY
+            | StatusCode::FOUND
+            | StatusCode::SEE_OTHER
+            | StatusCode::TEMPORARY_REDIRECT
+            | StatusCode::PERMANENT_REDIRECT
+    )
 }
 
-/// The host portion of an already-lowercased absolute URL, port stripped.
-fn host_of(url: &str) -> Option<&str> {
-    let after_scheme = url.split_once("://")?.1;
-    let authority = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .filter(|a| !a.is_empty())?;
-    // Credentials, if someone put them in the URL.
-    let authority = authority.rsplit('@').next()?;
-    // An IPv6 literal keeps its brackets; anything else loses its port.
-    if authority.starts_with('[') {
-        return authority.split_once(']').map(|(h, _)| {
-            // Put the bracket back so the caller compares against "[::1]".
-            let end = h.len() + 1;
-            &authority[..end]
-        });
-    }
-    Some(authority.split(':').next().unwrap_or(authority))
-}
-
-/// `172.16.0.0/12` — the one private range that is not a clean prefix match.
-fn is_private_172(host: &str) -> bool {
-    let Some(rest) = host.strip_prefix("172.") else {
-        return false;
-    };
-    let Some(second) = rest.split('.').next() else {
-        return false;
-    };
-    matches!(second.parse::<u8>(), Ok(16..=31))
+fn too_large(url: &Url, bytes: u64) -> String {
+    format!(
+        "`{url}` is larger than the {} MiB download limit ({bytes} bytes reported or received). \
+         Fetch a more specific page.",
+        MAX_BODY_BYTES / (1024 * 1024)
+    )
 }
 
 /// Whether to run the body through the HTML renderer.
@@ -300,6 +566,122 @@ fn truncate(text: &str, max_chars: usize, final_url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    #[derive(Clone)]
+    struct FakeResolver {
+        answers: Arc<Mutex<VecDeque<Vec<ResolvedAddress>>>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl FakeResolver {
+        fn new(answers: Vec<Vec<ResolvedAddress>>) -> Self {
+            Self {
+                answers: Arc::new(Mutex::new(answers.into())),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Resolver for FakeResolver {
+        fn resolve<'a>(&'a self, host: &'a str, _port: u16) -> ResolveFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let answer = self.answers.lock().unwrap().pop_front();
+            Box::pin(async move {
+                answer.ok_or_else(|| format!("fake DNS had no answer left for `{host}`"))
+            })
+        }
+    }
+
+    struct Reply {
+        bytes: Vec<u8>,
+        delay: std::time::Duration,
+    }
+
+    impl Reply {
+        fn immediate(bytes: impl Into<Vec<u8>>) -> Self {
+            Self {
+                bytes: bytes.into(),
+                delay: std::time::Duration::ZERO,
+            }
+        }
+    }
+
+    fn server(
+        make_replies: impl FnOnce(u16) -> Vec<Reply>,
+    ) -> (SocketAddr, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let replies = make_replies(address.port());
+        let thread = std::thread::spawn(move || {
+            for reply in replies {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let count = stream.read(&mut chunk).unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..count]);
+                }
+                std::thread::sleep(reply.delay);
+                let _ = stream.write_all(&reply.bytes);
+            }
+        });
+        (address, thread)
+    }
+
+    fn mapped(public: IpAddr, connect: SocketAddr) -> ResolvedAddress {
+        ResolvedAddress {
+            validated: public,
+            connect,
+        }
+    }
+
+    fn public_v4() -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))
+    }
+
+    fn ok_response(body: &[u8]) -> Vec<u8> {
+        let mut response =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    fn chunked_response(body: &[u8], encoding: Option<&str>) -> Vec<u8> {
+        let encoding = encoding
+            .map(|value| format!("Content-Encoding: {value}\r\n"))
+            .unwrap_or_default();
+        let mut response =
+            format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n{encoding}\r\n").into_bytes();
+        for chunk in body.chunks(8191) {
+            response.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            response.extend_from_slice(chunk);
+            response.extend_from_slice(b"\r\n");
+        }
+        response.extend_from_slice(b"0\r\n\r\n");
+        response
+    }
+
+    async fn fetch_for_test(
+        url: &str,
+        resolver: &FakeResolver,
+        control: &ExecutionControl,
+    ) -> Result<(Vec<u8>, String, Url), String> {
+        fetch_bytes(parse_url(url).unwrap(), resolver, control).await
+    }
 
     #[test]
     fn a_plain_https_url_is_allowed() {
@@ -357,8 +739,393 @@ mod tests {
     }
 
     #[test]
+    fn user_information_is_rejected_even_when_the_host_is_public() {
+        assert!(check_url("https://user:secret@example.com/").is_err());
+    }
+
+    #[test]
     fn ports_do_not_disguise_a_private_host() {
         assert!(check_url("http://192.168.0.5:8443/admin").is_err());
+    }
+
+    /// The URL parser, rather than string prefix matching, must expose legacy
+    /// numeric IPv4 forms and IPv4 embedded in IPv6 before policy runs.
+    #[test]
+    fn disguised_ipv4_and_ipv6_loopback_are_refused() {
+        for url in [
+            "http://2130706433/",
+            "http://0177.0.0.1/",
+            "http://[::ffff:127.0.0.1]/",
+            "http://[::127.0.0.1]/",
+        ] {
+            assert!(check_url(url).is_err(), "{url} should be refused");
+        }
+    }
+
+    #[test]
+    fn private_and_mixed_dns_answers_are_refused_whole() {
+        let connect = SocketAddr::from((Ipv4Addr::LOCALHOST, 80));
+        let private = mapped(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), connect);
+        let public = mapped(public_v4(), connect);
+        let private_error = validate_answers("private.test", vec![private]).unwrap_err();
+        assert!(private_error.contains("only non-public"), "{private_error}");
+        let mixed_error = validate_answers("mixed.test", vec![public, private]).unwrap_err();
+        assert!(mixed_error.contains("mixture"), "{mixed_error}");
+    }
+
+    /// Missing one IANA special-purpose family reopens SSRF through a spelling
+    /// that looks unlike the familiar RFC 1918 and `::1` examples.
+    #[test]
+    fn every_non_public_address_family_is_refused() {
+        for address in [
+            "0.1.2.3",
+            "10.1.2.3",
+            "100.64.0.1",
+            "127.0.0.2",
+            "169.254.1.2",
+            "172.20.1.2",
+            "192.0.0.9",
+            "192.168.1.2",
+            "198.18.0.1",
+            "198.51.100.2",
+            "203.0.113.2",
+            "224.0.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "::ffff:10.0.0.1",
+            "64:ff9b::1",
+            "100::1",
+            "2001::1",
+            "2001:db8::1",
+            "2002::1",
+            "3fff::1",
+            "fc00::1",
+            "fe80::1",
+            "fec0::1",
+            "ff02::1",
+            "4000::1",
+        ] {
+            let ip: IpAddr = address.parse().unwrap();
+            let allowed = match ip {
+                IpAddr::V4(ip) => is_public_ipv4(ip),
+                IpAddr::V6(ip) => is_public_ipv6(ip),
+            };
+            assert!(!allowed, "{address} should be refused");
+        }
+        for address in ["1.1.1.1", "172.32.0.1", "2001:4860:4860::8888", "2606:4700::1111"] {
+            let ip: IpAddr = address.parse().unwrap();
+            let allowed = match ip {
+                IpAddr::V4(ip) => is_public_ipv4(ip),
+                IpAddr::V6(ip) => is_public_ipv6(ip),
+            };
+            assert!(allowed, "{address} should remain public");
+        }
+    }
+
+    /// Denying all of 192/8 fixed SSRF by breaking public 192.x sites. Keep the
+    /// IANA allocations closed while proving both sides of each block remain
+    /// reachable.
+    #[test]
+    fn only_explicit_special_purpose_192_ranges_are_refused() {
+        for address in [
+            "192.0.0.0",
+            "192.0.0.255",
+            "192.0.2.0",
+            "192.0.2.255",
+            "192.31.196.0",
+            "192.31.196.255",
+            "192.52.193.0",
+            "192.52.193.255",
+            "192.88.99.0",
+            "192.88.99.255",
+            "192.168.0.0",
+            "192.168.255.255",
+            "192.175.48.0",
+            "192.175.48.255",
+        ] {
+            assert!(
+                !is_public_ipv4(address.parse().unwrap()),
+                "{address} should be refused"
+            );
+        }
+        for address in [
+            "192.0.1.255",
+            "192.0.3.0",
+            "192.31.195.255",
+            "192.31.197.0",
+            "192.52.192.255",
+            "192.52.194.0",
+            "192.88.98.255",
+            "192.88.100.0",
+            "192.167.255.255",
+            "192.169.0.0",
+            "192.175.47.255",
+            "192.175.49.0",
+            "192.200.1.1",
+        ] {
+            assert!(
+                is_public_ipv4(address.parse().unwrap()),
+                "{address} should remain public"
+            );
+        }
+    }
+
+    /// The validated answer must be the address used by the connector. This
+    /// fake separates its policy address from the local test socket so a success
+    /// proves the hostname override, not ambient DNS, made the connection.
+    #[tokio::test]
+    async fn validated_dns_answers_are_pinned_for_the_connection() {
+        let (address, server) = server(|_| vec![Reply::immediate(ok_response(b"pinned"))]);
+        let resolver = FakeResolver::new(vec![vec![mapped(public_v4(), address)]]);
+        let result = fetch_for_test(
+            "http://does-not-exist.invalid/",
+            &resolver,
+            &ExecutionControl::default().bounded_by(TIMEOUT),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.0, b"pinned");
+        server.join().unwrap();
+    }
+
+    /// A redirect target is resolved and rejected before any request builder can
+    /// connect to it; checking only the eventual response URL is too late.
+    #[tokio::test]
+    async fn a_redirect_to_a_private_dns_answer_is_rejected_before_connect() {
+        let (address, server) = server(|_| {
+            vec![Reply::immediate(
+                b"HTTP/1.1 302 Found\r\nLocation: http://inside.test/secret\r\nContent-Length: 0\r\n\r\n"
+                    .to_vec(),
+            )]
+        });
+        let resolver = FakeResolver::new(vec![
+            vec![mapped(public_v4(), address)],
+            vec![mapped(
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 9)),
+            )],
+        ]);
+        let error = fetch_for_test(
+            "http://outside.test/",
+            &resolver,
+            &ExecutionControl::default().bounded_by(TIMEOUT),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("only non-public"), "{error}");
+        assert_eq!(resolver.calls(), 2);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn relative_redirects_re_resolve_the_host_on_every_hop() {
+        let (address, server) = server(|_| {
+            vec![
+                Reply::immediate(
+                    b"HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\n\r\n"
+                        .to_vec(),
+                ),
+                Reply::immediate(ok_response(b"arrived")),
+            ]
+        });
+        let resolver = FakeResolver::new(vec![
+            vec![mapped(public_v4(), address)],
+            vec![mapped(public_v4(), address)],
+        ]);
+        let result = fetch_for_test(
+            "http://redirect.test/start",
+            &resolver,
+            &ExecutionControl::default().bounded_by(TIMEOUT),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.0, b"arrived");
+        assert_eq!(result.2.path(), "/final");
+        assert_eq!(resolver.calls(), 2);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn redirect_loops_and_a_sixth_hop_are_rejected() {
+        let (loop_address, loop_server) = server(|_| {
+            vec![Reply::immediate(
+                b"HTTP/1.1 302 Found\r\nLocation: /same\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            )]
+        });
+        let loop_resolver =
+            FakeResolver::new(vec![vec![mapped(public_v4(), loop_address)]]);
+        let error = fetch_for_test(
+            "http://loop.test/same",
+            &loop_resolver,
+            &ExecutionControl::default().bounded_by(TIMEOUT),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("redirect loop"), "{error}");
+        loop_server.join().unwrap();
+
+        let (chain_address, chain_server) = server(|_| {
+            (1..=6)
+                .map(|next| {
+                    Reply::immediate(
+                        format!(
+                            "HTTP/1.1 302 Found\r\nLocation: /{next}\r\nContent-Length: 0\r\n\r\n"
+                        )
+                        .into_bytes(),
+                    )
+                })
+                .collect()
+        });
+        let chain_resolver = FakeResolver::new(
+            (0..6)
+                .map(|_| vec![mapped(public_v4(), chain_address)])
+                .collect(),
+        );
+        let error = fetch_for_test(
+            "http://chain.test/0",
+            &chain_resolver,
+            &ExecutionControl::default().bounded_by(TIMEOUT),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("limit of 5 redirects"), "{error}");
+        assert_eq!(chain_resolver.calls(), 6);
+        chain_server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_and_oversized_chunked_bodies_enforce_the_byte_ceiling() {
+        let exact = vec![b'x'; MAX_BODY_BYTES];
+        let oversized = vec![b'y'; MAX_BODY_BYTES + 1];
+        let (address, server) = server(|_| {
+            vec![
+                Reply::immediate(chunked_response(&exact, None)),
+                Reply::immediate(chunked_response(&oversized, None)),
+            ]
+        });
+        let resolver = FakeResolver::new(vec![
+            vec![mapped(public_v4(), address)],
+            vec![mapped(public_v4(), address)],
+        ]);
+        let control = ExecutionControl::default().bounded_by(TIMEOUT);
+        let result = fetch_for_test("http://body.test/exact", &resolver, &control)
+            .await
+            .unwrap();
+        assert_eq!(result.0.len(), MAX_BODY_BYTES);
+        let error = fetch_for_test("http://body.test/over", &resolver, &control)
+            .await
+            .unwrap_err();
+        assert!(error.contains("8 MiB"), "{error}");
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn known_oversize_and_non_identity_encoding_are_rejected_without_bodies() {
+        let (address, server) = server(|_| {
+            vec![
+                Reply::immediate(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                        MAX_BODY_BYTES + 1
+                    )
+                    .into_bytes(),
+                ),
+                Reply::immediate(chunked_response(b"not really gzip", Some("gzip"))),
+            ]
+        });
+        let resolver = FakeResolver::new(vec![
+            vec![mapped(public_v4(), address)],
+            vec![mapped(public_v4(), address)],
+        ]);
+        let control = ExecutionControl::default().bounded_by(TIMEOUT);
+        let size_error = fetch_for_test("http://headers.test/size", &resolver, &control)
+            .await
+            .unwrap_err();
+        assert!(size_error.contains("8 MiB"), "{size_error}");
+        let encoding_error = fetch_for_test("http://headers.test/encoding", &resolver, &control)
+            .await
+            .unwrap_err();
+        assert!(
+            encoding_error.contains("unsupported Content-Encoding `gzip`"),
+            "{encoding_error}"
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_and_one_absolute_deadline_interrupt_body_reads() {
+        let delayed = || Reply {
+            bytes: ok_response(b"late"),
+            delay: std::time::Duration::from_secs(2),
+        };
+        let (address, server) = server(|_| vec![delayed(), delayed()]);
+        let resolver = FakeResolver::new(vec![
+            vec![mapped(public_v4(), address)],
+            vec![mapped(public_v4(), address)],
+        ]);
+
+        let (control, stopper) = ExecutionControl::for_turn(
+            crate::ExecutionToken::new(1, 1),
+            std::time::Duration::from_secs(10),
+        );
+        let stop = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            stopper.stop();
+        });
+        let error = fetch_for_test("http://slow.test/stop", &resolver, &control)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "stopped by user");
+        stop.await.unwrap();
+
+        let (deadline, _) = ExecutionControl::with_deadline(
+            crate::ExecutionToken::new(2, 1),
+            tokio::time::Instant::now() + std::time::Duration::from_millis(50),
+        );
+        let error = fetch_for_test("http://slow.test/deadline", &resolver, &deadline)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "turn deadline reached");
+        server.join().unwrap();
+    }
+
+    /// Download completion is not permission to spend unbounded CPU. A late
+    /// blocking renderer may finish because Tokio cannot cancel a running
+    /// blocking closure, but its value must stay detached after the deadline.
+    #[tokio::test]
+    async fn cpu_rendering_obeys_control_and_quarantines_its_late_result() {
+        let (control, _) = ExecutionControl::with_deadline(
+            crate::ExecutionToken::new(3, 1),
+            tokio::time::Instant::now() + std::time::Duration::from_millis(30),
+        );
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let job_finished = finished.clone();
+        let started = tokio::time::Instant::now();
+        let error = controlled_blocking(&control, move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            job_finished.store(true, Ordering::SeqCst);
+            Ok("late")
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, "turn deadline reached");
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+        assert!(!finished.load(Ordering::SeqCst));
+        tokio::time::sleep(std::time::Duration::from_millis(175)).await;
+        assert!(finished.load(Ordering::SeqCst));
+
+        let (control, stopper) = ExecutionControl::for_turn(
+            crate::ExecutionToken::new(4, 1),
+            std::time::Duration::from_secs(10),
+        );
+        stopper.stop();
+        let error = controlled_blocking(&control, || Ok("must not start"))
+            .await
+            .unwrap_err();
+        assert_eq!(error, "stopped by user");
     }
 
     #[test]

@@ -18,9 +18,21 @@ reqwest.workspace = true
 futures-util.workspace = true
 thiserror.workspace = true
 keyring.workspace = true
+# Session replay must be tied to the exact credential and tool-schema bytes
+# without ever storing either. SHA-256 gives a stable one-way identity; a
+# hand-rolled hash would be collision-prone precisely where a false match would
+# replay one account's conversation into another.
+sha2 = "0.11.0"
+# Saves compare and rename under a store-wide OS lock. A process-local mutex
+# cannot stop two open Smithy windows from both accepting the same predecessor;
+# fs2 supplies the platform file-locking semantics without hand-written flock.
+fs2 = "0.4.3"
 
 [dev-dependencies]
 tempfile.workspace = true
+# Paused time makes deadline races exact. Sleeping in cancellation tests made
+# a loaded machine indistinguishable from a broken absolute-deadline contract.
+tokio = { workspace = true, features = ["test-util"] }
 # A dev-dependency on ourselves, with `testing` on. This is how `tests/` gets at
 # `provider::test_support` without making the feature a default: `cargo test`
 # enables no non-default features on its own, and the alternative — shipping the

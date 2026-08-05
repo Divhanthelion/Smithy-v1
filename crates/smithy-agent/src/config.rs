@@ -307,26 +307,62 @@ impl AgentConfig {
     /// Blocking, because reading the key can block on the OS credential store.
     /// Callers are already on a worker; see the module docs.
     pub fn build_provider(&self) -> Result<Arc<dyn Provider>, ProviderError> {
+        self.build_provider_with_account_fingerprint()
+            .map(|(provider, _)| provider)
+    }
+
+    /// Build the provider and retain only a one-way account identity.
+    ///
+    /// Fingerprinting happens before the key is moved into the provider, so no
+    /// second raw `String` crosses into app state beside the provider that needs
+    /// it. Reading Keychain again would prompt twice and can observe a different
+    /// value if the account changes between reads.
+    pub fn build_provider_with_account_fingerprint(
+        &self,
+    ) -> Result<
+        (
+            Arc<dyn Provider>,
+            Option<crate::persist::CredentialAccountFingerprint>,
+        ),
+        ProviderError,
+    > {
         match self.provider {
-            ProviderChoice::LmStudio => Ok(Arc::new(LmStudio::new(
-                self.lmstudio.base_url.clone(),
-                self.lmstudio.model.clone(),
-            )?)),
+            ProviderChoice::LmStudio => Ok((
+                Arc::new(LmStudio::new(
+                    self.lmstudio.base_url.clone(),
+                    self.lmstudio.model.clone(),
+                )?),
+                None,
+            )),
             ProviderChoice::OpenRouter => {
                 let key = self.require_key(ProviderChoice::OpenRouter, "OPENROUTER_API_KEY")?;
-                Ok(Arc::new(OpenRouter::new(
-                    self.openrouter.base_url.clone(),
-                    self.openrouter.model.clone(),
-                    key,
-                )?))
+                let identity = crate::persist::CredentialAccountFingerprint::from_secret(
+                    self.provider.as_str(),
+                    &key,
+                );
+                Ok((
+                    Arc::new(OpenRouter::new(
+                        self.openrouter.base_url.clone(),
+                        self.openrouter.model.clone(),
+                        key,
+                    )?),
+                    Some(identity),
+                ))
             }
             ProviderChoice::DeepSeek => {
                 let key = self.require_key(ProviderChoice::DeepSeek, "DEEPSEEK_API_KEY")?;
-                Ok(Arc::new(crate::providers::DeepSeek::new(
-                    self.deepseek.base_url.clone(),
-                    self.deepseek.model.clone(),
-                    key,
-                )?))
+                let identity = crate::persist::CredentialAccountFingerprint::from_secret(
+                    self.provider.as_str(),
+                    &key,
+                );
+                Ok((
+                    Arc::new(crate::providers::DeepSeek::new(
+                        self.deepseek.base_url.clone(),
+                        self.deepseek.model.clone(),
+                        key,
+                    )?),
+                    Some(identity),
+                ))
             }
         }
     }
@@ -556,8 +592,10 @@ mod tests {
     #[test]
     fn settings_survive_a_round_trip() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut config = AgentConfig::default();
-        config.provider = ProviderChoice::OpenRouter;
+        let mut config = AgentConfig {
+            provider: ProviderChoice::OpenRouter,
+            ..AgentConfig::default()
+        };
         config.openrouter.model = "anthropic/claude-opus-4".to_string();
         config.lmstudio.model = "qwen3.6-27b".to_string();
 
@@ -594,8 +632,10 @@ mod tests {
 
     #[test]
     fn the_active_endpoint_follows_the_selection() {
-        let mut config = AgentConfig::default();
-        config.provider = ProviderChoice::LmStudio;
+        let mut config = AgentConfig {
+            provider: ProviderChoice::LmStudio,
+            ..AgentConfig::default()
+        };
         assert_eq!(config.active().base_url, "http://localhost:1234/v1");
         config.provider = ProviderChoice::OpenRouter;
         assert_eq!(config.active().base_url, "https://openrouter.ai/api/v1");
@@ -656,8 +696,10 @@ mod tests {
     #[test]
     fn all_three_endpoints_survive_a_round_trip() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut config = AgentConfig::default();
-        config.provider = ProviderChoice::DeepSeek;
+        let mut config = AgentConfig {
+            provider: ProviderChoice::DeepSeek,
+            ..AgentConfig::default()
+        };
         config.deepseek.model = "deepseek-v4-pro".to_string();
         config.openrouter.model = "cloud".to_string();
         config.lmstudio.model = "local".to_string();

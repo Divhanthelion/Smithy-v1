@@ -11,6 +11,8 @@
 //! is on minimizing CPU-to-GPU data transfer by batching backgrounds and text runs.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::ops::Range;
 use std::rc::Rc;
 
 use floem::peniko::kurbo::{Point, Rect};
@@ -22,7 +24,17 @@ use floem::reactive::{RwSignal, SignalGet, SignalUpdate};
 use floem::text::{Attrs, AttrsList, FamilyOwned, FontStyle, FontWeight, TextLayout};
 use floem::views::Decorators;
 
-use crate::terminal::{TerminalCell, TerminalColor, TerminalGrid, TerminalKey, TerminalManager};
+use crate::terminal::{
+    TerminalCell, TerminalColor, TerminalEvent, TerminalKey, TerminalManager, TerminalSnapshot,
+};
+
+/// Rows retained around the viewport.
+///
+/// With no margin, a fast trackpad scroll could expose the next row before the
+/// scroll listener's cache refresh reached the canvas, producing a one-frame
+/// blank seam at the panel edge. Two rows cover that event-ordering gap without
+/// materialising meaningful scrollback.
+const VIEWPORT_OVERSCAN_ROWS: usize = 2;
 
 /// The family every terminal cell is laid out in. Held in one place so the
 /// measurement and the drawing can never disagree about which face they mean.
@@ -124,8 +136,8 @@ pub struct TerminalViewState {
     pub font_size: f32,
     /// Whether the terminal has focus
     pub focused: bool,
-    /// Cached grid for rendering
-    cached_grid: Option<TerminalGrid>,
+    /// Set when the PTY reports exit, including for an inactive tab.
+    exit_status: Option<i32>,
 }
 
 impl TerminalViewState {
@@ -136,7 +148,7 @@ impl TerminalViewState {
             theme: TerminalTheme::default(),
             font_size: 14.0,
             focused: false,
-            cached_grid: None,
+            exit_status: None,
         }
     }
 
@@ -153,16 +165,16 @@ impl TerminalViewState {
     ) -> Result<(), crate::error::TerminalError> {
         let shell = crate::terminal::default_shell();
         let terminal = TerminalManager::spawn_in(&shell, cwd)?;
-        self.cached_grid = Some(terminal.grid());
         self.terminal = Some(terminal);
+        self.exit_status = None;
         Ok(())
     }
 
     /// Spawn a terminal with the specified shell
     pub fn spawn_shell(&mut self, shell: &str) -> Result<(), crate::error::TerminalError> {
         let terminal = TerminalManager::spawn(shell)?;
-        self.cached_grid = Some(terminal.grid());
         self.terminal = Some(terminal);
+        self.exit_status = None;
         Ok(())
     }
 
@@ -172,7 +184,7 @@ impl TerminalViewState {
             terminal.close()?;
         }
         self.terminal = None;
-        self.cached_grid = None;
+        self.exit_status = None;
         Ok(())
     }
 
@@ -180,41 +192,39 @@ impl TerminalViewState {
     pub fn is_active(&self) -> bool {
         self.terminal
             .as_ref()
-            .map(|t| !t.is_closed())
+            .map(|t| !t.is_closed() && self.exit_status.is_none())
             .unwrap_or(false)
     }
 
-    /// Get the current terminal grid
-    pub fn grid(&self) -> Option<&TerminalGrid> {
-        self.cached_grid.as_ref()
+    /// Clone only rows requested by the render viewport.
+    pub fn snapshot_rows(&self, range: Range<usize>) -> Option<TerminalSnapshot> {
+        self.terminal.as_ref().map(|t| t.snapshot_rows(range))
     }
 
-    /// Update the cached grid from the terminal
-    pub fn update_grid(&mut self) {
-        if let Some(ref terminal) = self.terminal {
-            self.cached_grid = Some(terminal.grid());
-        }
+    /// Exit status observed while polling, if any.
+    pub fn exit_status(&self) -> Option<i32> {
+        self.exit_status
     }
 
-    /// Poll for terminal events and update state
-    pub fn poll_events(&mut self) -> bool {
-        let mut updated = false;
-        if let Some(ref terminal) = self.terminal {
-            while let Some(_event) = terminal.try_recv_event() {
-                updated = true;
+    /// Poll coalesced activity and bounded lifecycle state.
+    pub fn poll_events(&mut self) -> TerminalPoll {
+        let mut poll = TerminalPoll::default();
+        if let Some(ref mut terminal) = self.terminal {
+            while let Some(event) = terminal.try_recv_event() {
+                match event {
+                    TerminalEvent::Activity(revision) => {
+                        poll.activity = true;
+                        poll.revision = revision;
+                    }
+                    TerminalEvent::Exit(code) => {
+                        self.exit_status = Some(code);
+                        poll.lifecycle = true;
+                    }
+                    TerminalEvent::Bell => poll.lifecycle = true,
+                }
             }
-            if updated {
-                self.cached_grid = Some(terminal.grid());
-            }
         }
-        updated
-    }
-
-    /// Force refresh the cached grid
-    ///
-    /// Call this when you know the terminal has been updated externally.
-    pub fn refresh(&mut self) {
-        self.update_grid();
+        poll
     }
 
     /// Send a key to the terminal
@@ -246,7 +256,6 @@ impl TerminalViewState {
     pub fn resize(&mut self, cols: u16, rows: u16) -> Result<(), crate::error::TerminalError> {
         if let Some(ref mut terminal) = self.terminal {
             terminal.resize(cols, rows)?;
-            self.cached_grid = Some(terminal.grid());
         }
         Ok(())
     }
@@ -260,6 +269,13 @@ impl TerminalViewState {
     pub fn char_width_px(&self) -> f32 {
         self.font_size * 0.6
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TerminalPoll {
+    pub activity: bool,
+    pub lifecycle: bool,
+    pub revision: u64,
 }
 
 impl Default for TerminalViewState {
@@ -373,59 +389,139 @@ pub struct RenderedRow {
     pub cells: Vec<RenderedCell>,
 }
 
-impl TerminalViewState {
-    /// Scrolled-off lines followed by the live grid, as one row list.
-    ///
-    /// `row_idx` is absolute across both, which is what the canvas positions
-    /// against, so the cursor's grid-relative row has to be offset by
-    /// [`Self::scrollback_len`] before it is drawn.
-    pub fn get_scrollback_and_visible_rows(&self) -> Vec<RenderedRow> {
-        let Some(grid) = &self.cached_grid else {
-            return Vec::new();
-        };
+struct CachedRow {
+    row_idx: usize,
+    source: Vec<TerminalCell>,
+    cells: Vec<RenderedCell>,
+    layout: Option<Rc<TextLayout>>,
+}
 
-        let mut rows = Vec::with_capacity(grid.total_rows());
-        for (idx, line) in grid.scrollback().iter().enumerate() {
-            rows.push(RenderedRow {
-                row_idx: idx,
-                cells: line
+#[derive(Default)]
+struct RenderCache {
+    rows: Vec<CachedRow>,
+    total_rows: usize,
+    cursor: Option<(usize, usize)>,
+}
+
+impl RenderCache {
+    fn refresh(&mut self, snapshot: TerminalSnapshot, theme: TerminalTheme, font_size: f32) {
+        let old: HashMap<usize, CachedRow> =
+            self.rows.drain(..).map(|row| (row.row_idx, row)).collect();
+        self.total_rows = snapshot.total_rows;
+        self.cursor = Some(snapshot.cursor);
+        self.rows = snapshot
+            .rows
+            .into_iter()
+            .enumerate()
+            .map(|(offset, source)| {
+                let row_idx = snapshot.start_row + offset;
+                if let Some(cached) = old.get(&row_idx) {
+                    if cached.source == source {
+                        return CachedRow {
+                            row_idx,
+                            source,
+                            cells: cached.cells.clone(),
+                            layout: cached.layout.clone(),
+                        };
+                    }
+                }
+                let cells: Vec<_> = source
                     .iter()
-                    .map(|cell| RenderedCell::from_cell(cell, &self.theme))
-                    .collect(),
-            });
-        }
+                    .map(|cell| RenderedCell::from_cell(cell, &theme))
+                    .collect();
+                let layout = layout_row(&cells, theme, font_size);
+                CachedRow {
+                    row_idx,
+                    source,
+                    cells,
+                    layout,
+                }
+            })
+            .collect();
+    }
+}
 
-        let offset = grid.scrollback().len();
-        for row_idx in 0..grid.rows() {
-            if let Some(row_cells) = grid.get_row(row_idx) {
-                rows.push(RenderedRow {
-                    row_idx: offset + row_idx,
-                    cells: row_cells
-                        .iter()
-                        .map(|cell| RenderedCell::from_cell(cell, &self.theme))
-                        .collect(),
-                });
+fn viewport_row_range(
+    offset_y: f64,
+    viewport_height: f64,
+    line_height: f64,
+    total_rows: usize,
+) -> Range<usize> {
+    if line_height <= 0.0 {
+        return 0..0;
+    }
+    let first = (offset_y.max(0.0) / line_height).floor() as usize;
+    let visible_end = ((offset_y.max(0.0) + viewport_height.max(0.0)) / line_height).ceil() as usize;
+    first
+        .saturating_sub(VIEWPORT_OVERSCAN_ROWS)
+        ..visible_end
+            .saturating_add(VIEWPORT_OVERSCAN_ROWS)
+            .min(total_rows)
+}
+
+/// Convert a real, visible layout box into PTY cells.
+///
+/// Floem reports a zero box while a view has `display: none`. Treating that as
+/// a tiny terminal used to send SIGWINCH for 1x1, destroy shell layout, and
+/// then send another redraw on show. `None` means preserve the last real size.
+fn terminal_size_from_layout(
+    width: f64,
+    height: f64,
+    char_width: f64,
+    line_height: f64,
+) -> Option<(u16, u16)> {
+    if !width.is_finite()
+        || !height.is_finite()
+        || width <= 0.0
+        || height <= 0.0
+        || char_width <= 0.0
+        || line_height <= 0.0
+    {
+        return None;
+    }
+    Some((
+        (width / char_width).floor().max(1.0) as u16,
+        (height / line_height).floor().max(1.0) as u16,
+    ))
+}
+
+fn layout_row(
+    cells: &[RenderedCell],
+    theme: TerminalTheme,
+    font_size: f32,
+) -> Option<Rc<TextLayout>> {
+    let text: String = cells.iter().map(|c| c.c).collect();
+    if text.trim().is_empty() {
+        return None;
+    }
+    let mut attrs_list = AttrsList::new(base_attrs(font_size, theme.foreground));
+    let mut byte = 0usize;
+    for cell in cells {
+        let len = cell.c.len_utf8();
+        if cell.fg != theme.foreground || cell.bold || cell.italic {
+            let mut attrs = base_attrs(font_size, cell.fg);
+            if cell.bold {
+                attrs = attrs.weight(FontWeight::BOLD);
             }
+            if cell.italic {
+                attrs = attrs.font_style(FontStyle::Italic);
+            }
+            attrs_list.add_span(byte..byte + len, attrs);
         }
-
-        rows
+        byte += len;
     }
+    Some(Rc::new(TextLayout::new_with_text(&text, attrs_list, None)))
+}
 
-    /// How many lines have scrolled off the top.
-    pub fn scrollback_len(&self) -> usize {
-        self.cached_grid
-            .as_ref()
-            .map_or(0, |g| g.scrollback().len())
-    }
-
+impl TerminalViewState {
     /// Scrolled-off lines plus the live grid.
     pub fn total_rows(&self) -> usize {
-        self.cached_grid.as_ref().map_or(0, |g| g.total_rows())
+        self.snapshot_rows(0..0).map_or(0, |s| s.total_rows)
     }
 
-    /// Get cursor position (col, row)
+    /// Get the absolute cursor position across scrollback and the live grid.
     pub fn cursor_position(&self) -> Option<(usize, usize)> {
-        self.cached_grid.as_ref().map(|g| g.cursor_position())
+        self.snapshot_rows(0..0).map(|s| s.cursor)
     }
 }
 
@@ -439,10 +535,11 @@ impl TerminalViewState {
 /// height, so there was nothing to scroll. And the cell size was guessed at
 /// `font_size * 1.2` by `0.6` because nothing ever measured the font.
 ///
-/// One canvas has none of those failure modes. `canvas` tracks the signals its
-/// paint closure reads, so reading `version_signal` is enough to repaint; there
-/// are no child views to go stale, be reused, or steal focus; and the cell
-/// metrics come from laying out real glyphs rather than from a ratio.
+/// One canvas has none of those failure modes. A reactive effect turns
+/// `version_signal` and viewport changes into a bounded row cache, then bumps
+/// the cache signal paint reads; there are no child views to go stale, be
+/// reused, or steal focus, and the cell metrics come from laying out real
+/// glyphs rather than from a ratio.
 pub fn terminal_grid_view(
     state: SharedTerminalState,
     version_signal: RwSignal<u64>,
@@ -466,34 +563,48 @@ pub fn terminal_grid_view(
     // and scrolling back to read something does not get yanked away by the next
     // line the shell prints.
     let stick_to_bottom = RwSignal::new(true);
+    let viewport_offset = RwSignal::new(0.0f64);
+    let viewport_height = RwSignal::new(0.0f64);
 
-    // Drives the canvas height. Read in `style`, which cannot borrow the
-    // terminal state, so the row count is mirrored into a signal here.
+    // The effect is the only place that snapshots rows and lays out text.
+    // Paint only reads this bounded cache.
     let total_rows_signal = RwSignal::new(0usize);
-    let state_for_rows = state.clone();
+    let cache_version = RwSignal::new(0u64);
+    let render_cache = Rc::new(RefCell::new(RenderCache::default()));
+    let cache_for_effect = render_cache.clone();
+    let state_for_cache = state.clone();
     Effect::new(move |_| {
         let _ = version_signal.get();
-        if let Ok(st) = state_for_rows.try_borrow() {
-            total_rows_signal.set(st.total_rows());
+        let offset = viewport_offset.get();
+        let height = viewport_height.get();
+        if let Ok(st) = state_for_cache.try_borrow() {
+            let total = st.total_rows();
+            let range = viewport_row_range(offset, height, line_height, total);
+            if let Some(snapshot) = st.snapshot_rows(range) {
+                if let Ok(mut cache) = cache_for_effect.try_borrow_mut() {
+                    cache.refresh(snapshot, theme, font_size);
+                }
+                if total_rows_signal.get_untracked() != total {
+                    total_rows_signal.set(total);
+                }
+                cache_version.update(|revision| *revision += 1);
+            }
         }
     });
 
+    let cache_for_paint = render_cache.clone();
     canvas(move |cx, size| {
-        // Tracked: bumping `version_signal` is what schedules the repaint.
-        let _ = version_signal.get();
+        // Tracked after the off-paint cache refresh has completed.
+        let _ = cache_version.get();
 
         cx.fill(&Rect::ZERO.with_size(size), theme.background, 0.0);
 
-        let Ok(state_ref) = state.try_borrow() else {
+        let Ok(cache) = cache_for_paint.try_borrow() else {
             return;
         };
-        let rows = state_ref.get_scrollback_and_visible_rows();
 
-        for row in &rows {
+        for row in &cache.rows {
             let y = row.row_idx as f64 * line_height;
-            if y > size.height {
-                break;
-            }
 
             // Cell backgrounds first, merged into spans so a run of one colour
             // is a single fill rather than one per column.
@@ -521,37 +632,15 @@ pub fn terminal_grid_view(
                 );
             }
 
-            // Then the glyphs, as one laid-out line carrying per-cell colour.
-            let text: String = row.cells.iter().map(|c| c.c).collect();
-            if text.trim().is_empty() {
-                continue;
+            // Text layout was built by the cache effect and is reused while
+            // overlapping rows remain byte-for-byte unchanged.
+            if let Some(layout) = &row.layout {
+                layout.draw(cx, Point::new(0.0, y));
             }
-            let mut attrs_list = AttrsList::new(base_attrs(font_size, theme.foreground));
-            let mut byte = 0usize;
-            for cell in &row.cells {
-                let len = cell.c.len_utf8();
-                if cell.fg != theme.foreground || cell.bold || cell.italic {
-                    let mut attrs = base_attrs(font_size, cell.fg);
-                    if cell.bold {
-                        attrs = attrs.weight(FontWeight::BOLD);
-                    }
-                    if cell.italic {
-                        attrs = attrs.font_style(FontStyle::Italic);
-                    }
-                    attrs_list.add_span(byte..byte + len, attrs);
-                }
-                byte += len;
-            }
-
-            let layout = TextLayout::new_with_text(&text, attrs_list, None);
-            layout.draw(cx, Point::new(0.0, y));
         }
 
         // The cursor last, so it sits over the character it inverts.
-        if let Some((col, row)) = state_ref.cursor_position() {
-            // The cursor is addressed within the live grid, which is drawn
-            // below however many lines have scrolled off.
-            let row = row + state_ref.scrollback_len();
+        if let Some((col, row)) = cache.cursor {
             let rect = Rect::new(
                 col as f64 * char_width,
                 row as f64 * line_height,
@@ -593,8 +682,9 @@ pub fn terminal_grid_view(
     .on_event_cont(
         floem::views::scroll::ScrollChangedListener,
         move |_, changed| {
+            viewport_offset.set(changed.offset.y);
             let content = total_rows_signal.get_untracked() as f64 * line_height;
-            let viewport = f64::from(last_size.get_untracked().1) * line_height;
+            let viewport = viewport_height.get_untracked();
             stick_to_bottom.set(is_at_bottom(
                 changed.offset.y,
                 content,
@@ -609,18 +699,26 @@ pub fn terminal_grid_view(
     // to its content, so its height is the scrollback, not the visible area.
     .on_event_cont(floem::context::LayoutChangedListener, move |_, layout| {
         let size = layout.new_box.size();
-        let cols = (size.width / char_width).floor().max(1.0) as u16;
-        let rows = (size.height / line_height).floor().max(1.0) as u16;
+        let Some((cols, rows)) =
+            terminal_size_from_layout(size.width, size.height, char_width, line_height)
+        else {
+            return;
+        };
+        viewport_height.set(size.height);
         if last_size.get_untracked() == (cols, rows) {
             return;
         }
-        last_size.set((cols, rows));
+        let mut resized = false;
         if let Ok(mut st) = state_for_resize.try_borrow_mut() {
-            if let Err(e) = st.resize(cols, rows) {
-                eprintln!("terminal resize failed: {e}");
+            match st.resize(cols, rows) {
+                Ok(()) => resized = true,
+                Err(e) => eprintln!("terminal resize failed: {e}"),
             }
         }
-        version_signal.update(|v| *v += 1);
+        if resized {
+            last_size.set((cols, rows));
+            version_signal.update(|v| *v += 1);
+        }
     })
 }
 
@@ -832,7 +930,7 @@ mod tests {
         let state = TerminalViewState::new();
         assert!(state.terminal.is_none());
         assert!(!state.is_active());
-        assert!(state.grid().is_none());
+        assert!(state.snapshot_rows(0..1).is_none());
     }
 
     #[test]
@@ -927,8 +1025,77 @@ mod tests {
     #[test]
     fn a_terminal_with_no_shell_yet_has_no_rows_to_draw() {
         let state = TerminalViewState::new();
-        assert!(state.get_scrollback_and_visible_rows().is_empty());
         assert_eq!(state.total_rows(), 0);
-        assert_eq!(state.scrollback_len(), 0);
+        assert!(state.cursor_position().is_none());
+    }
+
+    /// Snapshotting exactly the viewport produced blank seams during fast
+    /// scrolling because paint could move one event ahead of cache refresh.
+    /// The range includes the named margin on both sides and still stays
+    /// bounded at the history edges.
+    #[test]
+    fn the_viewport_range_includes_overscan_without_leaving_content() {
+        let line = 10.0;
+        assert_eq!(
+            viewport_row_range(100.0, 50.0, line, 100),
+            8..17,
+            "rows 10..15 are visible, with two rows around them"
+        );
+        assert_eq!(viewport_row_range(0.0, 20.0, line, 3), 0..3);
+    }
+
+    /// Floem emits a zero layout box when the terminal panel is hidden.
+    /// Turning that into 1x1 used to reflow the shell on hide and again on
+    /// show; the last visible geometry must survive the hidden interval.
+    #[test]
+    fn hiding_and_showing_preserves_the_last_real_terminal_size() {
+        let cell = (8.0, 16.0);
+        let last_real = terminal_size_from_layout(800.0, 384.0, cell.0, cell.1).unwrap();
+        assert_eq!(last_real, (100, 24));
+        assert_eq!(
+            terminal_size_from_layout(0.0, 0.0, cell.0, cell.1),
+            None,
+            "hidden layout must not become 1x1"
+        );
+        assert_eq!(
+            terminal_size_from_layout(800.0, 384.0, cell.0, cell.1),
+            Some(last_real),
+            "showing restores the same geometry; the listener's last-size check suppresses SIGWINCH"
+        );
+    }
+
+    /// Scrolling by one row used to rebuild every text layout in the viewport.
+    /// Unchanged overlap should retain the same layout allocation.
+    #[test]
+    fn overlapping_unchanged_rows_reuse_their_text_layouts() {
+        let row = vec![TerminalCell::with_char('x')];
+        let mut cache = RenderCache::default();
+        cache.refresh(
+            TerminalSnapshot {
+                start_row: 10,
+                rows: vec![row.clone(), row.clone()],
+                total_rows: 100,
+                cols: 1,
+                cursor: (0, 99),
+            },
+            TerminalTheme::default(),
+            14.0,
+        );
+        let old = cache.rows[1].layout.as_ref().unwrap().clone();
+        cache.refresh(
+            TerminalSnapshot {
+                start_row: 11,
+                rows: vec![row],
+                total_rows: 100,
+                cols: 1,
+                cursor: (0, 99),
+            },
+            TerminalTheme::default(),
+            14.0,
+        );
+        assert!(Rc::ptr_eq(
+            &old,
+            cache.rows[0].layout.as_ref().unwrap()
+        ));
     }
 }

@@ -13,7 +13,8 @@
 //! the security scanner all attach through it without any tool knowing they
 //! exist.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -41,6 +42,165 @@ pub struct ToolCtx {
     pub todos: Mutex<Vec<Todo>>,
 }
 
+/// Call-local authorization checked at irreversible boundaries.
+///
+/// Hooks can attach guards without mutating shared `ToolCtx`; that keeps
+/// concurrent calls independent and is the seam the broader execution-control
+/// work can extend beyond file publication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ExecutionToken {
+    pub generation: u64,
+    pub turn: u64,
+}
+
+impl ExecutionToken {
+    pub const fn new(generation: u64, turn: u64) -> Self {
+        Self { generation, turn }
+    }
+}
+
+/// The cancellation and one absolute deadline governing one turn.
+///
+/// A control is created once when the turn is claimed and cloned through every
+/// await. Deriving a fresh timeout after an approval or provider call would let
+/// each wait spend the full budget and turn a fifteen-minute ceiling into hours.
+#[derive(Clone, Default)]
+pub struct ExecutionControl {
+    token: Option<ExecutionToken>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+    deadline: Option<tokio::time::Instant>,
+    publication_guards: Vec<Arc<dyn Fn() -> Result<(), String> + Send + Sync>>,
+}
+
+#[derive(Clone)]
+pub struct StopLease {
+    token: ExecutionToken,
+    cancellation: tokio_util::sync::CancellationToken,
+}
+
+impl std::fmt::Debug for ExecutionControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecutionControl")
+            .field("token", &self.token)
+            .field("deadline", &self.deadline)
+            .field("publication_guards", &self.publication_guards.len())
+            .finish()
+    }
+}
+
+impl ExecutionControl {
+    pub fn for_turn(
+        token: ExecutionToken,
+        timeout: Duration,
+    ) -> (ExecutionControl, StopLease) {
+        Self::with_deadline(token, tokio::time::Instant::now() + timeout)
+    }
+
+    pub fn with_deadline(
+        token: ExecutionToken,
+        deadline: tokio::time::Instant,
+    ) -> (ExecutionControl, StopLease) {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        (
+            ExecutionControl {
+                token: Some(token),
+                cancellation: Some(cancellation.clone()),
+                deadline: Some(deadline),
+                publication_guards: Vec::new(),
+            },
+            StopLease {
+                token,
+                cancellation,
+            },
+        )
+    }
+
+    pub fn token(&self) -> Option<ExecutionToken> {
+        self.token
+    }
+
+    pub fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.deadline
+    }
+
+    /// Keep the parent's stop identity while tightening a nested operation.
+    pub fn bounded_by(&self, timeout: Duration) -> Self {
+        let own = tokio::time::Instant::now() + timeout;
+        let mut child = self.clone();
+        child.deadline = Some(self.deadline.map_or(own, |parent| parent.min(own)));
+        child
+    }
+
+    pub fn with_publication_guard(
+        guard: impl Fn() -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            token: None,
+            cancellation: None,
+            deadline: None,
+            publication_guards: vec![Arc::new(guard)],
+        }
+    }
+
+    fn extend(&mut self, other: Self) {
+        self.publication_guards.extend(other.publication_guards);
+    }
+
+    pub fn authorize_publication(&self) -> Result<(), String> {
+        self.check()?;
+        for guard in &self.publication_guards {
+            guard()?;
+        }
+        Ok(())
+    }
+
+    pub fn check(&self) -> Result<(), String> {
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            return Err("stopped by user".into());
+        }
+        if self
+            .deadline
+            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            return Err("turn deadline reached".into());
+        }
+        Ok(())
+    }
+
+    pub async fn cancelled(&self) -> String {
+        match (&self.cancellation, self.deadline) {
+            (Some(cancellation), Some(deadline)) => tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => "stopped by user".into(),
+                _ = tokio::time::sleep_until(deadline) => "turn deadline reached".into(),
+            },
+            (Some(cancellation), None) => {
+                cancellation.cancelled().await;
+                "stopped by user".into()
+            }
+            (None, Some(deadline)) => {
+                tokio::time::sleep_until(deadline).await;
+                "turn deadline reached".into()
+            }
+            (None, None) => std::future::pending().await,
+        }
+    }
+}
+
+impl StopLease {
+    pub fn token(&self) -> ExecutionToken {
+        self.token
+    }
+
+    pub fn stop(&self) {
+        self.cancellation.cancel();
+    }
+}
+
 impl ToolCtx {
     pub fn new(workspace: Workspace) -> Self {
         Self {
@@ -64,6 +224,24 @@ pub trait Tool: Send + Sync {
     fn definition(&self) -> ToolDefinition;
 
     async fn run(&self, args: &Value, ctx: &ToolCtx) -> ToolOutput;
+
+    async fn run_controlled(
+        &self,
+        args: &Value,
+        ctx: &ToolCtx,
+        _control: &ExecutionControl,
+    ) -> ToolOutput {
+        self.run(args, ctx).await
+    }
+
+    /// Whether cancellation must wait for this tool's cleanup path.
+    ///
+    /// Most futures are safe to drop at Registry's select. A subprocess is not:
+    /// its blocking worker must kill and reap the process group before the turn
+    /// is allowed to report Stopped.
+    fn owns_cancellation_cleanup(&self) -> bool {
+        false
+    }
 }
 
 /// What a [`ToolHook`] decided about a pending call.
@@ -71,6 +249,8 @@ pub trait Tool: Send + Sync {
 pub enum HookDecision {
     /// Proceed to the tool.
     Allow,
+    /// Proceed with call-local guards checked again at irreversible boundaries.
+    AllowWithControl(ExecutionControl),
     /// Refuse. The reason is fed back to the model as an error result, so it can
     /// choose a different approach rather than silently stalling.
     Deny(String),
@@ -190,14 +370,36 @@ impl Registry {
     /// tool itself, and post-observation — happens here so nothing can bypass a
     /// guardrail by calling a tool directly.
     pub async fn execute(&self, call: &ToolCall, ctx: &ToolCtx) -> ToolResult {
-        let result = self.execute_inner(call, ctx).await;
+        self.execute_controlled(call, ctx, &ExecutionControl::default())
+            .await
+    }
+
+    pub async fn execute_controlled(
+        &self,
+        call: &ToolCall,
+        ctx: &ToolCtx,
+        control: &ExecutionControl,
+    ) -> ToolResult {
+        let result = self.execute_inner(call, ctx, control).await;
         for hook in &self.hooks {
-            hook.after(call, &result, ctx).await;
+            tokio::select! {
+                biased;
+                _ = control.cancelled() => break,
+                _ = hook.after(call, &result, ctx) => {}
+            }
         }
         result
     }
 
-    async fn execute_inner(&self, call: &ToolCall, ctx: &ToolCtx) -> ToolResult {
+    async fn execute_inner(
+        &self,
+        call: &ToolCall,
+        ctx: &ToolCtx,
+        parent_control: &ExecutionControl,
+    ) -> ToolResult {
+        if let Err(reason) = parent_control.check() {
+            return ToolResult::err(call, reason);
+        }
         let Some(tool) = self.get(&call.name) else {
             return ToolResult::err(
                 call,
@@ -214,9 +416,16 @@ impl Registry {
             Err(e) => return ToolResult::err(call, e),
         };
 
+        let mut control = parent_control.clone();
         for hook in &self.hooks {
-            match hook.before(call, &args, ctx).await {
+            let decision = tokio::select! {
+                biased;
+                reason = control.cancelled() => return ToolResult::err(call, reason),
+                decision = hook.before(call, &args, ctx) => decision,
+            };
+            match decision {
                 HookDecision::Allow => {}
+                HookDecision::AllowWithControl(additional) => control.extend(additional),
                 HookDecision::Deny(reason) => {
                     return ToolResult::err(call, format!("`{}` was not run: {reason}", call.name));
                 }
@@ -232,8 +441,19 @@ impl Registry {
                 }
             }
         }
+        if let Err(reason) = control.check() {
+            return ToolResult::err(call, reason);
+        }
 
-        let output = tool.run(&args, ctx).await;
+        let output = if tool.owns_cancellation_cleanup() {
+            tool.run_controlled(&args, ctx, &control).await
+        } else {
+            tokio::select! {
+                biased;
+                reason = control.cancelled() => return ToolResult::err(call, reason),
+                output = tool.run_controlled(&args, ctx, &control) => output,
+            }
+        };
         ToolResult {
             tool_call_id: call.id.clone(),
             name: call.name.clone(),

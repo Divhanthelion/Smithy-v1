@@ -28,10 +28,13 @@
 //! dependency graph, which on a real project is thousands of packages and would
 //! swamp the context with things the model cannot act on.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
 use serde_json::Value;
 use streaming_iterator::StreamingIterator;
 
@@ -51,6 +54,12 @@ pub struct Crate {
     pub modules: Vec<String>,
     /// Public item signatures, grouped by the file they came from.
     pub api: Vec<ApiItem>,
+}
+
+#[derive(Debug)]
+pub(crate) struct CrateScan {
+    pub crates: Vec<Crate>,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -93,12 +102,36 @@ impl ApiKind {
 /// which the caller should surface rather than silently degrade, because a Rust
 /// project whose metadata cannot be read is a project the agent will struggle
 /// in and the user should know why.
+///
+/// `cargo metadata` itself is the one pre-capability limitation: Cargo may
+/// inspect manifests declared by the root manifest before Smithy receives and
+/// validates their paths. Smithy does not read any reported source until the
+/// manifest, member directory, and `src` path pass the root-capability checks.
 pub fn crates(root: &Path) -> Result<Vec<Crate>, String> {
+    crates_controlled(root, &|| false)?
+        .map(|scan| scan.crates)
+        .ok_or_else(|| "project scan cancelled".into())
+}
+
+pub(crate) fn crates_controlled(
+    root: &Path,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Option<CrateScan>, String> {
+    // `Project::open` canonicalizes the selected root. Open that exact root
+    // once; every source operation below is relative to this descriptor.
+    let root_dir = Dir::open_ambient_dir(root, ambient_authority())
+        .map_err(|e| format!("cannot open selected project root {}: {e}", root.display()))?;
     let output = Command::new("cargo")
         .args(["metadata", "--no-deps", "--format-version", "1"])
         .current_dir(root)
         .output()
         .map_err(|e| format!("could not run cargo: {e}"))?;
+    // `Command::output` is one read-only OS child call and is not interruptible
+    // here. Its result is quarantined immediately after return; the filesystem
+    // walks below are cooperatively cancellable.
+    if cancelled() {
+        return Ok(None);
+    }
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -110,19 +143,65 @@ pub fn crates(root: &Path) -> Result<Vec<Crate>, String> {
 
     let metadata: Value = serde_json::from_slice(&output.stdout)
         .map_err(|e| format!("could not parse cargo metadata: {e}"))?;
+    scan_metadata(root, &root_dir, &metadata, cancelled)
+}
 
+pub(crate) fn scan_metadata(
+    root: &Path,
+    root_dir: &Dir,
+    metadata: &Value,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Option<CrateScan>, String> {
     let packages = metadata["packages"]
         .as_array()
         .ok_or("cargo metadata had no packages array")?;
+    let workspace_members: BTreeSet<&str> = metadata["workspace_members"]
+        .as_array()
+        .ok_or("cargo metadata had no workspace_members array")?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
 
     let mut out = Vec::new();
+    let mut warnings = Vec::new();
     for package in packages {
+        if cancelled() {
+            return Ok(None);
+        }
+        let id = package["id"].as_str().unwrap_or_default();
+        if !workspace_members.contains(id) {
+            continue;
+        }
+        let name = package["name"].as_str().unwrap_or("?");
         let manifest = PathBuf::from(package["manifest_path"].as_str().unwrap_or_default());
-        let crate_dir = manifest.parent().unwrap_or(root).to_path_buf();
-        let relative = crate_dir
-            .strip_prefix(root)
-            .unwrap_or(&crate_dir)
+        let manifest_relative = match manifest.strip_prefix(root) {
+            Ok(path) if !path.as_os_str().is_empty() => path.to_path_buf(),
+            _ => {
+                warnings.push(format!(
+                    "omitted workspace member `{name}`: its reported manifest is outside the \
+                     selected root"
+                ));
+                continue;
+            }
+        };
+        if let Err(reason) = require_plain_path(root_dir, &manifest_relative, PathKind::File) {
+            warnings.push(format!(
+                "omitted workspace member `{name}`: manifest {} {reason}",
+                manifest_relative.display()
+            ));
+            continue;
+        }
+        let relative = manifest_relative
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
             .to_path_buf();
+        if let Err(reason) = require_plain_path(root_dir, &relative, PathKind::Directory) {
+            warnings.push(format!(
+                "omitted workspace member `{name}`: member path {} {reason}",
+                display_relative(&relative)
+            ));
+            continue;
+        }
 
         let mut targets: Vec<String> = package["targets"]
             .as_array()
@@ -151,12 +230,31 @@ pub fn crates(root: &Path) -> Result<Vec<Crate>, String> {
             .unwrap_or_default();
         dependencies.sort();
 
-        let src = crate_dir.join("src");
-        let modules = module_paths(&src);
-        let api = public_api(&src);
+        let src = relative.join("src");
+        let source_paths = match source_paths_controlled(
+            root_dir,
+            &src,
+            name,
+            &mut warnings,
+            cancelled,
+        ) {
+            Ok(Some(paths)) => paths,
+            Ok(None) => return Ok(None),
+            Err(reason) => {
+                warnings.push(format!(
+                    "omitted workspace member `{name}`: src path {} {reason}",
+                    display_relative(&src)
+                ));
+                continue;
+            }
+        };
+        let modules = module_paths_from_sources(&src, &source_paths);
+        let Some(api) = public_api_from_sources(root_dir, &src, &source_paths, cancelled) else {
+            return Ok(None);
+        };
 
         out.push(Crate {
-            name: package["name"].as_str().unwrap_or("?").to_string(),
+            name: name.to_string(),
             path: relative,
             version: package["version"].as_str().unwrap_or("?").to_string(),
             edition: package["edition"].as_str().unwrap_or("?").to_string(),
@@ -171,7 +269,166 @@ pub fn crates(root: &Path) -> Result<Vec<Crate>, String> {
     // not promise a stable package order, and an unstable order here would
     // change the system prompt between runs and cost a cold prefill.
     out.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(out)
+    warnings.sort();
+    warnings.dedup();
+    Ok(Some(CrateScan {
+        crates: out,
+        warnings,
+    }))
+}
+
+#[derive(Clone, Copy)]
+enum PathKind {
+    File,
+    Directory,
+}
+
+fn display_relative(path: &Path) -> String {
+    if path.as_os_str().is_empty() {
+        ".".into()
+    } else {
+        path.display().to_string()
+    }
+}
+
+/// Require every component to be a real entry beneath the root capability.
+///
+/// Checking only the final canonical path would reintroduce an ambient lookup
+/// and miss which intermediate component was a symlink. The component walk
+/// makes a symlinked member, `src`, directory, or source file fail closed.
+fn require_plain_path(dir: &Dir, relative: &Path, kind: PathKind) -> Result<(), String> {
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err("is not a capability-relative path".into());
+    }
+    if relative.as_os_str().is_empty() {
+        return match kind {
+            PathKind::Directory => Ok(()),
+            PathKind::File => Err("does not name a file".into()),
+        };
+    }
+    let mut prefix = PathBuf::new();
+    let components: Vec<_> = relative.components().collect();
+    for (index, component) in components.iter().enumerate() {
+        prefix.push(component.as_os_str());
+        let metadata = dir
+            .symlink_metadata(&prefix)
+            .map_err(|error| format!("cannot be inspected: {error}"))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "crosses symlink `{}` and was not read",
+                prefix.display()
+            ));
+        }
+        if index + 1 < components.len() && !metadata.is_dir() {
+            return Err(format!("crosses non-directory `{}`", prefix.display()));
+        }
+        if index + 1 == components.len() {
+            let expected = match kind {
+                PathKind::File => metadata.is_file(),
+                PathKind::Directory => metadata.is_dir(),
+            };
+            if !expected {
+                return Err(match kind {
+                    PathKind::File => "is not a regular file".into(),
+                    PathKind::Directory => "is not a directory".into(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn source_paths_controlled(
+    dir: &Dir,
+    src: &Path,
+    crate_name: &str,
+    warnings: &mut Vec<String>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Option<Vec<PathBuf>>, String> {
+    match dir.symlink_metadata(src) {
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Some(Vec::new())),
+        Err(error) => return Err(format!("cannot be inspected: {error}")),
+        Ok(_) => require_plain_path(dir, src, PathKind::Directory)?,
+    }
+
+    let mut pending = vec![src.to_path_buf()];
+    let mut sources = Vec::new();
+    while let Some(current) = pending.pop() {
+        if cancelled() {
+            return Ok(None);
+        }
+        let entries = dir
+            .read_dir(&current)
+            .map_err(|error| format!("cannot be walked: {error}"))?;
+        let mut children = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("cannot be walked: {error}"))?;
+            children.push(current.join(entry.file_name()));
+        }
+        children.sort();
+        // Stack is LIFO; reverse keeps visitation lexicographic as well as the
+        // final source list deterministic.
+        for child in children.into_iter().rev() {
+            let metadata = dir
+                .symlink_metadata(&child)
+                .map_err(|error| format!("cannot inspect {}: {error}", child.display()))?;
+            if metadata.file_type().is_symlink() {
+                warnings.push(format!(
+                    "skipped source in `{crate_name}`: {} is a symlink and was not read",
+                    child.display()
+                ));
+            } else if metadata.is_dir() {
+                pending.push(child);
+            } else if metadata.is_file()
+                && child.extension().and_then(|extension| extension.to_str()) == Some("rs")
+            {
+                sources.push(child);
+            }
+        }
+    }
+    sources.sort();
+    Ok(Some(sources))
+}
+
+fn module_paths_from_sources(src: &Path, sources: &[PathBuf]) -> Vec<String> {
+    let mut modules: Vec<String> = sources
+        .iter()
+        .map(|path| module_path_of(path, src))
+        .filter(|module| !module.is_empty())
+        .collect();
+    modules.sort();
+    modules.dedup();
+    modules
+}
+
+fn public_api_from_sources(
+    dir: &Dir,
+    src: &Path,
+    sources: &[PathBuf],
+    cancelled: &dyn Fn() -> bool,
+) -> Option<Vec<ApiItem>> {
+    let mut items = Vec::new();
+    for path in sources {
+        if cancelled() {
+            return None;
+        }
+        let Ok(source) = dir.read_to_string(path) else {
+            continue;
+        };
+        items.extend(public_items_in(&source, &module_of(src, path)));
+    }
+    items.sort_by(|a, b| {
+        a.module
+            .cmp(&b.module)
+            .then(a.kind.cmp(&b.kind))
+            .then(a.signature.cmp(&b.signature))
+    });
+    items.dedup();
+    Some(items)
 }
 
 /// The module path for one file, relative to a crate's `src/`.
@@ -210,8 +467,15 @@ pub fn module_path_of(file: &Path, src: &Path) -> String {
 /// `src/tools/edit.rs` → `tools::edit`; `src/tools/mod.rs` → `tools`;
 /// `src/lib.rs` and `src/main.rs` are the crate root and produce nothing.
 pub fn module_paths(src: &Path) -> Vec<String> {
+    module_paths_controlled(src, &|| false).unwrap_or_default()
+}
+
+fn module_paths_controlled(
+    src: &Path,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<Vec<String>> {
     if !src.is_dir() {
-        return Vec::new();
+        return Some(Vec::new());
     }
     let mut modules = Vec::new();
 
@@ -222,6 +486,9 @@ pub fn module_paths(src: &Path) -> Vec<String> {
         .build()
         .flatten()
     {
+        if cancelled() {
+            return None;
+        }
         if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
             continue;
         }
@@ -254,13 +521,20 @@ pub fn module_paths(src: &Path) -> Vec<String> {
 
     modules.sort();
     modules.dedup();
-    modules
+    Some(modules)
 }
 
 /// Extract public item signatures from every `.rs` file under `src`.
 pub fn public_api(src: &Path) -> Vec<ApiItem> {
+    public_api_controlled(src, &|| false).unwrap_or_default()
+}
+
+fn public_api_controlled(
+    src: &Path,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<Vec<ApiItem>> {
     if !src.is_dir() {
-        return Vec::new();
+        return Some(Vec::new());
     }
     let mut items = Vec::new();
 
@@ -271,6 +545,9 @@ pub fn public_api(src: &Path) -> Vec<ApiItem> {
         .build()
         .flatten()
     {
+        if cancelled() {
+            return None;
+        }
         if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
             continue;
         }
@@ -293,7 +570,7 @@ pub fn public_api(src: &Path) -> Vec<ApiItem> {
             .then(a.signature.cmp(&b.signature))
     });
     items.dedup();
-    items
+    Some(items)
 }
 
 fn module_of(src: &Path, file: &Path) -> String {

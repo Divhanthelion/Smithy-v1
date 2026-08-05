@@ -9,9 +9,9 @@
 //!   and changing one early token reverts to the full cold cost. So history is
 //!   never mutated, reordered, or re-rendered, and the system prompt and tool
 //!   schemas are byte-stable for the life of a session.
-//! - **[`Budget`].** Step, wall-clock, and context ceilings, with the token
-//!   count read from the API's own `usage.prompt_tokens` rather than a local
-//!   tokenizer. Cheapest possible protection against a runaway loop.
+//! - **[`Budget`] + turn execution control.** Announced tool calls and context
+//!   are counted here; one absolute Tokio deadline is cloned across every await,
+//!   with token usage read from the API rather than a local tokenizer.
 //! - **Empty or truncated answers are failures, not finishes.** At high context
 //!   the model can reason correctly but loop inside its reasoning channel until
 //!   it hits the token limit, emitting empty content. Treating that as a clean
@@ -61,7 +61,8 @@ pub use parse::{parse, Action};
 pub use persist::{transcript, SessionStore, TranscriptEntry};
 pub use provider::{Completion, CompletionRequest, Delta, Provider, ProviderError, Sampling};
 pub use providers::{create_provider_from_env, LmStudio, ModelInfo, OpenRouter};
+pub use smithy_tools::{ExecutionControl, ExecutionToken, StopLease};
 pub use session::{
-    ContextLedger, ContextSegment, Outcome, Session, SessionConfig, Stopper, TurnEvent, Usage,
-    CANCELLED,
+    ContextLedger, ContextSegment, Outcome, Session, SessionAccounting, SessionConfig, TurnEvent,
+    Usage, CANCELLED,
 };

@@ -27,6 +27,12 @@ pub mod sandbox;
 pub mod schema;
 pub mod tools;
 
-pub use registry::{HookDecision, Registry, Todo, Tool, ToolCtx, ToolHook};
-pub use sandbox::{check_bash, Workspace};
+pub use registry::{
+    ExecutionControl, ExecutionToken, HookDecision, Registry, StopLease, Todo, Tool, ToolCtx,
+    ToolHook,
+};
+pub use sandbox::{
+    check_bash, FileBase, FileIdentity, FileSnapshot, Workspace, WorkspaceIdentity, WriteFailure,
+};
 pub use schema::{ToolCall, ToolDefinition, ToolParameter, ToolResult};
+pub use tools::edit::EditPlan;

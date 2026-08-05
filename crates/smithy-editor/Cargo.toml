@@ -17,6 +17,9 @@ libc = "0.2"
 smithy-fisherman = { workspace = true }
 smithy-sky = { workspace = true }
 smithy-voice = { workspace = true }
+# Reviews retain the capability layer's exact file/root stamps so acceptance
+# cannot reinterpret a preview against whichever project happens to be live.
+smithy-tools = { workspace = true }
 ropey.workspace = true
 lapce-xi-rope.workspace = true
 tree-sitter.workspace = true

@@ -27,6 +27,21 @@ pub struct TerminalTabManager {
     cwd: Option<std::path::PathBuf>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TerminalTabsPoll {
+    pub active_activity: bool,
+    pub lifecycle: bool,
+}
+
+fn include_poll(
+    summary: &mut TerminalTabsPoll,
+    is_active: bool,
+    poll: crate::terminal_view::TerminalPoll,
+) {
+    summary.active_activity |= is_active && poll.activity;
+    summary.lifecycle |= poll.lifecycle;
+}
+
 impl TerminalTabManager {
     pub fn new() -> Self {
         Self {
@@ -111,6 +126,19 @@ impl TerminalTabManager {
         &self.tabs
     }
 
+    /// Poll every PTY so hidden tabs still observe exits, while reporting
+    /// content activity only for the tab whose canvas can repaint.
+    pub fn poll_all(&mut self) -> TerminalTabsPoll {
+        let active = self.active;
+        let mut summary = TerminalTabsPoll::default();
+        for tab in &mut self.tabs {
+            if let Ok(mut state) = tab.state.try_borrow_mut() {
+                include_poll(&mut summary, active == Some(tab.id), state.poll_events());
+            }
+        }
+        summary
+    }
+
     /// Number of open tabs
     pub fn len(&self) -> usize {
         self.tabs.len()
@@ -147,5 +175,38 @@ mod tests {
     fn closing_a_tab_that_is_gone_is_not_an_error() {
         let mut mgr = TerminalTabManager::new();
         assert!(!mgr.close_tab(999));
+    }
+
+    /// A background shell can finish while another tab is selected. Polling
+    /// only the active tab used to leave that exit unobserved indefinitely.
+    #[test]
+    fn an_inactive_terminal_exit_is_still_observed() {
+        let mut summary = TerminalTabsPoll::default();
+        include_poll(
+            &mut summary,
+            false,
+            crate::terminal_view::TerminalPoll {
+                lifecycle: true,
+                ..Default::default()
+            },
+        );
+        assert!(summary.lifecycle);
+    }
+
+    /// Background output must update its grid but must not spend a repaint on
+    /// a canvas the user cannot see.
+    #[test]
+    fn inactive_terminal_output_does_not_request_a_repaint() {
+        let mut summary = TerminalTabsPoll::default();
+        include_poll(
+            &mut summary,
+            false,
+            crate::terminal_view::TerminalPoll {
+                activity: true,
+                revision: 9,
+                ..Default::default()
+            },
+        );
+        assert!(!summary.active_activity);
     }
 }

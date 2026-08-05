@@ -69,6 +69,57 @@ pub struct MemorySample {
     pub other_analyzer_count: usize,
 }
 
+/// Last usage read successfully from one live session.
+///
+/// The session mutex is intentionally contended for the duration of a turn.
+/// Keeping this side cache prevents the menu meter from flashing back to zero
+/// precisely while the provider is doing billable work.
+#[derive(Clone, Default)]
+pub struct UsageCache {
+    inner: Arc<std::sync::Mutex<(Option<usize>, Usage)>>,
+}
+
+impl UsageCache {
+    /// Install the accounting snapshot before the session can be claimed by a
+    /// turn. The first meter tick may then miss `try_lock` without erasing the
+    /// restored spend.
+    pub fn seed(
+        &self,
+        session: &Arc<tokio::sync::Mutex<smithy_agent::Session>>,
+        usage: Usage,
+    ) {
+        self.seed_identity(Arc::as_ptr(session) as usize, usage);
+    }
+
+    fn seed_identity(&self, identity: usize, usage: Usage) {
+        let mut cached = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        *cached = (Some(identity), usage);
+    }
+
+    fn load_for(
+        &self,
+        session: Option<&Arc<tokio::sync::Mutex<smithy_agent::Session>>>,
+    ) -> Usage {
+        let Some(session) = session else {
+            return self.update(None, None);
+        };
+        let identity = Arc::as_ptr(session) as usize;
+        let observed = session.try_lock().ok().map(|guard| guard.usage());
+        self.update(Some(identity), observed)
+    }
+
+    fn update(&self, identity: Option<usize>, observed: Option<Usage>) -> Usage {
+        let mut cached = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        if cached.0 != identity {
+            *cached = (identity, Usage::default());
+        }
+        if let Some(usage) = observed {
+            cached.1 = usage;
+        }
+        cached.1
+    }
+}
+
 impl MemorySample {
     /// The menu-bar string, or empty when there is nothing worth saying.
     pub fn render(&self) -> String {
@@ -276,13 +327,11 @@ impl BalanceCache {
 pub fn spend_now(
     data_dir: &std::path::Path,
     model_label: &str,
-    session: &Arc<tokio::sync::Mutex<Option<smithy_agent::Session>>>,
+    session: Option<&Arc<tokio::sync::Mutex<smithy_agent::Session>>>,
     balance: &BalanceCache,
+    usage_cache: &UsageCache,
 ) -> Spend {
-    let usage = match session.try_lock() {
-        Ok(guard) => guard.as_ref().map(|s| s.usage()).unwrap_or_default(),
-        Err(_) => Usage::default(),
-    };
+    let usage = usage_cache.load_for(session);
 
     let config = smithy_agent::AgentConfig::load(data_dir);
     let model = config.active().model.clone();
@@ -350,15 +399,15 @@ pub fn spawn_balance_poller(agent: crate::app_state::AgentState, data_dir: std::
                 .flatten();
 
                 if let Some(key) = key {
-                    match smithy_agent::catalogue::deepseek_balance(
+                    if let Ok(balance) = smithy_agent::catalogue::deepseek_balance(
                         &config.deepseek.base_url,
                         &key,
                     )
                     .await
                     {
-                        Ok(balance) => cache.store(&balance),
-                        Err(_) => {} // unknown is rendered as nothing
+                        cache.store(&balance);
                     }
+                    // Fetch failures leave the honest rendering, "unknown".
                 }
             } else {
                 // A stale figure from another account is worse than none.
@@ -562,6 +611,60 @@ mod tests {
         cache.store(&balance(9.93));
         cache.clear();
         assert!(cache.load().is_none());
+    }
+
+    /// The session lock is held for the whole provider turn. Treating a missed
+    /// `try_lock` as zero made the spend meter erase its last true value exactly
+    /// while another request was accruing cost.
+    #[test]
+    fn a_contended_session_keeps_the_last_successful_usage_sample() {
+        let cache = UsageCache::default();
+        let measured = Usage {
+            prompt_tokens: 12_000,
+            completion_tokens: 800,
+            cached_tokens: 7_000,
+            reasoning_tokens: 300,
+            requests: 2,
+        };
+        assert_eq!(cache.update(Some(7), Some(measured)), measured);
+        assert_eq!(
+            cache.update(Some(7), None),
+            measured,
+            "lock contention reset the usage meter"
+        );
+        assert_eq!(
+            cache.update(Some(8), None),
+            Usage::default(),
+            "a different session inherited the previous conversation's spend"
+        );
+    }
+
+    /// A resumed session can be installed and claimed by an immediate send
+    /// before the meter's first tick. Seeding at installation must make that
+    /// first contended observation show restored spend, not zero or the prior
+    /// conversation's value.
+    #[test]
+    fn a_newly_installed_contended_session_starts_from_restored_usage() {
+        let cache = UsageCache::default();
+        let old = Usage {
+            prompt_tokens: 100,
+            requests: 1,
+            ..Default::default()
+        };
+        let restored = Usage {
+            prompt_tokens: 42_000,
+            completion_tokens: 900,
+            cached_tokens: 30_000,
+            reasoning_tokens: 400,
+            requests: 8,
+        };
+        cache.seed_identity(1, old);
+        cache.seed_identity(2, restored);
+        assert_eq!(
+            cache.update(Some(2), None),
+            restored,
+            "the first missed lock discarded restored accounting"
+        );
     }
 
     #[test]

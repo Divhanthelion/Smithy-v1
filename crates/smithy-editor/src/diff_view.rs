@@ -121,6 +121,34 @@ impl FileDiff {
         }
     }
 
+    /// Represent creation of a zero-byte file as an explicit review decision.
+    ///
+    /// An ordinary text diff from `""` to `""` has no hunks, which previously
+    /// collapsed "missing" and "present but empty" and gave the modal nothing to
+    /// accept. This sentinel hunk changes no bytes; it records file existence.
+    pub fn empty_creation(path: impl Into<String>) -> Self {
+        let path = path.into();
+        Self {
+            language: Self::detect_language(&path),
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                old_count: 0,
+                new_start: 1,
+                new_count: 0,
+                lines: vec![DiffLine {
+                    change_type: DiffChangeType::Added,
+                    old_content: None,
+                    new_content: Some("[create empty file]".into()),
+                    old_line_num: None,
+                    new_line_num: None,
+                }],
+            }],
+            path,
+            old_content: String::new(),
+            new_content: String::new(),
+        }
+    }
+
     /// Detect language from file path
     fn detect_language(path: &str) -> String {
         std::path::Path::new(path)
@@ -674,8 +702,8 @@ pub fn diff_modal(
 
     Container::new(dyn_container(
         // Keyed on the queued change, not on a bare diff. Reviews are matched
-        // on their `tool_call_id` — one turn can queue two writes to the same
-        // path — so the id has to survive as far as whatever resolves them.
+        // on their opaque registration — one turn can queue two writes to the
+        // same path — so the id survives as far as whatever resolves them.
         move || review.get(),
         move |d| {
             if let Some(file_diff) = d.map(|c| c.diff) {

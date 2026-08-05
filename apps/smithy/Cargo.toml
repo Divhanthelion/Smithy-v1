@@ -19,6 +19,10 @@ sysinfo.workspace = true
 smithy-voice.workspace = true
 floem.workspace = true
 tokio.workspace = true
+# Session construction has blocking scans and OS credential reads. A retained
+# token lets scans stop cooperatively while completed keychain calls are safely
+# quarantined from installation after their generation retires.
+tokio-util.workspace = true
 thiserror.workspace = true
 crossbeam-channel.workspace = true
 serde_json.workspace = true

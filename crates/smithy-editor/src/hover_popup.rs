@@ -7,49 +7,108 @@
 
 use floem::prelude::*;
 use floem::reactive::{RwSignal, SignalGet, SignalUpdate};
+use std::path::PathBuf;
 
 use crate::design;
+
+/// The exact document generation a semantic answer belongs to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HoverDocument {
+    pub epoch: u64,
+    pub path: PathBuf,
+    pub revision: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingHover {
+    pub request_id: u64,
+    pub document: HoverDocument,
+}
 
 /// What the popup shows.
 #[derive(Clone)]
 pub struct HoverState {
     /// Markdown-ish text from the server. `None` when nothing is showing.
     pub content: RwSignal<Option<String>>,
-    /// A request is in flight; distinguishes "waiting" from "nothing there".
-    pub pending: RwSignal<bool>,
+    /// The one request allowed to change this popup.
+    ///
+    /// A bool cannot distinguish two in-flight requests, so an older response
+    /// could replace the answer for the caret's newer position.
+    pub pending: RwSignal<Option<PendingHover>>,
+    document: RwSignal<Option<HoverDocument>>,
 }
 
 impl HoverState {
     pub fn new() -> Self {
         Self {
             content: RwSignal::new(None),
-            pending: RwSignal::new(false),
+            pending: RwSignal::new(None),
+            document: RwSignal::new(None),
         }
     }
 
-    pub fn request_started(&self) {
-        self.pending.set(true);
+    /// Bind the popup to what is currently active.
+    ///
+    /// Path alone is insufficient: an answer requested before an edit is stale
+    /// for the same file, and a project transition can retain the same path.
+    pub fn bind_document(&self, document: Option<HoverDocument>) {
+        if self.document.get_untracked() != document {
+            self.pending.set(None);
+            self.content.set(None);
+            self.document.set(document);
+        }
+    }
+
+    pub fn request_started(&self, request_id: u64, document: HoverDocument) {
+        self.bind_document(Some(document.clone()));
+        self.pending.set(Some(PendingHover {
+            request_id,
+            document,
+        }));
         self.content.set(None);
     }
 
     /// Show a result. An empty or whitespace-only body is *not* shown — the
     /// server says "I have nothing" by returning empty contents, and an empty
     /// box on screen reads as a bug.
-    pub fn show(&self, content: Option<String>) {
-        self.pending.set(false);
+    pub fn show(&self, request_id: u64, content: Option<String>) -> bool {
+        let Some(pending) = self.pending.get_untracked() else {
+            return false;
+        };
+        if pending.request_id != request_id
+            || self.document.get_untracked().as_ref() != Some(&pending.document)
+        {
+            return false;
+        }
+        self.pending.set(None);
         self.content.set(match content {
             Some(text) if !text.trim().is_empty() => Some(clean_markup(&text)),
             _ => None,
         });
+        true
+    }
+
+    /// Finish only the matching request without declaring the server dead.
+    pub fn fail(&self, request_id: u64) -> bool {
+        if self
+            .pending
+            .get_untracked()
+            .is_none_or(|pending| pending.request_id != request_id)
+        {
+            return false;
+        }
+        self.pending.set(None);
+        self.content.set(None);
+        true
     }
 
     pub fn dismiss(&self) {
-        self.pending.set(false);
+        self.pending.set(None);
         self.content.set(None);
     }
 
     pub fn is_visible(&self) -> bool {
-        self.pending.get() || self.content.get().is_some()
+        self.pending.get().is_some() || self.content.get().is_some()
     }
 }
 
@@ -127,7 +186,7 @@ pub fn hover_popup(state: HoverState) -> impl IntoView {
             ))
             .style(|s| s.width_full().items_center().margin_bottom(design::SPACE_2)),
             Label::derived(move || {
-                if for_body.pending.get() {
+                if for_body.pending.get().is_some() {
                     "…".to_string()
                 } else {
                     for_body.content.get().unwrap_or_default()
@@ -166,6 +225,14 @@ pub fn hover_popup(state: HoverState) -> impl IntoView {
 mod tests {
     use super::*;
 
+    fn document(path: &str, revision: u64) -> HoverDocument {
+        HoverDocument {
+            epoch: 1,
+            path: PathBuf::from(path),
+            revision,
+        }
+    }
+
     #[test]
     fn code_fences_and_rules_are_stripped() {
         let raw = "```rust\npub fn parse(s: &str) -> Result<Ast>\n```\n\n---\n\nParses input.";
@@ -202,8 +269,8 @@ mod tests {
     #[test]
     fn an_empty_result_shows_nothing() {
         let state = HoverState::new();
-        state.request_started();
-        state.show(Some("   \n\n  ".into()));
+        state.request_started(1, document("a.rs", 0));
+        state.show(1, Some("   \n\n  ".into()));
         assert!(!state.is_visible());
         assert_eq!(state.content.get_untracked(), None);
     }
@@ -211,8 +278,8 @@ mod tests {
     #[test]
     fn a_missing_result_shows_nothing() {
         let state = HoverState::new();
-        state.request_started();
-        state.show(None);
+        state.request_started(1, document("a.rs", 0));
+        state.show(1, None);
         assert!(!state.is_visible());
     }
 
@@ -222,24 +289,24 @@ mod tests {
     fn a_pending_request_is_visible() {
         let state = HoverState::new();
         assert!(!state.is_visible());
-        state.request_started();
+        state.request_started(1, document("a.rs", 0));
         assert!(state.is_visible());
     }
 
     #[test]
     fn showing_a_result_clears_pending() {
         let state = HoverState::new();
-        state.request_started();
-        state.show(Some("fn main()".into()));
-        assert!(!state.pending.get_untracked());
+        state.request_started(1, document("a.rs", 0));
+        state.show(1, Some("fn main()".into()));
+        assert!(state.pending.get_untracked().is_none());
         assert!(state.is_visible());
     }
 
     #[test]
     fn dismissing_clears_everything() {
         let state = HoverState::new();
-        state.request_started();
-        state.show(Some("something".into()));
+        state.request_started(1, document("a.rs", 0));
+        state.show(1, Some("something".into()));
         state.dismiss();
         assert!(!state.is_visible());
     }
@@ -249,9 +316,108 @@ mod tests {
     #[test]
     fn a_new_request_clears_the_previous_answer() {
         let state = HoverState::new();
-        state.show(Some("first".into()));
-        state.request_started();
+        state.request_started(1, document("a.rs", 0));
+        state.show(1, Some("first".into()));
+        state.request_started(2, document("a.rs", 0));
         assert_eq!(state.content.get_untracked(), None);
-        assert!(state.pending.get_untracked());
+        assert_eq!(
+            state
+                .pending
+                .get_untracked()
+                .map(|pending| pending.request_id),
+            Some(2)
+        );
+    }
+
+    /// Network replies can arrive in the opposite order from requests. The
+    /// older answer must not overwrite the caret's newer hover.
+    #[test]
+    fn a_late_hover_response_cannot_replace_the_current_request() {
+        let state = HoverState::new();
+        state.request_started(10, document("a.rs", 0));
+        state.request_started(11, document("a.rs", 0));
+
+        assert!(!state.show(10, Some("old".into())));
+        assert_eq!(
+            state
+                .pending
+                .get_untracked()
+                .map(|pending| pending.request_id),
+            Some(11)
+        );
+        assert!(state.show(11, Some("new".into())));
+        assert_eq!(state.content.get_untracked().as_deref(), Some("new"));
+    }
+
+    /// Dismissal is a decision that the in-flight answer is no longer wanted.
+    /// Clearing only the pixels let the late response reopen the popup.
+    #[test]
+    fn dismissing_a_pending_hover_invalidates_its_late_response() {
+        let state = HoverState::new();
+        state.request_started(20, document("a.rs", 0));
+        state.dismiss();
+
+        assert!(!state.show(20, Some("too late".into())));
+        assert!(!state.is_visible());
+    }
+
+    /// One hover can fail while rust-analyzer remains healthy for diagnostics,
+    /// definition and later hovers. The failure belongs only to its request.
+    #[test]
+    fn a_hover_error_clears_only_the_matching_request() {
+        let state = HoverState::new();
+        state.request_started(30, document("a.rs", 0));
+        assert!(state.fail(30));
+        assert!(!state.is_visible());
+
+        state.request_started(31, document("a.rs", 0));
+        assert!(!state.fail(30));
+        assert_eq!(
+            state
+                .pending
+                .get_untracked()
+                .map(|pending| pending.request_id),
+            Some(31)
+        );
+    }
+
+    /// Request ids are process-wide but an answer also belongs to the document
+    /// generation at the caret. Switching files must invalidate the old file's
+    /// answer before it arrives.
+    #[test]
+    fn switching_documents_rejects_a_late_old_file_hover() {
+        let state = HoverState::new();
+        state.request_started(40, document("old.rs", 0));
+        state.bind_document(Some(document("new.rs", 0)));
+
+        assert!(!state.show(40, Some("old file".into())));
+        assert!(!state.is_visible());
+    }
+
+    /// A hover computed before an edit describes the old syntax even when the
+    /// path did not move. Revision changes therefore invalidate it too.
+    #[test]
+    fn editing_the_active_document_rejects_its_pre_edit_hover() {
+        let state = HoverState::new();
+        state.request_started(50, document("same.rs", 7));
+        state.bind_document(Some(document("same.rs", 8)));
+
+        assert!(!state.show(50, Some("revision seven".into())));
+        assert!(!state.is_visible());
+    }
+
+    /// Project switches can retain an identical absolute path in synthetic or
+    /// replaced workspaces. The project epoch prevents that answer crossing the
+    /// semantic boundary.
+    #[test]
+    fn changing_project_epoch_rejects_a_late_hover_for_the_same_path() {
+        let state = HoverState::new();
+        state.request_started(60, document("same.rs", 0));
+        let mut next_project = document("same.rs", 0);
+        next_project.epoch = 2;
+        state.bind_document(Some(next_project));
+
+        assert!(!state.show(60, Some("previous project".into())));
+        assert!(!state.is_visible());
     }
 }

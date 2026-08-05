@@ -2,10 +2,9 @@
 //!
 //! Ported from coda, whose spec called these "the cheapest, most important
 //! reliability layer": they make a runaway loop impossible regardless of what
-//! the model does. Step and time budgets are per user-turn; the context budget
-//! is cumulative and read from the endpoint's own token accounting.
-
-use std::time::Instant;
+//! the model does. Tool-call counts are tracked here; the one absolute time
+//! budget lives in the turn's `ExecutionControl`, and context is cumulative
+//! from the endpoint's own token accounting.
 
 use serde::{Deserialize, Serialize};
 
@@ -93,7 +92,6 @@ impl std::fmt::Display for Stop {
 /// Per-turn budget tracker.
 pub struct Budget {
     limits: Limits,
-    started: Instant,
     steps: usize,
     last_prompt_tokens: i64,
     /// Cumulative tool-result characters this turn (pre-annotation).
@@ -115,7 +113,6 @@ impl Budget {
     pub fn seeded(limits: Limits, last_prompt_tokens: i64) -> Self {
         Budget {
             limits,
-            started: Instant::now(),
             steps: 0,
             last_prompt_tokens,
             tool_result_chars: 0,
@@ -152,15 +149,19 @@ impl Budget {
         ))
     }
 
-    /// Call at the top of each loop iteration. `Err` means a ceiling was hit.
-    pub fn tick(&mut self) -> Result<(), Stop> {
-        self.steps += 1;
-        if self.steps > self.limits.max_steps {
+    /// Claim one model-announced tool invocation before dispatching it.
+    ///
+    /// Provider rounds are not work steps: a final answer costs zero, while
+    /// every denied, unknown, or malformed announced call still spends one.
+    pub fn claim_tool_call(&mut self) -> Result<usize, Stop> {
+        if self.steps >= self.limits.max_steps {
             return Err(Stop::Steps(self.limits.max_steps));
         }
-        if self.started.elapsed().as_secs() > self.limits.max_seconds {
-            return Err(Stop::Time(self.limits.max_seconds));
-        }
+        self.steps += 1;
+        Ok(self.steps)
+    }
+
+    pub fn check_context(&self) -> Result<(), Stop> {
         if self.last_prompt_tokens > self.limits.context_hard {
             return Err(Stop::Context(self.last_prompt_tokens));
         }
@@ -196,7 +197,9 @@ impl Budget {
     /// history. Append-only-safe: we shape the result, we do not rewrite it
     /// later. Warn rather than truncate — cutting risks deleting the answer.
     pub fn annotate_tool_result(&mut self, content: &mut String) {
-        self.tool_result_chars = self.tool_result_chars.saturating_add(content.len());
+        self.tool_result_chars = self
+            .tool_result_chars
+            .saturating_add(content.chars().count());
         if self.tool_result_chars > self.limits.tool_result_warn_chars {
             content.push_str(
                 "\n\n[results are running long this turn; narrow the query rather than fetching more]",
@@ -235,7 +238,7 @@ mod tests {
         });
         let mut warned_at = None;
         for step in 1..=10 {
-            b.tick().expect("within budget");
+            b.claim_tool_call().expect("within budget");
             if b.should_warn_steps().is_some() && warned_at.is_none() {
                 warned_at = Some(step);
             }
@@ -253,7 +256,7 @@ mod tests {
         });
         let mut warnings = 0;
         for _ in 0..5 {
-            b.tick().ok();
+            b.claim_tool_call().ok();
             if b.should_warn_steps().is_some() {
                 warnings += 1;
             }
@@ -269,7 +272,7 @@ mod tests {
             ..limits()
         });
         for _ in 0..8 {
-            b.tick().ok();
+            b.claim_tool_call().ok();
         }
         let warning = b.should_warn_steps().expect("warned");
         assert!(warning.contains("remain"), "{warning}");
@@ -283,30 +286,30 @@ mod tests {
     #[test]
     fn stops_at_the_step_ceiling() {
         let mut b = Budget::new(limits());
-        assert!(b.tick().is_ok());
-        assert!(b.tick().is_ok());
-        assert!(b.tick().is_ok());
-        assert_eq!(b.tick(), Err(Stop::Steps(3)));
+        assert!(b.claim_tool_call().is_ok());
+        assert!(b.claim_tool_call().is_ok());
+        assert!(b.claim_tool_call().is_ok());
+        assert_eq!(b.claim_tool_call(), Err(Stop::Steps(3)));
     }
 
     #[test]
     fn seeded_budget_stops_before_the_first_tick_completes_a_doomed_turn() {
-        let mut b = Budget::seeded(
+        let b = Budget::seeded(
             Limits {
                 context_hard: 100,
                 ..limits()
             },
             250,
         );
-        assert_eq!(b.tick(), Err(Stop::Context(250)));
+        assert_eq!(b.check_context(), Err(Stop::Context(250)));
     }
 
     #[test]
     fn context_under_the_ceiling_keeps_going() {
         let mut b = Budget::new(limits());
-        b.tick().unwrap();
+        b.check_context().unwrap();
         b.record_prompt_tokens(150);
-        assert!(b.tick().is_ok());
+        assert!(b.check_context().is_ok());
     }
 
     #[test]
@@ -357,6 +360,47 @@ mod tests {
         // The body is still intact — we warn, we do not truncate.
         assert!(second.starts_with(&"y".repeat(50)));
         assert_eq!(b.tool_result_chars(), 110);
+    }
+
+    /// Labelling used to be considered after the aggregate-result budget,
+    /// understating the exact scalar characters retained in History.
+    #[test]
+    fn result_budget_counts_the_wrapped_content_that_enters_history() {
+        let raw = "command output";
+        let mut wrapped = crate::message::wrap_tool_evidence("bash", raw).unwrap();
+        let expected = wrapped.chars().count();
+        let mut budget = Budget::new(Limits {
+            tool_result_warn_chars: usize::MAX,
+            ..limits()
+        });
+        budget.annotate_tool_result(&mut wrapped);
+        assert_eq!(budget.tool_result_chars(), expected);
+        assert!(budget.tool_result_chars() > raw.len());
+    }
+
+    /// Rust string byte length made non-ASCII evidence spend two to four times
+    /// the documented character budget. The threshold is Unicode scalar
+    /// characters, matching every other context sizing path in the agent.
+    #[test]
+    fn multibyte_tool_results_are_counted_as_characters_not_utf8_bytes() {
+        let mut budget = Budget::new(Limits {
+            tool_result_warn_chars: 4,
+            ..limits()
+        });
+        let mut first = "é🐟".to_string();
+        budget.annotate_tool_result(&mut first);
+        assert_eq!(budget.tool_result_chars(), 2);
+        assert!(!first.contains("running long"));
+
+        let mut second = "漢字".to_string();
+        budget.annotate_tool_result(&mut second);
+        assert_eq!(budget.tool_result_chars(), 4);
+        assert!(!second.contains("running long"));
+
+        let mut third = "ø".to_string();
+        budget.annotate_tool_result(&mut third);
+        assert_eq!(budget.tool_result_chars(), 5);
+        assert!(third.contains("running long"));
     }
 
     #[test]

@@ -92,8 +92,8 @@ fn list(filter: Option<&str>) {
     rows.sort_by(|a, b| b.0.cmp(&a.0));
 
     println!(
-        "{:<38} {:>5} {:>10}  {}",
-        "PROJECT", "MSGS", "REASONING", "FILE"
+        "{:<38} {:>5} {:>10}  FILE",
+        "PROJECT", "MSGS", "REASONING"
     );
     for (_, project, path, messages, reasoning) in rows {
         let project = if project.chars().count() > 36 {
@@ -110,7 +110,17 @@ fn list(filter: Option<&str>) {
 
 fn load(path: &Path) -> Option<StoredSession> {
     let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
+    let id = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("(unknown)");
+    match smithy_agent::persist::decode_session_json(id, &text) {
+        Ok(session) => Some(session),
+        Err(error) => {
+            eprintln!("skipped {}: {error}", path.display());
+            None
+        }
+    }
 }
 
 fn show(path: &Path, with_reasoning: bool) {
@@ -136,6 +146,7 @@ fn show(path: &Path, with_reasoning: bool) {
     }
     eprintln!();
 
+    print_outcomes(&session, 0);
     for (index, message) in session.messages.iter().enumerate() {
         // Reasoning is keyed by how many messages existed when it was emitted,
         // so it slots in ahead of the assistant message it produced.
@@ -165,6 +176,7 @@ fn show(path: &Path, with_reasoning: bool) {
                 println!("    {name}: {}", one_line(&message.content, 160));
             }
         }
+        print_outcomes(&session, index + 1);
     }
 }
 
@@ -185,6 +197,7 @@ fn markdown(path: &Path) {
         session.limits.max_steps, session.limits.context_hard
     );
 
+    print_markdown_outcomes(&session, 0);
     for (index, message) in session.messages.iter().enumerate() {
         for entry in session.reasoning.iter().filter(|r| r.after_message == index) {
             println!("<details><summary>Reasoning — step {}</summary>\n", entry.step);
@@ -216,6 +229,55 @@ fn markdown(path: &Path) {
                     truncate(&message.content, 4000)
                 );
             }
+        }
+        print_markdown_outcomes(&session, index + 1);
+    }
+}
+
+fn print_outcomes(session: &StoredSession, after_message: usize) {
+    for outcome in session
+        .turn_outcomes
+        .iter()
+        .filter(|outcome| outcome.after_message == after_message)
+    {
+        match outcome.status {
+            smithy_agent::persist::PersistedTurnStatus::Answered => {}
+            smithy_agent::persist::PersistedTurnStatus::Stopped => println!(
+                "\n[stopped] {}",
+                outcome.detail.as_deref().unwrap_or("Turn stopped.")
+            ),
+            smithy_agent::persist::PersistedTurnStatus::Failed => println!(
+                "\n[failed] {}",
+                outcome
+                    .failure
+                    .as_ref()
+                    .map(|failure| failure.detail.as_str())
+                    .unwrap_or("The turn failed.")
+            ),
+        }
+    }
+}
+
+fn print_markdown_outcomes(session: &StoredSession, after_message: usize) {
+    for outcome in session
+        .turn_outcomes
+        .iter()
+        .filter(|outcome| outcome.after_message == after_message)
+    {
+        match outcome.status {
+            smithy_agent::persist::PersistedTurnStatus::Answered => {}
+            smithy_agent::persist::PersistedTurnStatus::Stopped => println!(
+                "> **Stopped:** {}\n",
+                outcome.detail.as_deref().unwrap_or("Turn stopped.")
+            ),
+            smithy_agent::persist::PersistedTurnStatus::Failed => println!(
+                "> **Failed:** {}\n",
+                outcome
+                    .failure
+                    .as_ref()
+                    .map(|failure| failure.detail.as_str())
+                    .unwrap_or("The turn failed.")
+            ),
         }
     }
 }

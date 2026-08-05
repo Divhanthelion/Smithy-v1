@@ -35,8 +35,12 @@
 //!   trusted.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use serde::{Deserialize, Serialize};
 
 /// What a symbol is.
@@ -330,42 +334,197 @@ impl SymbolIndex {
     /// this is a structural index, and a module under a dotted directory is
     /// still code the agent may have to edit.
     pub fn build(root: &Path) -> SymbolIndex {
+        Self::build_controlled(root, || false).unwrap_or_default()
+    }
+
+    /// Build while allowing a retired session generation to stop the walk.
+    ///
+    /// The callback is checked at file and symbol boundaries. Parsing one
+    /// already-read source remains atomic; tree-sitter has no safe interruption
+    /// point inside a single parse.
+    pub fn build_controlled(
+        root: &Path,
+        cancelled: impl Fn() -> bool,
+    ) -> Option<SymbolIndex> {
+        Self::build_controlled_with_hook(root, &cancelled, &mut |_| {})
+    }
+
+    fn build_controlled_with_hook(
+        root: &Path,
+        cancelled: &dyn Fn() -> bool,
+        before_read: &mut dyn FnMut(&Path),
+    ) -> Option<SymbolIndex> {
+        let root = root.canonicalize().ok()?;
+        let dir = Dir::open_ambient_dir(&root, ambient_authority()).ok()?;
+        let sources = capability_rust_sources(&dir, &root, cancelled).ok()??;
         let mut index = SymbolIndex::default();
 
-        let walker = ignore::WalkBuilder::new(root)
-            .hidden(false)
-            .git_ignore(true)
-            .require_git(false)
-            .build();
-
-        for entry in walker.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
+        for relative in sources {
+            if cancelled() {
+                return None;
             }
-            let Ok(source) = std::fs::read_to_string(path) else {
-                continue;
+            before_read(&relative);
+            // Enumeration and this read intentionally share the same root
+            // descriptor. If the name is swapped to an external symlink after
+            // enumeration, cap-std refuses it rather than following ambient
+            // path resolution.
+            let source = match dir.read_to_string(&relative) {
+                Ok(source) => source,
+                Err(_) => return None,
             };
             // Guard against a generated monster: a megabyte of bindings costs
             // seconds to parse and answers nothing anyone asks.
             if source.len() > 2 * 1024 * 1024 {
                 continue;
             }
-            let display = path
-                .strip_prefix(root)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .to_string();
-            let module = module_for(path);
+            let display = relative.to_string_lossy().to_string();
+            let module = module_for(&relative);
 
             index.files += 1;
             for symbol in symbols_in(&source, &module, &display) {
+                if cancelled() {
+                    return None;
+                }
                 index.insert(symbol);
             }
         }
+        if cancelled() {
+            return None;
+        }
         index.sort_spans();
-        index
+        Some(index)
     }
+}
+
+fn capability_rust_sources(
+    dir: &Dir,
+    root: &Path,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Option<Vec<PathBuf>>, String> {
+    let mut sources = Vec::new();
+    collect_rust_sources(
+        dir,
+        root,
+        Path::new(""),
+        &mut Vec::new(),
+        &mut sources,
+        cancelled,
+    )?;
+    if cancelled() {
+        return Ok(None);
+    }
+    sources.sort();
+    Ok(Some(sources))
+}
+
+fn collect_rust_sources(
+    dir: &Dir,
+    root: &Path,
+    relative: &Path,
+    inherited_ignores: &mut Vec<Gitignore>,
+    sources: &mut Vec<PathBuf>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(), String> {
+    if cancelled() {
+        return Ok(());
+    }
+    let mut pushed = 0usize;
+    for name in [".gitignore", ".ignore"] {
+        if let Some(ignore) = ignore_file_in(dir, root, relative, name)? {
+            inherited_ignores.push(ignore);
+            pushed += 1;
+        }
+    }
+    let mut children = Vec::new();
+    let read_path = if relative.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        relative
+    };
+    for entry in dir
+        .read_dir(read_path)
+        .map_err(|error| format!("cannot enumerate {}: {error}", relative.display()))?
+    {
+        let entry = entry.map_err(|error| format!("cannot enumerate project: {error}"))?;
+        children.push(relative.join(entry.file_name()));
+    }
+    children.sort();
+
+    for child in children {
+        if cancelled() {
+            break;
+        }
+        if child.file_name().and_then(|name| name.to_str()) == Some(".git") {
+            continue;
+        }
+        let metadata = dir
+            .symlink_metadata(&child)
+            .map_err(|error| format!("cannot inspect {}: {error}", child.display()))?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        let absolute = root.join(&child);
+        let mut ignored = false;
+        for matcher in inherited_ignores.iter() {
+            let matched = matcher.matched(&absolute, metadata.is_dir());
+            if !matched.is_none() {
+                ignored = matched.is_ignore();
+            }
+        }
+        if ignored {
+            continue;
+        }
+        if metadata.is_dir() {
+            collect_rust_sources(
+                dir,
+                root,
+                &child,
+                inherited_ignores,
+                sources,
+                cancelled,
+            )?;
+        } else if metadata.is_file()
+            && child.extension().and_then(|extension| extension.to_str()) == Some("rs")
+        {
+            sources.push(child);
+        }
+    }
+    for _ in 0..pushed {
+        inherited_ignores.pop();
+    }
+    Ok(())
+}
+
+fn ignore_file_in(
+    dir: &Dir,
+    root: &Path,
+    relative: &Path,
+    name: &str,
+) -> Result<Option<Gitignore>, String> {
+    let path = relative.join(name);
+    match dir.symlink_metadata(&path) {
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("cannot inspect {}: {error}", path.display())),
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(format!("refusing symlinked ignore file {}", path.display()))
+        }
+        Ok(metadata) if !metadata.is_file() => return Ok(None),
+        Ok(_) => {}
+    }
+    let contents = dir
+        .read_to_string(&path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let mut builder = GitignoreBuilder::new(root);
+    let origin = root.join(&path);
+    for line in contents.lines() {
+        builder
+            .add_line(Some(origin.clone()), line)
+            .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
+    }
+    builder
+        .build()
+        .map(Some)
+        .map_err(|error| format!("cannot build ignore rules for {}: {error}", path.display()))
 }
 
 /// The module path for a file, found by locating its nearest `src/` ancestor.
@@ -717,6 +876,80 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].container.as_deref(), Some("Desktop"));
         assert!(index.lookup("nothing_named_this").is_empty());
+    }
+
+    /// An ambient walk followed by an ambient read had a swap window: replacing
+    /// an enumerated `.rs` file with an external symlink leaked that source into
+    /// the index. The capability read must fail the whole build instead.
+    #[cfg(unix)]
+    #[test]
+    fn a_source_swapped_to_an_external_symlink_fails_without_indexing_it() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join("src")).unwrap();
+        std::fs::write(workspace.path().join("src/lib.rs"), "pub fn safe() {}").unwrap();
+        std::fs::write(
+            outside.path().join("leak.rs"),
+            "pub fn EXTERNAL_SYMBOL_SENTINEL() {}",
+        )
+        .unwrap();
+        let mut swapped = false;
+        let result = SymbolIndex::build_controlled_with_hook(
+            workspace.path(),
+            &|| false,
+            &mut |relative| {
+                if relative == Path::new("src/lib.rs") {
+                    std::fs::remove_file(workspace.path().join(relative)).unwrap();
+                    symlink(
+                        outside.path().join("leak.rs"),
+                        workspace.path().join(relative),
+                    )
+                    .unwrap();
+                    swapped = true;
+                }
+            },
+        );
+        assert!(swapped, "the deterministic race seam did not run");
+        assert!(result.is_none(), "a swapped source must fail closed");
+    }
+
+    /// Capability traversal must retain the old ignore-aware performance
+    /// boundary; indexing generated target trees made startup scale with builds.
+    #[test]
+    fn capability_symbol_walk_still_respects_gitignore_and_order() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("src")).unwrap();
+        std::fs::create_dir_all(workspace.path().join("generated")).unwrap();
+        std::fs::write(workspace.path().join(".gitignore"), "generated/\n").unwrap();
+        std::fs::write(
+            workspace.path().join("src/z.rs"),
+            "pub fn duplicate() {}\npub fn z_last() {}",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.path().join("src/a.rs"),
+            "pub fn duplicate() {}\npub fn a_first() {}",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.path().join("generated/leak.rs"),
+            "pub fn IGNORED_SENTINEL() {}",
+        )
+        .unwrap();
+        let first = SymbolIndex::build(workspace.path());
+        let second = SymbolIndex::build(workspace.path());
+        assert!(first.lookup("IGNORED_SENTINEL").is_empty());
+        assert_eq!(
+            first
+                .lookup("duplicate")
+                .iter()
+                .map(|symbol| symbol.file.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/a.rs", "src/z.rs"]
+        );
+        assert_eq!(first.lookup("duplicate"), second.lookup("duplicate"));
     }
 
     #[test]

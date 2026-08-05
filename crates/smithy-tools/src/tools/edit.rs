@@ -14,11 +14,121 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::fuzzy::{self, MatchTier};
-use crate::registry::{Tool, ToolCtx};
+use crate::fuzzy::{self, MatchSearch, MatchTier};
+use crate::registry::{ExecutionControl, Tool, ToolCtx};
 use crate::schema::{arg_bool, arg_str, ToolDefinition, ToolOutput, ToolParameter};
 
 pub struct Edit;
+
+/// A validated edit computed without touching the filesystem.
+///
+/// Both the direct tool and the review hook use this exact planner. Keeping the
+/// validation, fuzzy cascade and messages here prevents a preview from offering
+/// a change that the real tool would reject.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EditPlan {
+    pub content: String,
+    pub message: String,
+}
+
+impl EditPlan {
+    pub fn validate(old: &str, new: &str) -> Result<(), String> {
+        if old == new {
+            return Err("old_string and new_string are identical — nothing to change".into());
+        }
+        if old.is_empty() {
+            return Err("old_string is empty — use `write` to create a file".into());
+        }
+        Ok(())
+    }
+
+    pub fn new(
+        text: &str,
+        old: &str,
+        new: &str,
+        replace_all: bool,
+        shown: &str,
+    ) -> Result<Self, String> {
+        Self::validate(old, new)?;
+
+        let exact_count = fuzzy::count_exact(text, old);
+        if exact_count > 1 && !replace_all {
+            return Err(format!(
+                "`old_string` appears {exact_count} times in `{shown}`; it must be unique. \
+                 Add surrounding context to disambiguate, or set replace_all=true."
+            ));
+        }
+        if exact_count > 0 {
+            let content = if replace_all {
+                text.replace(old, new)
+            } else {
+                text.replacen(old, new, 1)
+            };
+            let n = if replace_all { exact_count } else { 1 };
+            return Ok(Self {
+                content,
+                message: format!(
+                    "Edited `{shown}` ({n} replacement{}).",
+                    if n == 1 { "" } else { "s" }
+                ),
+            });
+        }
+
+        let m = match fuzzy::find(text, old) {
+            MatchSearch::Unique(found) => found,
+            MatchSearch::None => {
+                return Err(format!(
+                    "`old_string` was not found in `{shown}`, and no close match could be identified. \
+                     Read the file and copy the exact text (including indentation) you want to replace."
+                ));
+            }
+            MatchSearch::Ambiguous(ambiguous) => {
+                let candidates = ambiguous
+                    .candidates
+                    .iter()
+                    .enumerate()
+                    .map(|(index, candidate)| format!("Candidate {}:\n{}", index + 1, candidate))
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                return Err(format!(
+                    "`old_string` matched more than one region in `{shown}` after {} matching \
+                     (confidence {:.2}). Refusing to choose the first tied region. Add exact \
+                     surrounding context to make the target unique.\n\n{candidates}",
+                    ambiguous.tier, ambiguous.confidence
+                ));
+            }
+        };
+
+        if !m.auto_apply {
+            return Err(format!(
+                "`old_string` did not match exactly. The closest region ({} match, confidence \
+                 {:.2}) was:\n{}\n\nThat is not close enough to edit safely. Re-issue the edit \
+                 using that exact text if it is the region you meant.",
+                m.tier, m.confidence, m.matched_text
+            ));
+        }
+
+        if replace_all && m.tier != MatchTier::Exact {
+            return Err(format!(
+                "replace_all needs an exact match, but `old_string` only matched approximately \
+                 ({}). The text that matched was:\n{}\n\nRe-issue with that exact text.",
+                m.tier, m.matched_text
+            ));
+        }
+
+        let mut content = String::with_capacity(text.len() + new.len());
+        content.push_str(&text[..m.byte_offset]);
+        content.push_str(new);
+        content.push_str(&text[m.byte_offset + m.matched_text.len()..]);
+
+        let mut message = format!("Edited `{shown}` (1 replacement, {} match).", m.tier);
+        if let Some(advisory) = m.advisory() {
+            message.push('\n');
+            message.push_str(&advisory);
+        }
+        Ok(Self { content, message })
+    }
+}
 
 #[async_trait]
 impl Tool for Edit {
@@ -52,6 +162,16 @@ impl Tool for Edit {
     }
 
     async fn run(&self, args: &Value, ctx: &ToolCtx) -> ToolOutput {
+        self.run_controlled(args, ctx, &ExecutionControl::default())
+            .await
+    }
+
+    async fn run_controlled(
+        &self,
+        args: &Value,
+        ctx: &ToolCtx,
+        control: &ExecutionControl,
+    ) -> ToolOutput {
         let path = match arg_str(args, "path") {
             Ok(p) => p,
             Err(e) => return ToolOutput::err(e),
@@ -66,83 +186,33 @@ impl Tool for Edit {
         };
         let replace_all = arg_bool(args, "replace_all").unwrap_or(false);
 
-        if old == new {
-            return ToolOutput::err("old_string and new_string are identical — nothing to change");
+        if let Err(error) = EditPlan::validate(old, new) {
+            return ToolOutput::err(error);
         }
-        if old.is_empty() {
-            return ToolOutput::err("old_string is empty — use `write` to create a file");
-        }
-
-        let text = match ctx.workspace.read_to_string(path) {
-            Ok(t) => t,
+        let expected = match ctx.workspace.snapshot(path) {
+            Ok(crate::sandbox::FileSnapshot::Present(base)) => {
+                crate::sandbox::FileSnapshot::Present(base)
+            }
+            Ok(crate::sandbox::FileSnapshot::Missing) => {
+                return ToolOutput::err(format!("cannot read `{path}`: file does not exist"));
+            }
             Err(e) => return ToolOutput::err(e),
         };
+        let text = expected.content().unwrap().to_string();
         let shown = ctx.workspace.display_path(path);
-
-        // Exact path first, including the uniqueness rule.
-        let exact_count = fuzzy::count_exact(&text, old);
-        if exact_count > 1 && !replace_all {
-            return ToolOutput::err(format!(
-                "`old_string` appears {exact_count} times in `{shown}`; it must be unique. \
-                 Add surrounding context to disambiguate, or set replace_all=true."
-            ));
-        }
-        if exact_count > 0 {
-            let updated = if replace_all {
-                text.replace(old, new)
-            } else {
-                text.replacen(old, new, 1)
-            };
-            if let Err(e) = ctx.workspace.write(path, &updated) {
-                return ToolOutput::err(e);
-            }
-            let n = if replace_all { exact_count } else { 1 };
-            return ToolOutput::ok(format!(
-                "Edited `{shown}` ({n} replacement{}).",
-                if n == 1 { "" } else { "s" }
-            ));
-        }
-
-        // No exact hit — run the cascade.
-        let Some(m) = fuzzy::find(&text, old) else {
-            return ToolOutput::err(format!(
-                "`old_string` was not found in `{shown}`, and no close match could be identified. \
-                 Read the file and copy the exact text (including indentation) you want to replace."
-            ));
+        let plan = match EditPlan::new(&text, old, new, replace_all, &shown) {
+            Ok(plan) => plan,
+            Err(error) => return ToolOutput::err(error),
         };
-
-        if !m.auto_apply {
-            return ToolOutput::err(format!(
-                "`old_string` did not match exactly. The closest region ({} match, confidence \
-                 {:.2}) was:\n{}\n\nThat is not close enough to edit safely. Re-issue the edit \
-                 using that exact text if it is the region you meant.",
-                m.tier, m.confidence, m.matched_text
-            ));
+        if let Err(e) = ctx
+            .workspace
+            .compare_and_write_authorized(path, &expected, &plan.content, || {
+                control.authorize_publication()
+            })
+        {
+            return ToolOutput::err(e.to_string());
         }
-
-        if replace_all && m.tier != MatchTier::Exact {
-            return ToolOutput::err(format!(
-                "replace_all needs an exact match, but `old_string` only matched approximately \
-                 ({}). The text that matched was:\n{}\n\nRe-issue with that exact text.",
-                m.tier, m.matched_text
-            ));
-        }
-
-        let mut updated = String::with_capacity(text.len() + new.len());
-        updated.push_str(&text[..m.byte_offset]);
-        updated.push_str(new);
-        updated.push_str(&text[m.byte_offset + m.matched_text.len()..]);
-
-        if let Err(e) = ctx.workspace.write(path, &updated) {
-            return ToolOutput::err(e);
-        }
-
-        let mut msg = format!("Edited `{shown}` (1 replacement, {} match).", m.tier);
-        if let Some(advisory) = m.advisory() {
-            msg.push('\n');
-            msg.push_str(&advisory);
-        }
-        ToolOutput::ok(msg)
+        ToolOutput::ok(plan.message)
     }
 }
 
@@ -285,5 +355,23 @@ mod tests {
             .await;
         assert!(out.is_error);
         assert!(out.content.contains("needs an exact match"));
+    }
+
+    /// A normalized tie used to select the first source-order candidate. The
+    /// refusal must explain both the tier and how to make intent unique.
+    #[test]
+    fn ambiguous_fuzzy_ties_have_an_actionable_refusal_message() {
+        let error = EditPlan::new(
+            "let  value = 1;\nbetween();\nlet value  = 1;\n",
+            "let   value   = 1;",
+            "let value = 2;",
+            false,
+            "a.rs",
+        )
+        .unwrap_err();
+        assert!(error.contains("more than one region"), "{error}");
+        assert!(error.contains("whitespace-normalized"), "{error}");
+        assert!(error.contains("Refusing to choose the first tied region"));
+        assert!(error.contains("surrounding context"));
     }
 }

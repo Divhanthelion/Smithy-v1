@@ -1,10 +1,50 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::registry::{Tool, ToolCtx};
+use crate::registry::{ExecutionControl, Tool, ToolCtx};
 use crate::schema::{arg_str, ToolDefinition, ToolOutput, ToolParameter};
 
 pub struct Write;
+
+impl Write {
+    async fn run_with_control(
+        &self,
+        args: &Value,
+        ctx: &ToolCtx,
+        control: &ExecutionControl,
+    ) -> ToolOutput {
+        let path = match arg_str(args, "path") {
+            Ok(p) => p,
+            Err(e) => return ToolOutput::err(e),
+        };
+        let content = match arg_str(args, "content") {
+            Ok(c) => c,
+            Err(e) => return ToolOutput::err(e),
+        };
+
+        let expected = match ctx.workspace.snapshot(path) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return ToolOutput::err(error),
+        };
+        let existed = matches!(expected, crate::sandbox::FileSnapshot::Present(_));
+        if let Err(e) = ctx.workspace.compare_and_write_authorized(
+            path,
+            &expected,
+            content,
+            || control.authorize_publication(),
+        ) {
+            return ToolOutput::err(e.to_string());
+        }
+
+        let lines = content.lines().count();
+        let verb = if existed { "Overwrote" } else { "Created" };
+        ToolOutput::ok(format!(
+            "{verb} `{}` ({lines} line{}).",
+            ctx.workspace.display_path(path),
+            if lines == 1 { "" } else { "s" }
+        ))
+    }
+}
 
 #[async_trait]
 impl Tool for Write {
@@ -26,31 +66,17 @@ impl Tool for Write {
     }
 
     async fn run(&self, args: &Value, ctx: &ToolCtx) -> ToolOutput {
-        let path = match arg_str(args, "path") {
-            Ok(p) => p,
-            Err(e) => return ToolOutput::err(e),
-        };
-        let content = match arg_str(args, "content") {
-            Ok(c) => c,
-            Err(e) => return ToolOutput::err(e),
-        };
+        self.run_with_control(args, ctx, &ExecutionControl::default())
+            .await
+    }
 
-        let existed = ctx.workspace.exists(path);
-        if ctx.workspace.is_dir(path) {
-            return ToolOutput::err(format!("`{path}` is a directory, not a file"));
-        }
-
-        if let Err(e) = ctx.workspace.write(path, content) {
-            return ToolOutput::err(e);
-        }
-
-        let lines = content.lines().count();
-        let verb = if existed { "Overwrote" } else { "Created" };
-        ToolOutput::ok(format!(
-            "{verb} `{}` ({lines} line{}).",
-            ctx.workspace.display_path(path),
-            if lines == 1 { "" } else { "s" }
-        ))
+    async fn run_controlled(
+        &self,
+        args: &Value,
+        ctx: &ToolCtx,
+        control: &ExecutionControl,
+    ) -> ToolOutput {
+        self.run_with_control(args, ctx, control).await
     }
 }
 

@@ -17,6 +17,13 @@ use smithy_editor::{
 /// Shared terminal tab manager
 pub type SharedTerminalTabs = Rc<RefCell<TerminalTabManager>>;
 
+fn queue_tick(tx: &crossbeam_channel::Sender<()>) -> bool {
+    match tx.try_send(()) {
+        Ok(()) | Err(crossbeam_channel::TrySendError::Full(())) => true,
+        Err(crossbeam_channel::TrySendError::Disconnected(())) => false,
+    }
+}
+
 /// Multi-terminal UI component with tab bar
 pub struct MultiTerminalComponent {
     tabs: SharedTerminalTabs,
@@ -56,11 +63,13 @@ impl MultiTerminalComponent {
         let version = self.version;
         let tabs_version = self.tabs_version;
 
-        // Spawn a background thread to poll the terminal at 60fps
-        let (tick_tx, tick_rx) = crossbeam_channel::unbounded::<()>();
+        // One pending tick represents all missed frames. An unbounded channel
+        // retained one value per frame while the UI thread was busy or the
+        // panel was hidden, then made it process stale time.
+        let (tick_tx, tick_rx) = crossbeam_channel::bounded::<()>(1);
         std::thread::spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_millis(16));
-            if tick_tx.send(()).is_err() {
+            if !queue_tick(&tick_tx) {
                 break;
             }
         });
@@ -70,17 +79,14 @@ impl MultiTerminalComponent {
 
         Effect::new(move |_| {
             tick_signal.get();
-            let mut updated = false;
+            let mut active_activity = false;
             if let Ok(mut mgr) = tabs_for_tick.try_borrow_mut() {
-                if let Some(tab) = mgr.active_tab_mut() {
-                    if let Ok(mut state) = tab.state.try_borrow_mut() {
-                        if state.poll_events() {
-                            updated = true;
-                        }
-                    }
-                }
+                active_activity = mgr.poll_all().active_activity;
             }
-            if updated {
+            // Polling continues while hidden so exits are never stranded, but
+            // there is no canvas to refresh and no reason to run render-cache
+            // work until the panel is shown again.
+            if active_activity && visible.get_untracked() {
                 version.update(|v| *v += 1);
             }
         });
@@ -102,6 +108,10 @@ impl MultiTerminalComponent {
                 if needs_version_bump {
                     tabs_version.update(|v| *v += 1);
                 }
+                // Hidden output deliberately did not repaint. Showing the
+                // panel must therefore refresh the active tab from its shared
+                // grid even when no new tab was needed.
+                version.update(|v| *v += 1);
             }
         });
 
@@ -165,7 +175,7 @@ impl MultiTerminalComponent {
                             let alt = key_event.modifiers.contains(floem::prelude::Modifiers::ALT);
                             if let Ok(mut state) = tab.state.try_borrow_mut() {
                                 let _ = state.send_key(terminal_key, ctrl, alt);
-                                state.poll_events();
+                                let _ = state.poll_events();
                                 updated = true;
                             }
                         }
@@ -306,4 +316,21 @@ fn terminal_tab_bar(tabs: SharedTerminalTabs, tabs_version: RwSignal<u64>) -> im
             .border_color(Color::from_rgb8(60, 60, 60))
             .items_center()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::queue_tick;
+
+    /// A blocked UI used to accumulate one wake every 16 ms. The wake means
+    /// only "poll now", so retaining more than one wastes memory and stale
+    /// work without preserving information.
+    #[test]
+    fn the_terminal_tick_retains_at_most_one_wake() {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        for _ in 0..10_000 {
+            assert!(queue_tick(&tx));
+        }
+        assert_eq!(rx.len(), 1);
+    }
 }

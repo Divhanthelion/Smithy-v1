@@ -121,6 +121,10 @@ pub struct AgentPanelState {
     /// it and the box the words land in are the same panel.
     pub voice: RwSignal<smithy_voice::Voice>,
     pub busy: RwSignal<bool>,
+    /// Whether the current generation has an installed session and no turn owns
+    /// it. Kept separate from `connected`: a build is installed before Ready is
+    /// painted, and a turn releases this only after its Stop handle is detached.
+    pub turn_available: RwSignal<bool>,
     /// Answer text accumulating live during a turn.
     pub streaming_answer: RwSignal<String>,
     /// Reasoning accumulating live. Never enters history.
@@ -171,6 +175,7 @@ impl AgentPanelState {
             input: RwSignal::new(String::new()),
             voice: RwSignal::new(smithy_voice::Voice::Cold),
             busy: RwSignal::new(false),
+            turn_available: RwSignal::new(false),
             streaming_answer: RwSignal::new(String::new()),
             streaming_reasoning: RwSignal::new(String::new()),
             context_tokens: RwSignal::new(0),
@@ -338,9 +343,12 @@ pub fn budget_color(fraction: f64) -> Color {
 // Views
 // ============================================================================
 
+// Keep the callbacks explicit: each one is a distinct application boundary,
+// and hiding them in a bag makes wiring the wrong action look type-correct.
+#[allow(clippy::too_many_arguments)]
 pub fn agent_panel(
     state: AgentPanelState,
-    on_send: std::rc::Rc<dyn Fn(String)>,
+    on_send: std::rc::Rc<dyn Fn(String) -> bool>,
     on_stop: std::rc::Rc<dyn Fn()>,
     on_close: impl Fn() + 'static,
     on_voice: impl Fn() + 'static,
@@ -1451,24 +1459,14 @@ fn microphone(
 
 fn composer(
     state: AgentPanelState,
-    on_send: std::rc::Rc<dyn Fn(String)>,
+    on_send: std::rc::Rc<dyn Fn(String) -> bool>,
     on_stop: std::rc::Rc<dyn Fn()>,
     on_voice: impl Fn() + 'static,
     hotkey: String,
 ) -> impl IntoView {
     let send = {
         let on_send = on_send.clone();
-        move || {
-            if state.busy.get_untracked() {
-                return;
-            }
-            let text = state.input.get_untracked().trim().to_string();
-            if text.is_empty() {
-                return;
-            }
-            state.input.set(String::new());
-            on_send(text);
-        }
+        move || try_send_from_composer(state, on_send.as_ref())
     };
     let send_on_enter = send.clone();
 
@@ -1498,6 +1496,10 @@ fn composer(
             Label::derived(move || {
                 if state.busy.get() {
                     "working…".to_string()
+                } else if !state.connected.get() {
+                    "Connect the agent to send".to_string()
+                } else if !state.turn_available.get() {
+                    "Waiting for the current turn…".to_string()
                 } else {
                     "Enter to send · Shift+Enter for a newline".to_string()
                 }
@@ -1534,9 +1536,12 @@ fn composer(
                         let send = send.clone();
                         Box::new(
                             Button::new("Send")
-                                .on_event_stop(floem::event::listener::Click, move |_, _| send())
-                                .style(|s| {
-                                    s.background(catppuccin::LAVENDER)
+                                .on_event_stop(floem::event::listener::Click, move |_, _| {
+                                    send();
+                                })
+                                .style(move |s| {
+                                    s.set_disabled(!composer_can_send(state))
+                                        .background(catppuccin::LAVENDER)
                                         .color(catppuccin::CRUST)
                                         .font_size(12.0)
                                         .font_bold()
@@ -1544,6 +1549,10 @@ fn composer(
                                         .padding_vert(5.0)
                                         .border_radius(6.0)
                                         .hover(|s| s.background(catppuccin::MAUVE))
+                                        .disabled(|s| {
+                                            s.background(catppuccin::SURFACE0)
+                                                .color(catppuccin::SURFACE2)
+                                        })
                                 }),
                         ) as Box<dyn View>
                     }
@@ -1559,6 +1568,36 @@ fn composer(
             .border_top(1.0)
             .border_color(catppuccin::SURFACE0)
     })
+}
+
+fn composer_can_send(state: AgentPanelState) -> bool {
+    state.connected.get()
+        && state.turn_available.get()
+        && !state.busy.get()
+        && !state.input.get().trim().is_empty()
+}
+
+/// Hand the composer contents off without consuming them speculatively.
+///
+/// The callback is the lifecycle's final authority. Connectivity can change
+/// between the reactive disabled-state calculation and a click; clearing first
+/// made that race erase the user's prompt while leaving its attachments behind.
+fn try_send_from_composer(
+    state: AgentPanelState,
+    on_send: &dyn Fn(String) -> bool,
+) -> bool {
+    if !state.connected.get_untracked()
+        || !state.turn_available.get_untracked()
+        || state.busy.get_untracked()
+    {
+        return false;
+    }
+    let text = state.input.get_untracked().trim().to_string();
+    if text.is_empty() || !on_send(text) {
+        return false;
+    }
+    state.input.set(String::new());
+    true
 }
 
 #[cfg(test)]
@@ -1649,6 +1688,65 @@ mod tests {
         assert_eq!(budget_color(0.1), catppuccin::GREEN);
         assert_eq!(budget_color(0.6), catppuccin::YELLOW);
         assert_eq!(budget_color(0.95), catppuccin::RED);
+    }
+
+    /// A lifecycle transition can retire the session after the Send button was
+    /// painted but before its callback runs. Clearing the field before asking
+    /// the lifecycle erased the prompt in exactly that race; attachments then
+    /// survived without the words that explained them.
+    #[test]
+    fn a_rejected_send_preserves_the_composer_and_its_attachments() {
+        let state = AgentPanelState::new();
+        state.connected.set(true);
+        state.turn_available.set(true);
+        state.input.set("keep these words".into());
+        state.attachments.set(vec![crate::attachment::Attachment {
+            path: "notes.txt".into(),
+            display: "notes.txt".into(),
+            bytes: 12,
+            kind: crate::attachment::AttachmentKind::Text,
+            included: true,
+        }]);
+
+        assert!(!try_send_from_composer(state, &|_| false));
+        assert_eq!(state.input.get_untracked(), "keep these words");
+        assert_eq!(state.attachments.get_untracked().len(), 1);
+    }
+
+    /// Pressing Enter while disconnected used to clear the composer and enqueue
+    /// a task that could only report "not connected". Disabled chrome is not
+    /// enough: keyboard submission follows the same guard and must not call the
+    /// app at all.
+    #[test]
+    fn a_disconnected_composer_refuses_without_consuming_input() {
+        let state = AgentPanelState::new();
+        state.input.set("send after reconnect".into());
+        let called = std::cell::Cell::new(false);
+
+        assert!(!try_send_from_composer(state, &|_| {
+            called.set(true);
+            true
+        }));
+        assert!(!called.get());
+        assert_eq!(state.input.get_untracked(), "send after reconnect");
+    }
+
+    /// Connected describes the endpoint, not ownership of the session slot. A
+    /// turn that is still releasing that slot must keep keyboard and button
+    /// submission disabled, or the second task can queue behind a retired turn.
+    #[test]
+    fn an_unavailable_turn_slot_refuses_without_consuming_input() {
+        let state = AgentPanelState::new();
+        state.connected.set(true);
+        state.input.set("wait for the slot".into());
+        let called = std::cell::Cell::new(false);
+
+        assert!(!try_send_from_composer(state, &|_| {
+            called.set(true);
+            true
+        }));
+        assert!(!called.get());
+        assert_eq!(state.input.get_untracked(), "wait for the slot");
     }
 
     #[test]

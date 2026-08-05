@@ -9,6 +9,7 @@
 //! why the XML fallback below is kept rather than deleted as dead code.
 
 use serde_json::Value;
+use std::collections::HashSet;
 
 use smithy_tools::ToolCall;
 
@@ -28,17 +29,11 @@ pub enum Action {
 pub fn parse(c: &Completion) -> Action {
     // 1. Structured path.
     if !c.tool_calls.is_empty() {
-        let mut out = Vec::with_capacity(c.tool_calls.len());
-        for tc in &c.tool_calls {
-            if tc.name.trim().is_empty() {
-                return Action::Malformed("a tool_call had an empty function name".into());
-            }
-            if let Err(e) = tc.parsed_arguments() {
-                return Action::Malformed(e);
-            }
-            out.push(tc.clone());
-        }
-        return Action::Calls(out);
+        // Keep provider-assigned ids even when a name or argument is malformed.
+        // Registry is the dispatch choke point and returns a correlated error;
+        // collapsing the whole completion to `Malformed` discarded every id in
+        // a batch and made structurally valid History impossible.
+        return Action::Calls(normalize_structured_ids(&c.tool_calls));
     }
 
     // 2. Fallback: scrape the content field.
@@ -57,6 +52,30 @@ pub fn parse(c: &Completion) -> Action {
 
     // 3. No tool call anywhere → the model is answering.
     Action::Done(c.content.clone())
+}
+
+fn normalize_structured_ids(calls: &[ToolCall]) -> Vec<ToolCall> {
+    let mut used = HashSet::with_capacity(calls.len());
+    calls
+        .iter()
+        .enumerate()
+        .map(|(index, call)| {
+            let base = if call.id.trim().is_empty() {
+                format!("call_{index}")
+            } else {
+                call.id.clone()
+            };
+            let mut id = base.clone();
+            let mut suffix = 2usize;
+            while !used.insert(id.clone()) {
+                id = format!("{base}_{suffix}");
+                suffix += 1;
+            }
+            let mut normalized = call.clone();
+            normalized.id = id;
+            normalized
+        })
+        .collect()
 }
 
 /// If a `<think>` block was left unclosed and a tool call appears after it,
@@ -313,15 +332,40 @@ mod tests {
         }
     }
 
+    /// Structured calls already have provider ids. Rejecting malformed JSON in
+    /// parse discarded that id, so History could not carry a correlated error.
     #[test]
-    fn malformed_json_args() {
+    fn malformed_structured_arguments_stay_correlatable() {
         let c = Completion {
             tool_calls: vec![ToolCall::new("1", "read", "{not json")],
             ..Default::default()
         };
         match parse(&c) {
-            Action::Malformed(e) => assert!(e.contains("not valid JSON")),
-            other => panic!("expected Malformed, got {other:?}"),
+            Action::Calls(calls) => assert_eq!(calls[0].id, "1"),
+            other => panic!("expected Calls, got {other:?}"),
         }
+    }
+
+    /// Some compatible endpoints emit an empty id for every call, while others
+    /// repeat one provider id across a batch. Replaying either shape gives
+    /// multiple tool results the same correlation key unless normalization
+    /// happens before the assistant message enters append-only History.
+    #[test]
+    fn structured_batches_receive_unique_non_empty_ids() {
+        let completion = Completion {
+            tool_calls: vec![
+                ToolCall::new("", "read", "{}"),
+                ToolCall::new("same", "read", "{}"),
+                ToolCall::new("same", "read", "{}"),
+                ToolCall::new("same_2", "read", "{}"),
+            ],
+            ..Default::default()
+        };
+        let Action::Calls(calls) = parse(&completion) else {
+            panic!("structured calls must remain calls");
+        };
+        let ids: Vec<&str> = calls.iter().map(|call| call.id.as_str()).collect();
+        assert_eq!(ids, ["call_0", "same", "same_2", "same_2_2"]);
+        assert!(ids.iter().all(|id| !id.is_empty()));
     }
 }

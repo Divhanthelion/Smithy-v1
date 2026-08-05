@@ -5,6 +5,8 @@
 
 use floem::peniko::Color;
 use floem::prelude::*;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use smithy_editor::{
     catppuccin, diff_modal, file_browser_view, main_layout_view, spawn_file_watcher, FileDiff,
@@ -40,7 +42,10 @@ pub fn key_debug(where_: &str, ev: &floem::prelude::KeyboardEvent) {
 }
 
 use app_state::{connect_agent, init_state, setup_agent_effect, submit_task};
-use editor::{handle_file_open, handle_tab_click, handle_tab_close, EditorComponent};
+use editor::{
+    commit_close, handle_file_open, handle_tab_click, resolve_close, CloseChoice, CloseIntent,
+    CloseResolution, CloseTarget, EditorComponent,
+};
 use terminal::MultiTerminalComponent;
 
 /// Everything that has to be told to stop, reachable from a signal handler.
@@ -51,19 +56,70 @@ use terminal::MultiTerminalComponent;
 /// shell processes (reached through `smithy_editor::kill_all_shells`).
 struct ExitHooks {
     lsp: smithy_editor::LspHandle,
+    ran: AtomicBool,
 }
 
 impl ExitHooks {
     /// Ask everything to stop. Idempotent, and safe on a signal path.
     fn run(&self) {
+        if self.ran.swap(true, Ordering::AcqRel) {
+            return;
+        }
         // Asks the server to exit rather than killing it: `kill_on_drop` covers
         // the hard case, but it never gets the chance on a signal, and a server
         // told to shut down leaves no lock files or half-written caches behind.
-        self.lsp.shutdown();
+        if !self.lsp.shutdown() {
+            eprintln!("LSP shutdown worker did not acknowledge before exit");
+        }
         // The one leak neither `kill_on_drop` nor the process group covers: a pty
         // child is in its own session, so `Ctrl-C` never reaches it.
         smithy_editor::kill_all_shells();
     }
+}
+
+static EXIT_HOOKS: OnceLock<Arc<ExitHooks>> = OnceLock::new();
+
+fn run_exit_hooks() {
+    if let Some(hooks) = EXIT_HOOKS.get() {
+        hooks.run();
+    }
+}
+
+/// Admit only events from the workspace and server lifetime the UI currently
+/// represents. Status/Ready events are authoritative transitions; diagnostics
+/// and request errors may describe only the already accepted process.
+fn accept_lsp_stamp(
+    project_root: &std::path::Path,
+    accepted: &mut Option<smithy_editor::LspStamp>,
+    incoming: &smithy_editor::LspStamp,
+    authoritative: bool,
+) -> bool {
+    if incoming.root_path != project_root {
+        return false;
+    }
+    let Some(current) = accepted.as_ref() else {
+        *accepted = Some(incoming.clone());
+        return true;
+    };
+    if current.root_path != project_root || incoming.generation > current.generation {
+        *accepted = Some(incoming.clone());
+        return true;
+    }
+    if incoming.generation < current.generation {
+        return false;
+    }
+    if incoming.client_id == current.client_id {
+        return true;
+    }
+    if authoritative || current.client_id.is_none() {
+        *accepted = Some(incoming.clone());
+        return true;
+    }
+    false
+}
+
+fn server_count_for_lsp_status(running: bool) -> usize {
+    usize::from(running)
 }
 
 /// Install a `Ctrl-C` handler that runs the exit hooks before the process dies.
@@ -72,7 +128,7 @@ impl ExitHooks {
 /// `Drop`, no LSP `shutdown`, and every pty shell reparented to `launchd`. Running
 /// from a terminal and quitting with `Ctrl-C` is the normal way this app is used
 /// during development, so it is the normal path, not the exceptional one.
-fn install_signal_handler(hooks: ExitHooks) {
+fn install_signal_handler(hooks: Arc<ExitHooks>) {
     runtime::tokio_runtime().spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
             eprintln!("shutting down…");
@@ -95,16 +151,17 @@ fn main() {
     // Create the Floem application with the main view and set window title
     let config = floem::window::WindowConfig::default().title("Smithy");
     floem::Application::new()
-        .window(|_| app_view(), Some(config))
+        .window(app_view, Some(config))
         .run();
 
-    // The window closed normally. The signal path exits the process itself, so
-    // reaching here means `run()` returned and the hooks have not fired.
-    smithy_editor::kill_all_shells();
+    // Native window close and application termination converge here. The same
+    // idempotent path is used by Ctrl-C, so a platform that reports both cannot
+    // race two shutdown handshakes.
+    run_exit_hooks();
 }
 
 /// Create the main application view
-fn app_view() -> impl IntoView {
+fn app_view(window_id: floem::window::WindowId) -> impl IntoView {
     // Initialize all application state
     let (app_state, signals, agent_state) = init_state();
 
@@ -130,6 +187,8 @@ fn app_view() -> impl IntoView {
     // effect needs it: an external change is only interesting for the file
     // actually on screen.
     let open_editor = floem::reactive::RwSignal::new(None::<smithy_editor::EditorHandle>);
+    let editor_sessions = smithy_editor::EditorSessions::new();
+    let close_intent = floem::reactive::RwSignal::new(None::<CloseIntent>);
     // Raised only when a file changed on disk *and* has unsaved edits, which is
     // the one case where reloading and not reloading both cost something.
     let external_change = floem::reactive::RwSignal::new(None::<smithy_editor::ExternalChange>);
@@ -224,9 +283,12 @@ fn app_view() -> impl IntoView {
 
     // Installed here rather than in `main`, because this is where the LSP handle
     // exists. One handler for the process; `app_view` runs once.
-    install_signal_handler(ExitHooks {
+    let exit_hooks = Arc::new(ExitHooks {
         lsp: app_state.lsp_handle.clone(),
+        ran: AtomicBool::new(false),
     });
+    let _ = EXIT_HOOKS.set(exit_hooks.clone());
+    install_signal_handler(exit_hooks);
 
     // Translate agent events into panel state, then connect in the background.
     setup_agent_effect(agent_state.clone());
@@ -260,6 +322,22 @@ fn app_view() -> impl IntoView {
 
     // --- Hover and go-to-definition ---
     let hover_state = smithy_editor::HoverState::new();
+    // Changes when the semantic workspace changes even if an absolute path and
+    // document revision happen to be identical across the transition.
+    let hover_epoch = floem::reactive::RwSignal::new(0u64);
+
+    {
+        let hover_state = hover_state.clone();
+        floem::reactive::Effect::new(move |_| {
+            let epoch = hover_epoch.get();
+            let document = open_editor.get().map(|handle| smithy_editor::HoverDocument {
+                epoch,
+                path: handle.path.clone(),
+                revision: handle.revision.get(),
+            });
+            hover_state.bind_document(document);
+        });
+    }
 
     // Fire a request at the caret. Both features are the same shape: read the
     // caret, ask the server, wait for the answer on the response channel.
@@ -271,17 +349,25 @@ fn app_view() -> impl IntoView {
                 return;
             };
             let (line, column) = handle.caret_position();
-            hover_state.request_started();
-            lsp_handle.hover(handle.path.clone(), line, column);
+            let document = smithy_editor::HoverDocument {
+                epoch: hover_epoch.get_untracked(),
+                path: handle.path.clone(),
+                revision: handle.revision(),
+            };
+            let request_id = lsp_handle.hover(handle.path.clone(), line, column);
+            hover_state.request_started(request_id, document);
         }
     };
 
     let ask_definition = {
         let lsp_handle = app_state.lsp_handle.clone();
+        let hover_state = hover_state.clone();
         move || {
             let Some(handle) = open_editor.get_untracked() else {
                 return;
             };
+            // Definition supersedes the semantic popup at this caret.
+            hover_state.dismiss();
             let (line, column) = handle.caret_position();
             lsp_handle.goto_definition(handle.path.clone(), line, column);
         }
@@ -349,6 +435,19 @@ fn app_view() -> impl IntoView {
         });
     }
 
+    // The active handle is a pointer into the durable per-tab registry. Tab
+    // switches change focus; they do not recreate documents or discard text.
+    {
+        let sessions = editor_sessions.clone();
+        let active = signals.active_buffer;
+        let editor_version = signals.editor_version;
+        floem::reactive::Effect::new(move |_| {
+            active.get();
+            editor_version.get();
+            open_editor.set(active.get_untracked().and_then(|id| sessions.get(id)));
+        });
+    }
+
     // Center pane: editor, or the call graph. A mode switch rather than a fourth
     // splitter — the layout is already at three panes.
     let cg_ui = agent_state.call_graph;
@@ -381,47 +480,53 @@ fn app_view() -> impl IntoView {
         }
     };
     let buffer_manager_for_editor = app_state.buffer_manager.clone();
-    let editor_view = dyn_container(
-        move || cg_ui.visible.get(),
-        move |show_graph| {
-            if show_graph {
-                let for_build = for_build.clone();
-                call_graph::call_graph_view(
-                    cg_ui,
-                    project_root_sig,
-                    open_from_graph.clone(),
-                    move || call_graph::build(&for_build),
-                )
-                .into_any()
-            } else {
-                // Rebuilt when returning from the graph — same as opening a
-                // file, which already constructs a fresh editor pane.
-                Stack::vertical((
-                    smithy_editor::external_change_bar(
-                        external_change,
-                        move || {
-                            if let Some(handle) = open_editor.get_untracked() {
-                                if let Err(e) = handle.reload_from_disk() {
-                                    eprintln!("{e}");
-                                }
-                            }
-                            external_change.set(None);
-                        },
-                        move || external_change.set(None),
-                    ),
-                    Container::new(editor_component.view(
-                        project_map,
-                        signals.active_buffer,
-                        buffer_manager_for_editor.clone(),
-                        open_editor,
-                    ))
-                    .style(|s| s.flex_grow(1.0).width_full().min_height(0.0)),
-                ))
-                .style(|s| s.width_full().height_full())
-                .into_any()
-            }
-        },
-    )
+    let for_graph_build = for_build.clone();
+    let graph_pane = Container::new(call_graph::call_graph_view(
+        cg_ui,
+        project_root_sig,
+        open_from_graph,
+        move || call_graph::build(&for_graph_build),
+    ))
+    .style(move |s| {
+        let s = s.width_full().height_full();
+        if cg_ui.visible.get() {
+            s
+        } else {
+            s.display(floem::taffy::Display::None)
+        }
+    });
+    let editor_pane = Stack::vertical((
+        smithy_editor::external_change_bar(
+            external_change,
+            move || {
+                if let Some(handle) = open_editor.get_untracked() {
+                    if let Err(e) = handle.reload_from_disk() {
+                        eprintln!("{e}");
+                    }
+                }
+                external_change.set(None);
+            },
+            move || external_change.set(None),
+        ),
+        Container::new(editor_component.view(
+            project_map,
+            signals.active_buffer,
+            buffer_manager_for_editor,
+            open_editor,
+            editor_sessions.clone(),
+            signals.editor_version,
+        ))
+        .style(|s| s.flex_grow(1.0).width_full().min_height(0.0)),
+    ))
+    .style(move |s| {
+        let s = s.width_full().height_full();
+        if cg_ui.visible.get() {
+            s.display(floem::taffy::Display::None)
+        } else {
+            s
+        }
+    });
+    let editor_view = Stack::new((editor_pane, graph_pane))
     .style(|s| s.width_full().height_full().min_height(0.0));
 
     // Create multi-terminal component
@@ -437,15 +542,11 @@ fn app_view() -> impl IntoView {
         let on_send = std::rc::Rc::new(move |task: String| submit_task(&for_send, task));
         // Signals the running turn to stop at its next checkpoint. Returns
         // immediately — the panel leaves `busy` set until the turn reports back
-        // through `AgentUiEvent::Stopped`, so the button reflects the turn
+        // through its stamped terminal event, so the button reflects the turn
         // actually ending rather than the click being registered.
-        let stopper = agent_state.stopper.clone();
+        let lifecycle = agent_state.lifecycle.clone();
         let on_stop = std::rc::Rc::new(move || {
-            if let Ok(s) = stopper.lock() {
-                if let Some(s) = s.as_ref() {
-                    s.stop();
-                }
-            }
+            lifecycle.stop_current_turn();
         });
         let voice = voice_control.clone();
         // Try the endpoint again, for the case the plan did not cover: launching
@@ -454,8 +555,6 @@ fn app_view() -> impl IntoView {
         // started afterwards was unreachable without restarting the editor.
         let for_reconnect = agent_state.clone();
         let on_reconnect = move || {
-            for_reconnect.panel.connected.set(false);
-            for_reconnect.panel.model_label.set("connecting…".into());
             connect_agent(&for_reconnect);
         };
         let settings_dir_for_open = settings_dir.clone();
@@ -530,13 +629,55 @@ fn app_view() -> impl IntoView {
         }
     };
 
-    let on_tab_close = {
+    // Every close gesture first becomes an intent, including clean tabs. Only
+    // this commit closure removes documents and emits didClose.
+    let commit_requested_close = {
         let buffer_manager = app_state.buffer_manager.clone();
         let active_buffer = signals.active_buffer;
         let buffer_states = signals.buffer_states;
+        let editor_version = signals.editor_version;
+        let sessions = editor_sessions.clone();
+        let lsp_handle = app_state.lsp_handle.clone();
+        std::rc::Rc::new(move |intent: CloseIntent| {
+            let target = intent.target;
+            if let Err(refreshed) = commit_close(
+                &intent,
+                &buffer_manager,
+                active_buffer,
+                buffer_states,
+                editor_version,
+                &sessions,
+                &lsp_handle,
+            ) {
+                close_intent.set(Some(refreshed));
+                return;
+            }
+            if target == CloseTarget::Window {
+                // `close_window` bypasses WindowCloseRequested, so confirmation
+                // cannot recurse into another copy of this dialog.
+                floem::close_window(window_id);
+            }
+        })
+    };
 
+    let request_close = {
+        let buffer_manager = app_state.buffer_manager.clone();
+        let sessions = editor_sessions.clone();
+        let commit = commit_requested_close.clone();
+        std::rc::Rc::new(move |target: CloseTarget| {
+            let intent = CloseIntent::new(target, &sessions, &buffer_manager.borrow());
+            if intent.dirty.is_empty() {
+                commit(intent);
+            } else {
+                close_intent.set(Some(intent));
+            }
+        })
+    };
+
+    let on_tab_close = {
+        let request_close = request_close.clone();
         move |id| {
-            handle_tab_close(id, &buffer_manager, active_buffer, buffer_states);
+            request_close(CloseTarget::Tab(id));
         }
     };
 
@@ -549,7 +690,7 @@ fn app_view() -> impl IntoView {
     // headers" for weeks.
     {
         let availability = smithy_editor::lsp::LspRegistry::new(
-            tokio::sync::mpsc::channel::<(String, Vec<smithy_editor::LspDiagnostic>)>(1).0,
+            tokio::sync::mpsc::channel::<smithy_editor::ClientDiagnostics>(1).0,
         )
         .check_server("rust");
         if let Some(advice) = availability.advice() {
@@ -612,6 +753,8 @@ fn app_view() -> impl IntoView {
         let project_for_diags = agent_state.project.clone();
         let inbox = signals.lsp_inbox.clone();
         let lsp_tick = signals.lsp_tick;
+        let accepted_lsp_stamp =
+            std::rc::Rc::new(std::cell::RefCell::new(None::<smithy_editor::LspStamp>));
 
         floem::reactive::Effect::new(move |_| {
             lsp_tick.get();
@@ -625,10 +768,31 @@ fn app_view() -> impl IntoView {
             };
 
             for response in pending {
+                if let Some(stamp) = response.stamp() {
+                    let project_root = project_for_diags.borrow().root.clone();
+                    let authoritative = matches!(
+                        &response,
+                        smithy_editor::LspResponse::Ready { .. }
+                            | smithy_editor::LspResponse::ServerStatus { .. }
+                            | smithy_editor::LspResponse::Error {
+                                request_id: None,
+                                ..
+                            }
+                    );
+                    if !accept_lsp_stamp(
+                        &project_root,
+                        &mut accepted_lsp_stamp.borrow_mut(),
+                        stamp,
+                        authoritative,
+                    ) {
+                        continue;
+                    }
+                }
                 match response {
                     smithy_editor::LspResponse::Diagnostics {
                         path,
                         diagnostics: incoming,
+                        ..
                     } => {
                         let project_root = project_for_diags.borrow().root.clone();
                         // Display paths relative to the project, so rows are readable.
@@ -658,8 +822,8 @@ fn app_view() -> impl IntoView {
                             }
                         }
                     }
-                    smithy_editor::LspResponse::Hover { result, .. } => {
-                        hover_state.show(result.map(|h| h.contents));
+                    smithy_editor::LspResponse::Hover { request_id, result } => {
+                        hover_state.show(request_id, result.map(|h| h.contents));
                     }
                     smithy_editor::LspResponse::GotoDefinition {
                         location: Some((path, line, column)),
@@ -670,14 +834,35 @@ fn app_view() -> impl IntoView {
                     // A dead language server used to be invisible unless you had
                     // launched from a terminal and were reading stderr. The
                     // Problems panel already has somewhere to say so.
-                    smithy_editor::LspResponse::Error { message, .. } => {
+                    smithy_editor::LspResponse::Error {
+                        request_id: Some(request_id),
+                        ..
+                    } => {
+                        // A request-scoped error is not evidence that the
+                        // language server died. In particular, one failed hover
+                        // must not erase the global ready state.
+                        hover_state.fail(request_id);
+                    }
+                    smithy_editor::LspResponse::Error {
+                        request_id: None,
+                        message,
+                        ..
+                    } => {
                         diagnostics.server_status.set(Some(message));
                         diagnostics.server_count.set(0);
                     }
                     // So an empty panel can say which kind of empty it is.
-                    smithy_editor::LspResponse::Ready { servers } => {
+                    smithy_editor::LspResponse::Ready { servers, .. } => {
                         diagnostics.server_count.set(servers);
                         diagnostics.server_status.set(None);
+                    }
+                    smithy_editor::LspResponse::ServerStatus { running, .. } => {
+                        diagnostics
+                            .server_count
+                            .set(server_count_for_lsp_status(running));
+                        if running {
+                            diagnostics.server_status.set(None);
+                        }
                     }
                     _ => {}
                 }
@@ -709,7 +894,7 @@ fn app_view() -> impl IntoView {
                     smithy_editor::accel("O"),
                     {
                         let agent_state = agent_state.clone();
-                        move || open_project_dialog(&agent_state)
+                        move || open_project_dialog(&agent_state, hover_epoch)
                     },
                 ),
                 smithy_editor::MenuItem::action_with(
@@ -717,11 +902,9 @@ fn app_view() -> impl IntoView {
                     smithy_editor::accel("S"),
                     move || {
                         if let Some(handle) = open_editor.get_untracked() {
-                            if let Err(e) = handle.save() {
-                                eprintln!("{e}");
+                            if save_editor(&handle, external_change) {
+                                editor_version.update(|version| *version += 1);
                             }
-                            // Saving answers the question the bar was asking.
-                            external_change.set(None);
                         }
                     },
                 ),
@@ -735,7 +918,7 @@ fn app_view() -> impl IntoView {
                     let root = recent.root.clone();
                     items.push(smithy_editor::MenuItem::action(
                         recent.name.clone(),
-                        move || switch_project(&agent_state, root.clone()),
+                        move || switch_project(&agent_state, root.clone(), hover_epoch),
                     ));
                 }
             }
@@ -851,11 +1034,7 @@ fn app_view() -> impl IntoView {
                 }),
                 smithy_editor::MenuItem::action("Reconnect", {
                     let agent_state = agent_state.clone();
-                    move || {
-                        agent_state.panel.connected.set(false);
-                        agent_state.panel.model_label.set("connecting…".into());
-                        connect_agent(&agent_state);
-                    }
+                    move || connect_agent(&agent_state)
                 }),
             ],
         ),
@@ -906,8 +1085,9 @@ fn app_view() -> impl IntoView {
         let meter_tick = smithy_editor::tick::every(meters::MEMORY_INTERVAL);
         let balance_cache = agent_state.balance.clone();
         let panel = agent_state.panel;
-        let session = agent_state.session.clone();
+        let lifecycle = agent_state.lifecycle.clone();
         let settings_dir = settings_dir.clone();
+        let usage_cache = agent_state.usage_cache.clone();
 
         floem::reactive::Effect::new(move |_| {
             meter_tick.get();
@@ -929,8 +1109,9 @@ fn app_view() -> impl IntoView {
             let spend = meters::spend_now(
                 &settings_dir,
                 &panel.model_label.get_untracked(),
-                &session,
+                lifecycle.current_session().as_ref(),
                 &balance_cache,
+                &usage_cache,
             );
             status.spend.set(spend.render());
             status.spend_warn.set(spend.is_low());
@@ -962,7 +1143,7 @@ fn app_view() -> impl IntoView {
         let agent_for_pick = agent_state.clone();
         floem::reactive::Effect::new(move |_| {
             if let Some(dir) = project_pick_signal.get() {
-                switch_project(&agent_for_pick, dir);
+                switch_project(&agent_for_pick, dir, hover_epoch);
             }
         });
     }
@@ -1045,13 +1226,8 @@ fn app_view() -> impl IntoView {
                 if key_event.key == floem::prelude::Key::Character("s".into()) && cmd {
                     handled = true;
                     if let Some(handle) = open_editor.get_untracked() {
-                        match handle.save() {
-                            Ok(()) => {
-                                editor_version.update(|v| *v += 1);
-                                // Saving answers the question the bar was asking.
-                                external_change.set(None);
-                            }
-                            Err(e) => eprintln!("{e}"),
+                        if save_editor(&handle, external_change) {
+                            editor_version.update(|v| *v += 1);
                         }
                     }
                 }
@@ -1142,19 +1318,6 @@ fn app_view() -> impl IntoView {
     // Diff review modal: raised whenever the write-review hook queues a change
     // instead of letting it land on disk.
     let current_diff = agent_state.review.current;
-    // The **live** project, not a snapshot of its root.
-    //
-    // This was `agent_state.project.borrow().root.clone()`, captured once here at
-    // view construction. Accepting a review then wrote through a `Workspace` rooted
-    // at whichever project the app had *started* in — so a README accepted while
-    // working in another project overwrote this repo's own README, and the damage
-    // was committed by a later `git add -A`. Confirmed against the git history, not
-    // inferred.
-    //
-    // Third instance of this exact mistake: the diagnostics root and the
-    // language-server root were both startup snapshots too. Anything derived from
-    // `agent_state.project` must be read at the moment it is used.
-    let review_project = agent_state.project.clone();
     let pending_changes = agent_state.review.pending.clone();
 
     // Resolve the reviewed change and surface the next queued one, if any.
@@ -1175,7 +1338,8 @@ fn app_view() -> impl IntoView {
     //
     // The tool call is suspended inside `WriteReviewHook`, so the answer goes
     // back as *its* result — that is the whole point of the blocking gate, and
-    // why this takes the `tool_call_id`. `outcomes` is now only the fallback for
+    // why this takes the lifecycle-qualified registration id. `outcomes` is now
+    // only the fallback for
     // a decision nobody is waiting on (a review abandoned by a project switch,
     // or one whose turn has already ended), where the next turn's preamble is
     // still the only way to say what happened.
@@ -1183,8 +1347,13 @@ fn app_view() -> impl IntoView {
         let panel = agent_state.panel;
         let outcomes = agent_state.review.outcomes.clone();
         let review = agent_state.review.clone();
-        move |id: &str, path: &str, accepted: usize, total: usize| {
-            let note = agent::describe_review_outcome(path, accepted, total);
+        move |id: &str,
+              path: &str,
+              accepted: usize,
+              total: usize,
+              exact_message: Option<String>| {
+            let note = exact_message
+                .unwrap_or_else(|| agent::describe_review_outcome(path, accepted, total));
             panel.push(smithy_editor::AgentEntry::Notice(note.clone()));
 
             let delivered = review.respond(
@@ -1201,31 +1370,63 @@ fn app_view() -> impl IntoView {
     };
 
     let on_diff_accept = {
-        let project = review_project.clone();
+        let lifecycle = agent_state.lifecycle.clone();
+        let sessions = editor_sessions.clone();
         let advance_queue = advance_queue.clone();
         let record_outcome = record_outcome.clone();
-        move |diff: FileDiff, statuses: Vec<smithy_editor::ChangeStatus>| {
-            let Some(id) = current_diff.get_untracked().map(|c| c.id) else {
+        move |_diff: FileDiff, statuses: Vec<smithy_editor::ChangeStatus>| {
+            let Some(change) = current_diff.get_untracked() else {
                 return;
             };
-            let total = diff.hunks.len();
+            let id = change.id.clone();
+            let total = change.diff.hunks.len();
             let accepted = statuses
                 .iter()
                 .filter(|s| **s == smithy_editor::ChangeStatus::Accepted)
                 .count();
-            let content = smithy_editor::content_with_accepted_hunks(&diff, &statuses);
+            let content =
+                smithy_editor::content_with_accepted_hunks(&change.diff, &statuses);
 
-            // Through the workspace capability, not a joined path — an accepted
-            // diff is still a model-supplied path and gets the same confinement
-            // every other write does.
-            let root = project.borrow().root.clone();
-            match agent::apply_change(&root, &diff.path, &content) {
-                Ok(()) => record_outcome(&id, &diff.path, accepted, total),
+            let result = if accepted == 0 {
+                Ok(())
+            } else if lifecycle.accepts_review(&change.key) {
+                let lifecycle_for_publication = lifecycle.clone();
+                let key = change.key.clone();
+                agent::apply_change_authorized(&change, &content, &sessions, move || {
+                    if lifecycle_for_publication.accepts_review(&key) {
+                        Ok(())
+                    } else {
+                        Err(
+                            "the review expired immediately before publication because its agent \
+                             generation or turn is no longer current"
+                                .into(),
+                        )
+                    }
+                })
+            } else {
+                Err(agent::ReviewApplyFailure::before(format!(
+                    "the review of `{}` expired because its agent generation or turn is no longer \
+                     current. Nothing was written; re-read the file and reissue the change for \
+                     review.",
+                    change.path()
+                )))
+            };
+            match result {
+                Ok(()) => {
+                    let exact =
+                        (accepted > 0 && accepted == total).then(|| change.success_message.clone());
+                    record_outcome(&id, change.path(), accepted, total, exact)
+                }
                 Err(e) => {
-                    eprintln!("could not apply the accepted change to {}: {e}", diff.path);
-                    // The write failed, so nothing landed. Telling the model it
-                    // was accepted would be a lie it then edits against.
-                    record_outcome(&id, &diff.path, 0, total);
+                    eprintln!("could not apply the accepted change to {}: {e}", change.path());
+                    let applied = if e.published { accepted } else { 0 };
+                    record_outcome(
+                        &id,
+                        change.path(),
+                        applied,
+                        total,
+                        Some(e.to_string()),
+                    );
                 }
             }
             advance_queue(id);
@@ -1237,7 +1438,13 @@ fn app_view() -> impl IntoView {
         let record_outcome = record_outcome.clone();
         move || {
             if let Some(change) = current_diff.get_untracked() {
-                record_outcome(&change.id, change.path(), 0, change.diff.hunks.len());
+                record_outcome(
+                    &change.id,
+                    change.path(),
+                    0,
+                    change.diff.hunks.len(),
+                    None,
+                );
                 advance_queue(change.id);
             }
         }
@@ -1249,8 +1456,103 @@ fn app_view() -> impl IntoView {
     let on_diff_close = {
         move || {
             if let Some(change) = current_diff.get_untracked() {
-                record_outcome(&change.id, change.path(), 0, change.diff.hunks.len());
+                record_outcome(
+                    &change.id,
+                    change.path(),
+                    0,
+                    change.diff.hunks.len(),
+                    None,
+                );
                 advance_queue(change.id);
+            }
+        }
+    };
+
+    let keep_editing_after_close = {
+        let buffer_manager = app_state.buffer_manager.clone();
+        let sessions = editor_sessions.clone();
+        move || {
+            if let Some(intent) = close_intent.get_untracked() {
+                let _ = resolve_close(
+                    &intent,
+                    CloseChoice::KeepEditing,
+                    &sessions,
+                    &buffer_manager.borrow(),
+                );
+            }
+            close_intent.set(None);
+        }
+    };
+    let save_and_close = {
+        let buffer_manager = app_state.buffer_manager.clone();
+        let sessions = editor_sessions.clone();
+        let commit = commit_requested_close.clone();
+        move || {
+            let Some(intent) = close_intent.get_untracked() else {
+                return;
+            };
+            match resolve_close(
+                &intent,
+                CloseChoice::SaveAndClose,
+                &sessions,
+                &buffer_manager.borrow(),
+            ) {
+                CloseResolution::Commit(current) => {
+                    close_intent.set(None);
+                    commit(current);
+                }
+                CloseResolution::KeepOpen => close_intent.set(None),
+                CloseResolution::Refresh(current) => close_intent.set(Some(current)),
+            }
+        }
+    };
+    let discard_and_close = {
+        let buffer_manager = app_state.buffer_manager.clone();
+        let sessions = editor_sessions.clone();
+        let commit = commit_requested_close.clone();
+        move || {
+            let Some(intent) = close_intent.get_untracked() else {
+                return;
+            };
+            match resolve_close(
+                &intent,
+                CloseChoice::DiscardAndClose,
+                &sessions,
+                &buffer_manager.borrow(),
+            ) {
+                CloseResolution::Commit(current) => {
+                    close_intent.set(None);
+                    commit(current);
+                }
+                CloseResolution::Refresh(current) => close_intent.set(Some(current)),
+                CloseResolution::KeepOpen => close_intent.set(None),
+            }
+        }
+    };
+    let reload_close_conflict = {
+        let buffer_manager = app_state.buffer_manager.clone();
+        let sessions = editor_sessions.clone();
+        move || {
+            let Some(mut pending) = close_intent.get_untracked() else {
+                return;
+            };
+            let Some(id) = pending.conflict else {
+                return;
+            };
+            let result = sessions
+                .get(id)
+                .ok_or_else(|| "the conflicted editor is no longer open".to_string())
+                .and_then(|handle| handle.reload_from_disk());
+            match result {
+                Ok(()) => {
+                    let refreshed =
+                        CloseIntent::new(pending.target, &sessions, &buffer_manager.borrow());
+                    close_intent.set((!refreshed.dirty.is_empty()).then_some(refreshed));
+                }
+                Err(error) => {
+                    pending.error = Some(error);
+                    close_intent.set(Some(pending));
+                }
             }
         }
     };
@@ -1310,41 +1612,40 @@ fn app_view() -> impl IntoView {
         // Above the shell so dropdowns paint over the editor, below the modals
         // so a modal still takes precedence.
         menu_overlay,
+        close_confirmation_modal(
+            close_intent,
+            keep_editing_after_close,
+            save_and_close,
+            discard_and_close,
+            reload_close_conflict,
+        ),
         diff_modal(current_diff, on_diff_accept, on_diff_reject, on_diff_close),
-        shell_approval_modal(agent_state.shell_approval, agent_state.shell_inbox.clone()),
+        shell_approval_modal(
+            agent_state.shell_approval,
+            agent_state.shell_inbox.clone(),
+            agent_state.lifecycle.clone(),
+        ),
         smithy_editor::settings_modal(
             settings_state,
             {
                 // Saving reconnects, because a backend you selected and did not
                 // connect to is not a setting that has taken effect.
                 //
-                // A *different* provider, model, or URL starts a fresh session —
-                // replaying the previous model's transcript into a new one left
-                // the chat looking unchanged aside from a "Connected · …" notice,
-                // which is how a model switch used to look like it did nothing.
-                // Same endpoint → reconnect and resume, the way the header's
-                // Reconnect does.
+                // The reconnect path compares the complete persistence binding.
+                // A different provider/model/account/schema either resumes the
+                // newest exact match (when switching back) or starts fresh with
+                // a Notice naming the mismatch. Bypassing that path here made a
+                // model switch look like silent data loss.
                 let agent_state = agent_state.clone();
                 let dir = settings_dir.clone();
                 move || {
-                    let previous = smithy_agent::AgentConfig::load(&dir);
                     match settings::save(settings_state, &dir) {
                         Ok(warnings) => {
                             settings_state.close();
                             for warning in &warnings {
                                 eprintln!("[settings] {warning}");
                             }
-                            let next = smithy_agent::AgentConfig::load(&dir);
-                            let switched = previous.provider != next.provider
-                                || previous.active().model != next.active().model
-                                || previous.active().base_url != next.active().base_url;
-                            if switched {
-                                app_state::clear_context(&agent_state);
-                            } else {
-                                agent_state.panel.connected.set(false);
-                                agent_state.panel.model_label.set("connecting…".into());
-                                connect_agent(&agent_state);
-                            }
+                            connect_agent(&agent_state);
                         }
                         Err(e) => settings_state.report(e, true),
                     }
@@ -1362,6 +1663,226 @@ fn app_view() -> impl IntoView {
         ),
     ))
     .style(|s| s.width_full().height_full())
+    .on_event_with_config(
+        floem::event::listener::KeyDown,
+        floem::context::EventCallbackConfig {
+            phases: floem::context::Phases::CAPTURE,
+        },
+        move |_, event| {
+            if close_intent.get_untracked().is_none() {
+                return floem::event::EventPropagation::Continue;
+            }
+            if event.key == floem::prelude::Key::Named(floem::prelude::NamedKey::Escape) {
+                close_intent.set(None);
+            }
+            // The close overlay is modal. This root capture also covers the one
+            // frame before Floem can transfer focus from the editor to dialog.
+            floem::event::EventPropagation::Stop
+        },
+    )
+    .on_event_cont(
+        floem::event::listener::WindowCloseRequested,
+        move |cx, _| {
+            // Always intercept the native request. Clean windows commit and
+            // close immediately; dirty windows leave an explicit intent on
+            // screen. The confirmed path uses unconditional `close_window`.
+            cx.prevent_default();
+            request_close(CloseTarget::Window);
+        },
+    )
+}
+
+/// Save through the editor's immutable disk base and surface stale-base
+/// conflicts in the existing reload/manual-resolution bar.
+fn save_editor(
+    handle: &smithy_editor::EditorHandle,
+    external_change: RwSignal<Option<smithy_editor::ExternalChange>>,
+) -> bool {
+    match handle.save() {
+        Ok(()) => {
+            external_change.set(None);
+            true
+        }
+        Err(error) if error.is_conflict() => {
+            external_change.set(Some(smithy_editor::ExternalChange {
+                label: handle.path.display().to_string(),
+            }));
+            false
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            false
+        }
+    }
+}
+
+/// Unsaved-work confirmation shared by tab and native window close.
+fn close_confirmation_modal(
+    intent: RwSignal<Option<CloseIntent>>,
+    on_keep: impl Fn() + 'static,
+    on_save: impl Fn() + 'static,
+    on_discard: impl Fn() + 'static,
+    on_reload: impl Fn() + 'static,
+) -> impl IntoView {
+    let on_keep = std::rc::Rc::new(on_keep);
+    let on_save = std::rc::Rc::new(on_save);
+    let on_discard = std::rc::Rc::new(on_discard);
+    let on_reload = std::rc::Rc::new(on_reload);
+
+    Container::new(dyn_container(
+        move || intent.get(),
+        move |pending| {
+            let Some(pending) = pending else {
+                return Box::new(Empty::new().style(|s| s.display(floem::taffy::Display::None)))
+                    as Box<dyn View>;
+            };
+            let count = pending.dirty.len();
+            let title = match pending.target {
+                CloseTarget::Tab(_) => "Close this tab?".to_string(),
+                CloseTarget::Window => {
+                    format!("Close the window with {count} unsaved file{}?", if count == 1 { "" } else { "s" })
+                }
+            };
+            let error = pending.error.clone();
+            let keep = on_keep.clone();
+            let keep_for_key = on_keep.clone();
+            let save = on_save.clone();
+            let discard = on_discard.clone();
+            let reload = on_reload.clone();
+            let conflict = pending.conflict;
+
+            let dialog = Stack::vertical((
+                    Label::new(title).style(|s| {
+                        s.color(catppuccin::TEXT)
+                            .font_size(smithy_editor::design::TEXT_LG)
+                            .font_bold()
+                            .margin_bottom(smithy_editor::design::SPACE_3)
+                    }),
+                    Label::new("Unsaved edits will be lost only if you explicitly discard them.")
+                        .style(|s| {
+                            s.color(catppuccin::SUBTEXT0)
+                                .font_size(smithy_editor::design::TEXT_SM)
+                                .margin_bottom(smithy_editor::design::SPACE_4)
+                        }),
+                    dyn_container(
+                        move || error.clone(),
+                        move |message| {
+                            if let Some(message) = message {
+                                Box::new(Label::new(message).style(|s| {
+                                    s.color(catppuccin::RED)
+                                        .font_size(smithy_editor::design::TEXT_SM)
+                                        .margin_bottom(smithy_editor::design::SPACE_4)
+                                })) as Box<dyn View>
+                            } else {
+                                Box::new(
+                                    Empty::new()
+                                        .style(|s| s.display(floem::taffy::Display::None)),
+                                ) as Box<dyn View>
+                            }
+                        },
+                    ),
+                    dyn_container(
+                        move || conflict,
+                        move |conflict| {
+                            if conflict.is_some() {
+                                let reload = reload.clone();
+                                Box::new(
+                                    Button::new("Reload conflicted file from disk")
+                                        .on_event_stop(
+                                            floem::event::listener::Click,
+                                            move |_, _| reload(),
+                                        )
+                                        .style(|s| {
+                                            s.background(catppuccin::YELLOW)
+                                                .color(catppuccin::BASE)
+                                                .padding_horiz(16.0)
+                                                .padding_vert(8.0)
+                                                .border_radius(
+                                                    smithy_editor::design::RADIUS_SM,
+                                                )
+                                                .margin_bottom(
+                                                    smithy_editor::design::SPACE_4,
+                                                )
+                                        }),
+                                ) as Box<dyn View>
+                            } else {
+                                Box::new(
+                                    Empty::new()
+                                        .style(|s| s.display(floem::taffy::Display::None)),
+                                ) as Box<dyn View>
+                            }
+                        },
+                    ),
+                    Stack::horizontal((
+                        Button::new("Keep editing")
+                            .on_event_stop(floem::event::listener::Click, move |_, _| keep())
+                            .style(|s| {
+                                s.background(catppuccin::SURFACE0)
+                                    .color(catppuccin::TEXT)
+                                    .padding_horiz(16.0)
+                                    .padding_vert(8.0)
+                                    .border_radius(smithy_editor::design::RADIUS_SM)
+                            }),
+                        Container::new(Empty::new()).style(|s| s.flex_grow(1.0)),
+                        Button::new("Discard and close")
+                            .on_event_stop(floem::event::listener::Click, move |_, _| discard())
+                            .style(|s| {
+                                s.background(catppuccin::SURFACE0)
+                                    .color(catppuccin::RED)
+                                    .padding_horiz(16.0)
+                                    .padding_vert(8.0)
+                                    .border_radius(smithy_editor::design::RADIUS_SM)
+                            }),
+                        Button::new("Save and close")
+                            .on_event_stop(floem::event::listener::Click, move |_, _| save())
+                            .style(|s| {
+                                s.background(catppuccin::GREEN)
+                                    .color(catppuccin::BASE)
+                                    .padding_horiz(16.0)
+                                    .padding_vert(8.0)
+                                    .border_radius(smithy_editor::design::RADIUS_SM)
+                                    .margin_left(8.0)
+                            }),
+                    ))
+                    .style(|s| s.width_full().items_center()),
+                ))
+                .style(|s| {
+                    s.width(620.0)
+                        .padding(24.0)
+                        .background(catppuccin::BASE)
+                        .border(1.0)
+                        .border_color(catppuccin::SURFACE1)
+                        .border_radius(smithy_editor::design::RADIUS_LG)
+                        .keyboard_navigable()
+                })
+                // Focus is moved off the editor as soon as the dialog mounts.
+                // Without this, typing continued to mutate a document hidden
+                // behind the interaction-blocking backdrop.
+                .on_event_stop(floem::event::listener::KeyDown, move |_, event| {
+                    if event.key
+                        == floem::prelude::Key::Named(floem::prelude::NamedKey::Escape)
+                    {
+                        keep_for_key();
+                    }
+                });
+            let dialog_id = dialog.id();
+            floem::action::exec_after_animation_frame(move |_| dialog_id.request_focus());
+
+            Box::new(dialog) as Box<dyn View>
+        },
+    ))
+    .style(move |s| {
+        if intent.get().is_some() {
+            s.absolute()
+                .inset(0.0)
+                .background(Color::from_rgba8(0, 0, 0, 204))
+                .items_center()
+                .justify_center()
+                .z_index(500)
+        } else {
+            s.display(floem::taffy::Display::None)
+        }
+    })
 }
 
 /// Confirmation modal for shell commands the AI wants to run.
@@ -1372,6 +1893,7 @@ fn app_view() -> impl IntoView {
 fn shell_approval_modal(
     request: RwSignal<Option<app_state::ShellApprovalRequest>>,
     queued: app_state::Inbox<app_state::ShellApprovalRequest>,
+    lifecycle: app_state::AgentLifecycle,
 ) -> impl IntoView {
     // Answering shows the next request rather than clearing the slot. A turn can
     // dispatch two `bash` calls at once, and the second used to be dropped by the
@@ -1380,7 +1902,16 @@ fn shell_approval_modal(
     // `Rc`, not `Arc`: this never leaves floem's UI thread, and `dyn_container`
     // rebuilds its child per request so both buttons need a callable copy each
     // time.
-    let advance = std::rc::Rc::new(move || request.set(app_state::pop(&queued)));
+    let advance = std::rc::Rc::new(move || {
+        while let Some(next) = app_state::pop(&queued) {
+            if lifecycle.accepts_event(&next.stamp) {
+                request.set(Some(next));
+                return;
+            }
+            next.abandon();
+        }
+        request.set(None);
+    });
 
     Container::new(dyn_container(
         move || request.get(),
@@ -1500,11 +2031,11 @@ fn refresh_project_map(agent: &app_state::AgentState, map: floem::reactive::RwSi
 }
 
 /// Ask for a directory, then ground the agent in it.
-fn open_project_dialog(agent: &app_state::AgentState) {
+fn open_project_dialog(agent: &app_state::AgentState, hover_epoch: RwSignal<u64>) {
     let Some(dir) = smithy_editor::file_dialog::pick_folder() else {
         return;
     };
-    switch_project(agent, dir);
+    switch_project(agent, dir, hover_epoch);
 }
 
 /// Re-ground the agent in a different project.
@@ -1513,7 +2044,11 @@ fn open_project_dialog(agent: &app_state::AgentState) {
 /// description lives in the system prompt, which is frozen for the life of a
 /// session — rewriting it in place would invalidate the model's prefix cache and
 /// silently make every subsequent turn pay a full cold prefill.
-fn switch_project(agent: &app_state::AgentState, root: std::path::PathBuf) {
+fn switch_project(
+    agent: &app_state::AgentState,
+    root: std::path::PathBuf,
+    hover_epoch: RwSignal<u64>,
+) {
     let project = match smithy_project::Project::discover(&root)
         .or_else(|_| smithy_project::Project::open(&root))
     {
@@ -1524,21 +2059,17 @@ fn switch_project(agent: &app_state::AgentState, root: std::path::PathBuf) {
         }
     };
 
+    // Retire the old generation before any project-relative state moves. A
+    // turn can still be unwinding on the runtime, but from this point its
+    // events, reviews and approvals no longer belong to the visible project.
+    let session_transition =
+        app_state::begin_project_transition(agent, project.root.clone());
+    hover_epoch.update(|epoch| *epoch = epoch.wrapping_add(1));
+
     let _ = agent.registry.touch(&project.root, &project.name);
     *agent.sessions.borrow_mut() =
         smithy_agent::SessionStore::new(agent.registry.sessions_dir(&project.root)).ok();
     *agent.session_id.borrow_mut() = app_state::new_session_id();
-
-    // **Before** the root moves.
-    //
-    // A queued review holds a workspace-relative path and is written through
-    // whichever root is live when it is accepted. Leaving one queued across a
-    // switch therefore aims it at the new project — `README.md` proposed in one
-    // repository, written into the next — and the sandbox permits it, because
-    // that path is legitimate there. This is the same shape as the accident that
-    // overwrote this repository's own README, and reading the root live (which
-    // is right, and stays) is what makes it reachable.
-    agent.review.abandon();
 
     *agent.project.borrow_mut() = project.clone();
 
@@ -1579,10 +2110,10 @@ fn switch_project(agent: &app_state::AgentState, root: std::path::PathBuf) {
     agent.diagnostics.server_count.set(0);
 
     agent.panel.clear();
-    agent.panel.connected.set(false);
     // Attachments are named relative to the project root, and a chip left over
     // from the previous one would be labelled against a tree it does not live
-    // in — the same class of mistake `review.abandon` above exists to prevent.
+    // in — the same class of mistake the transition's review abandonment exists
+    // to prevent.
     agent.panel.clear_attachments();
     agent.panel.project_root.set(project.root.clone());
     // The map behind an empty editor belongs to the project, so it moves too.
@@ -1596,5 +2127,71 @@ fn switch_project(agent: &app_state::AgentState, root: std::path::PathBuf) {
         .panel
         .model_label
         .set(format!("opening {}…", project.name));
-    app_state::connect_agent(agent);
+    app_state::finish_project_transition(agent, session_transition);
+}
+
+#[cfg(test)]
+mod lsp_stamp_tests {
+    use super::*;
+
+    fn stamp(root: &str, generation: u64, client: u64) -> smithy_editor::LspStamp {
+        smithy_editor::LspStamp {
+            root_path: std::path::PathBuf::from(root),
+            generation,
+            client_id: Some(client),
+        }
+    }
+
+    /// Project switch clears the Problems panel, but an old-root diagnostic
+    /// could previously arrive afterward and repopulate it.
+    #[test]
+    fn an_old_root_diagnostic_is_discarded_after_project_switch() {
+        let mut accepted = Some(stamp("/old", 3, 8));
+        assert!(!accept_lsp_stamp(
+            std::path::Path::new("/new"),
+            &mut accepted,
+            &stamp("/old", 3, 8),
+            false,
+        ));
+    }
+
+    /// A newer initialize intent wins even at the same root; delayed Ready and
+    /// diagnostics from its predecessor cannot roll the panel backward.
+    #[test]
+    fn an_old_generation_cannot_replace_the_current_lsp_status() {
+        let mut accepted = Some(stamp("/project", 9, 22));
+        assert!(!accept_lsp_stamp(
+            std::path::Path::new("/project"),
+            &mut accepted,
+            &stamp("/project", 8, 21),
+            true,
+        ));
+    }
+
+    /// Replacement status changes the accepted client identity. Diagnostics
+    /// already queued by the crashed client are rejected afterward.
+    #[test]
+    fn stale_client_diagnostics_cannot_repopulate_the_cleared_panel() {
+        let mut accepted = Some(stamp("/project", 4, 11));
+        assert!(accept_lsp_stamp(
+            std::path::Path::new("/project"),
+            &mut accepted,
+            &stamp("/project", 4, 12),
+            true,
+        ));
+        assert!(!accept_lsp_stamp(
+            std::path::Path::new("/project"),
+            &mut accepted,
+            &stamp("/project", 4, 11),
+            false,
+        ));
+    }
+
+    /// Exhausting restart attempts is a disconnected status, not a log-only
+    /// event that leaves the Problems panel claiming one healthy server.
+    #[test]
+    fn exhausted_retries_zero_the_healthy_server_count() {
+        assert_eq!(server_count_for_lsp_status(false), 0);
+        assert_eq!(server_count_for_lsp_status(true), 1);
+    }
 }

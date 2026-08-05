@@ -50,7 +50,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use smithy_tools::registry::{Tool, ToolCtx};
 use smithy_tools::schema::{arg_str, arg_str_opt, ToolDefinition, ToolOutput, ToolParameter};
-use smithy_tools::{Registry, Workspace};
+use smithy_tools::{ExecutionControl, Registry, Workspace};
 
 use crate::limits::Limits;
 use crate::provider::{Provider, Sampling};
@@ -130,6 +130,62 @@ impl Explore {
             tool_result_warn_chars: crate::limits::tool_result_warn_for_window(CONTEXT_HARD),
         }
     }
+
+    async fn run_inner(
+        &self,
+        args: &Value,
+        parent_control: Option<&ExecutionControl>,
+    ) -> ToolOutput {
+        let question = match arg_str(args, "question") {
+            Ok(q) => q.trim(),
+            Err(e) => return ToolOutput::err(e),
+        };
+        if question.is_empty() {
+            return ToolOutput::err("the question is empty");
+        }
+
+        let workspace = match Workspace::open(&self.root) {
+            Ok(w) => w,
+            Err(e) => return ToolOutput::err(format!("cannot open the workspace: {e}")),
+        };
+        let ctx = Arc::new(ToolCtx::new(workspace));
+        let mut config = SessionConfig::new(system_prompt(&self.root));
+        config.limits = self.limits();
+        config.sampling = self.sampling.clone();
+        let mut session = Session::new(
+            self.provider.clone(),
+            self.registry.clone(),
+            ctx,
+            config,
+        );
+        let task = match arg_str_opt(args, "context").map(str::trim) {
+            Some(c) if !c.is_empty() => {
+                format!("{question}\n\nWhat the caller already knows:\n{c}")
+            }
+            _ => question.to_string(),
+        };
+
+        let outcome = match parent_control {
+            Some(parent) => {
+                let control = parent.bounded_by(std::time::Duration::from_secs(MAX_SECONDS));
+                session.run_turn_controlled(&task, None, control).await
+            }
+            None => session.run_turn(&task, None).await,
+        };
+        match outcome {
+            Ok(Outcome::Answer(answer)) if answer.trim().is_empty() => ToolOutput::err(
+                "the sub-agent returned nothing. Investigate directly with `grep` and `read`."
+                    .to_string(),
+            ),
+            Ok(Outcome::Answer(answer)) => ToolOutput::ok(answer),
+            Ok(Outcome::Stopped(reason)) => ToolOutput::ok(format!(
+                "[Partial: the sub-agent stopped before answering — {reason}. It produced no \
+                 findings. Do not call `explore` again for this; narrow the question or \
+                 investigate directly with `grep` and `read`.]"
+            )),
+            Err(e) => ToolOutput::err(format!("the sub-agent failed: {e}")),
+        }
+    }
 }
 
 #[async_trait]
@@ -171,61 +227,16 @@ impl Tool for Explore {
     }
 
     async fn run(&self, args: &Value, _ctx: &ToolCtx) -> ToolOutput {
-        let question = match arg_str(args, "question") {
-            Ok(q) => q.trim(),
-            Err(e) => return ToolOutput::err(e),
-        };
-        if question.is_empty() {
-            return ToolOutput::err("the question is empty");
-        }
+        self.run_inner(args, None).await
+    }
 
-        // A fresh workspace and a fresh todo list per exploration. Sharing the
-        // parent's `ToolCtx` would let a sub-agent rewrite the main agent's plan
-        // as a side effect of being asked a question.
-        let workspace = match Workspace::open(&self.root) {
-            Ok(w) => w,
-            Err(e) => return ToolOutput::err(format!("cannot open the workspace: {e}")),
-        };
-        let ctx = Arc::new(ToolCtx::new(workspace));
-
-        let mut config = SessionConfig::new(system_prompt(&self.root));
-        config.limits = self.limits();
-        config.sampling = self.sampling.clone();
-
-        let mut session = Session::new(
-            self.provider.clone(),
-            self.registry.clone(),
-            ctx,
-            config,
-        );
-
-        let task = match arg_str_opt(args, "context").map(str::trim) {
-            Some(c) if !c.is_empty() => {
-                format!("{question}\n\nWhat the caller already knows:\n{c}")
-            }
-            _ => question.to_string(),
-        };
-
-        // No event sink: the sub-agent's steps are exactly what this tool exists
-        // to keep out of the parent's view.
-        match session.run_turn(&task, None).await {
-            Ok(Outcome::Answer(answer)) if answer.trim().is_empty() => ToolOutput::err(
-                "the sub-agent returned nothing. Investigate directly with `grep` and `read`."
-                    .to_string(),
-            ),
-            Ok(Outcome::Answer(answer)) => ToolOutput::ok(answer),
-            // `Outcome::Stopped` carries the reason, not the work — the
-            // sub-agent's partial findings are in a history that is about to be
-            // dropped. So this reports the failure honestly rather than dressing
-            // it up as a thin answer, and names the next move: a caller told
-            // "Partial" with nothing in it should investigate, not re-delegate.
-            Ok(Outcome::Stopped(reason)) => ToolOutput::ok(format!(
-                "[Partial: the sub-agent stopped before answering — {reason}. It produced no \
-                 findings. Do not call `explore` again for this; narrow the question or \
-                 investigate directly with `grep` and `read`.]"
-            )),
-            Err(e) => ToolOutput::err(format!("the sub-agent failed: {e}")),
-        }
+    async fn run_controlled(
+        &self,
+        args: &Value,
+        _ctx: &ToolCtx,
+        control: &ExecutionControl,
+    ) -> ToolOutput {
+        self.run_inner(args, Some(control)).await
     }
 }
 

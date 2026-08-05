@@ -4,8 +4,8 @@
 # GitHub Actions was tried and removed: the account is Actions-locked, so every
 # run failed in four seconds having executed nothing, and a check that is
 # permanently red is worse than no check — it trains you to ignore the colour.
-# This does the same two things, on the machine that already has the toolchain
-# warm, before anything leaves it.
+# This runs the repository's checks on the machine that already has the
+# toolchain warm, before anything leaves it.
 #
 # One-time setup (per clone):
 #
@@ -28,7 +28,13 @@ fi
 echo "pre-push: building (warnings are errors)..."
 RUSTFLAGS="-D warnings" cargo build --workspace --all-targets
 
+echo "pre-push: linting (Clippy warnings are errors)..."
+cargo clippy --workspace --all-targets -- -D warnings
+
 echo "pre-push: testing..."
 cargo test --workspace
+
+echo "pre-push: testing fisherman harness..."
+cargo test -p smithy-fisherman --features harness
 
 echo "pre-push: ok"

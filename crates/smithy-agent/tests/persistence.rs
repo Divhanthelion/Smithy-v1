@@ -58,14 +58,21 @@ fn session(f: &Fixture, script: Vec<Completion>) -> Session {
 fn resumed(f: &Fixture, stored: StoredSession, script: Vec<Completion>) -> Session {
     let sampling = stored.sampling.clone();
     let limits = stored.limits.clone();
-    Session::resume(
+    let reasoning = stored.reasoning.clone();
+    let outcomes = stored.turn_outcomes.clone();
+    let accounting = stored.accounting;
+    let mut session = Session::resume(
         Arc::new(ScriptedProvider::new(script)),
         Arc::new(Registry::core()),
         f.ctx.clone(),
         stored.into_history(),
         sampling,
         limits,
-    )
+    );
+    session.restore_reasoning(reasoning);
+    session.restore_turn_outcomes(outcomes);
+    session.restore_accounting(accounting);
+    session
 }
 
 fn snapshot(history: &History) -> Vec<String> {
@@ -199,21 +206,26 @@ async fn the_system_prompt_survives_a_round_trip_unchanged() {
     );
 }
 
-/// Saving twice under one id appends to the same session rather than forking a
-/// second copy — which is what the UI does after every turn.
+/// Successive UI saves carry successive revisions and append to one session.
+/// Reusing the same revision is a conflict now, so this regression must model
+/// the lifecycle's actual allocation rather than legacy revision zero.
 #[tokio::test]
 async fn saving_the_same_id_twice_updates_rather_than_duplicating() {
     let f = fixture();
     let mut s = session(&f, vec![answer("one"), answer("two")]);
 
     s.run_turn("first", None).await.expect("turn one");
+    let mut first = store_from(&f, "sess-1", &s);
+    first.revision = 1;
     f.store
-        .save(&store_from(&f, "sess-1", &s))
+        .save(&first)
         .expect("save one");
 
     s.run_turn("second", None).await.expect("turn two");
+    let mut second = store_from(&f, "sess-1", &s);
+    second.revision = 2;
     f.store
-        .save(&store_from(&f, "sess-1", &s))
+        .save(&second)
         .expect("save two");
 
     let listed = f.store.list().expect("list");
@@ -362,4 +374,52 @@ async fn sampling_and_limits_are_restored_not_defaulted() {
     let resumed_session = resumed(&f, loaded, vec![answer("ok")]);
     assert_eq!(resumed_session.limits().max_steps, 7);
     assert_eq!(resumed_session.limits().context_hard, 12_345);
+}
+
+/// Restarting used to reset cumulative spend and the previous prompt baseline
+/// to zero. The next meter understated cost, and a session already over its
+/// context ceiling paid for one doomed request because Budget lost its seed.
+#[tokio::test]
+async fn resumed_usage_and_context_baselines_continue_instead_of_resetting() {
+    let f = fixture();
+    let first_completion = Completion {
+        content: "first answer".into(),
+        finish_reason: "stop".into(),
+        prompt_tokens: 120,
+        completion_tokens: 30,
+        cached_tokens: 70,
+        reasoning_tokens: 11,
+        ..Default::default()
+    };
+    let mut first = session(&f, vec![first_completion]);
+    first.run_turn("first", None).await.expect("first turn");
+
+    let mut stored = store_from(&f, "usage", &first);
+    stored.accounting = first.accounting();
+    f.store.save(&stored).expect("save accounting");
+    let loaded = f.store.load("usage").expect("load accounting");
+    let mut second = resumed(
+        &f,
+        loaded,
+        vec![Completion {
+            content: "second answer".into(),
+            finish_reason: "stop".into(),
+            prompt_tokens: 150,
+            completion_tokens: 20,
+            cached_tokens: 90,
+            reasoning_tokens: 5,
+            ..Default::default()
+        }],
+    );
+
+    assert_eq!(second.usage(), first.usage(), "cumulative spend reset");
+    assert_eq!(second.last_prompt_tokens(), 120, "budget seed reset");
+    assert_eq!(second.last_cached_tokens(), 70, "cache baseline reset");
+
+    second.run_turn("second", None).await.expect("second turn");
+    assert_eq!(second.usage().prompt_tokens, 270);
+    assert_eq!(second.usage().completion_tokens, 50);
+    assert_eq!(second.usage().cached_tokens, 160);
+    assert_eq!(second.usage().reasoning_tokens, 16);
+    assert_eq!(second.usage().requests, 2);
 }

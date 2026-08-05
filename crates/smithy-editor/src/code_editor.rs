@@ -23,6 +23,8 @@
 //! a two-child stack rather than the bare `text_editor` it used to be — the
 //! overlay is absolute and takes no part in the layout.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -39,8 +41,93 @@ use floem::views::text_editor;
 use floem::views::{canvas, Stack};
 
 use crate::design;
+use crate::buffer::BufferId;
+use crate::problems_panel::is_same_file;
 use crate::squiggle::{self, VisualRow};
 use crate::syntax_styling::{color_for_severity, EditSpan, InlineDiagnostic, SyntaxStyling};
+use smithy_tools::{FileBase, FileSnapshot, Workspace, WorkspaceIdentity, WriteFailure};
+
+struct SaveBinding {
+    workspace: Workspace,
+    workspace_identity: WorkspaceIdentity,
+    relative_path: String,
+    base: RefCell<FileSnapshot>,
+}
+
+impl SaveBinding {
+    fn open(path: &std::path::Path, loaded_content: &str) -> Result<Self, String> {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let workspace = Workspace::open(parent)?;
+        let workspace_identity = workspace.identity().clone();
+        let relative_path = path
+            .file_name()
+            .ok_or_else(|| format!("{} has no file name", path.display()))?
+            .to_string_lossy()
+            .into_owned();
+        let observed = workspace.snapshot(&relative_path)?;
+        // `Buffer` read the bytes just before the editor was built. Preserve
+        // those bytes as the expected base while retaining the identity seen at
+        // construction, so a content race fails the first comparison.
+        let base = match observed {
+            FileSnapshot::Present(base) => FileSnapshot::Present(FileBase {
+                content: loaded_content.to_string(),
+                identity: base.identity,
+            }),
+            FileSnapshot::Missing if loaded_content.is_empty() => FileSnapshot::Missing,
+            FileSnapshot::Missing => FileSnapshot::Present(FileBase {
+                content: loaded_content.to_string(),
+                identity: None,
+            }),
+        };
+        Ok(Self {
+            workspace,
+            workspace_identity,
+            relative_path,
+            base: RefCell::new(base),
+        })
+    }
+
+    fn snapshot(&self) -> Result<FileSnapshot, String> {
+        self.workspace.verify_identity(&self.workspace_identity)?;
+        self.workspace.snapshot(&self.relative_path)
+    }
+
+    fn reload(&self) -> Result<(String, FileSnapshot), String> {
+        let snapshot = self.snapshot()?;
+        let content = snapshot
+            .content()
+            .ok_or_else(|| format!("{} was deleted", self.relative_path))?
+            .to_string();
+        Ok((content, snapshot))
+    }
+}
+
+/// A user-editor save failure, distinguished so the UI can offer reload rather
+/// than reducing a stale-base conflict to terminal output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditorSaveError {
+    Conflict(String),
+    Failed(String),
+}
+
+impl EditorSaveError {
+    pub fn is_conflict(&self) -> bool {
+        matches!(self, Self::Conflict(_))
+    }
+}
+
+impl std::fmt::Display for EditorSaveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Conflict(message) | Self::Failed(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for EditorSaveError {}
 
 /// A handle to an open editor, so the app can read the text back to save it.
 #[derive(Clone)]
@@ -59,6 +146,94 @@ pub struct EditorHandle {
     doc: std::rc::Rc<dyn Document>,
     editor: floem::views::editor::Editor,
     styling: std::rc::Rc<SyntaxStyling>,
+    save_binding: Result<Rc<SaveBinding>, String>,
+}
+
+/// Durable documents for every open tab.
+///
+/// The active-editor signal is a convenience for menus, not ownership. Keeping
+/// handles here prevents tab switches from discarding unsaved text and gives
+/// write review one authoritative place to inspect every open document.
+#[derive(Clone, Default)]
+pub struct EditorSessions {
+    handles: Rc<RefCell<HashMap<BufferId, EditorHandle>>>,
+}
+
+impl EditorSessions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Retain the first document created for an open buffer.
+    ///
+    /// A keyed view rebuild should never construct the same row twice, but
+    /// replacing the registry entry if it does would split one tab into two
+    /// documents: the visible editor and write review would then disagree about
+    /// its text. Keeping the first handle makes that failure non-destructive.
+    pub fn register(&self, id: BufferId, handle: EditorHandle) {
+        self.handles.borrow_mut().entry(id).or_insert(handle);
+    }
+
+    pub fn remove(&self, id: BufferId) {
+        self.handles.borrow_mut().remove(&id);
+    }
+
+    pub fn get(&self, id: BufferId) -> Option<EditorHandle> {
+        self.handles.borrow().get(&id).cloned()
+    }
+
+    pub fn is_dirty(&self, id: BufferId) -> bool {
+        self.get(id).is_some_and(|handle| handle.is_dirty())
+    }
+
+    /// Every retained document with unsaved text.
+    pub fn dirty_ids(&self) -> Vec<BufferId> {
+        self.handles
+            .borrow()
+            .iter()
+            .filter_map(|(&id, handle)| handle.is_dirty().then_some(id))
+            .collect()
+    }
+
+    /// The ids currently owned by the registry.
+    #[cfg(test)]
+    fn ids(&self) -> Vec<BufferId> {
+        self.handles.borrow().keys().copied().collect()
+    }
+
+    pub fn dirty_path(&self, path: &std::path::Path) -> bool {
+        self.handles.borrow().values().any(|handle| {
+            handle.is_dirty()
+                && (is_same_file(&handle.path, path) || handle.path.as_path() == path)
+        })
+    }
+
+    /// Reload every clean open document for a path after reviewed publication.
+    ///
+    /// Dirty documents are rejected before publication, so encountering one
+    /// here means ownership changed unexpectedly and is reported rather than
+    /// silently replacing user text.
+    pub fn reload_clean_path(&self, path: &std::path::Path) -> Result<(), String> {
+        let matching: Vec<_> = self
+            .handles
+            .borrow()
+            .values()
+            .filter(|handle| {
+                is_same_file(&handle.path, path) || handle.path.as_path() == path
+            })
+            .cloned()
+            .collect();
+        for handle in matching {
+            if handle.is_dirty() {
+                return Err(format!(
+                    "{} became dirty while the reviewed write was being published",
+                    path.display()
+                ));
+            }
+            handle.reload_from_disk()?;
+        }
+        Ok(())
+    }
 }
 
 impl EditorHandle {
@@ -76,18 +251,86 @@ impl EditorHandle {
         self.text() != self.saved.get()
     }
 
+    /// The document generation used to prove a close decision still names the
+    /// text that was on screen when the user made it.
+    pub fn revision(&self) -> u64 {
+        self.revision.get_untracked()
+    }
+
     /// Write the buffer to its path.
     ///
     /// Uses `std::fs` directly rather than the agent's capability sandbox: this
     /// is a file the user opened themselves, and confining their own editing to
     /// the agent's workspace root would be wrong.
-    pub fn save(&self) -> Result<(), String> {
+    pub fn save(&self) -> Result<(), EditorSaveError> {
+        self.save_revision(self.revision())
+    }
+
+    /// Save only the exact document revision the caller inspected.
+    ///
+    /// A close prompt can remain open while another editor action changes the
+    /// document. Writing an older snapshot and then closing would discard that
+    /// later edit, so both sides of the filesystem write verify the generation.
+    pub fn save_revision(&self, expected_revision: u64) -> Result<(), EditorSaveError> {
         if self.path.as_os_str().is_empty() {
-            return Err("this buffer has no path to save to".into());
+            return Err(EditorSaveError::Failed(
+                "this buffer has no path to save to".into(),
+            ));
+        }
+        if self.revision() != expected_revision {
+            return Err(EditorSaveError::Failed(format!(
+                "{} changed after the close decision; review the current edits before closing",
+                self.path.display()
+            )));
+        }
+        let binding = self
+            .save_binding
+            .as_ref()
+            .map_err(|error| EditorSaveError::Failed(error.clone()))?;
+        let expected = binding.base.borrow().clone();
+        let observed = binding
+            .snapshot()
+            .map_err(EditorSaveError::Conflict)?;
+        if observed != expected {
+            return Err(EditorSaveError::Conflict(format!(
+                "{} changed on disk since this editor loaded it. Nothing was written; reload the \
+                 disk version or resolve the difference manually.",
+                self.path.display()
+            )));
         }
         let text = self.text();
-        std::fs::write(&self.path, &text)
-            .map_err(|e| format!("could not save {}: {e}", self.path.display()))?;
+        match binding
+            .workspace
+            .compare_and_write(&binding.relative_path, &expected, &text)
+        {
+            Ok(()) => {}
+            Err(WriteFailure::BeforePublication(message))
+                if message.contains("changed since preview") =>
+            {
+                return Err(EditorSaveError::Conflict(format!(
+                    "{} changed on disk while it was being saved. Nothing was written; reload the \
+                     disk version or resolve the difference manually.",
+                    self.path.display()
+                )));
+            }
+            Err(error) => return Err(EditorSaveError::Failed(error.to_string())),
+        }
+        let published = binding
+            .snapshot()
+            .map_err(EditorSaveError::Failed)?;
+        if published.content() != Some(text.as_str()) {
+            return Err(EditorSaveError::Conflict(format!(
+                "{} changed again immediately after publication; the tab remains dirty",
+                self.path.display()
+            )));
+        }
+        *binding.base.borrow_mut() = published;
+        if self.revision() != expected_revision {
+            return Err(EditorSaveError::Failed(format!(
+                "{} changed while it was being saved; the tab remains open",
+                self.path.display()
+            )));
+        }
         self.saved.set(text);
         Ok(())
     }
@@ -109,9 +352,13 @@ impl EditorHandle {
     /// not merely unreliable but backwards, since a change to a file you have
     /// open is exactly the one worth reacting to.
     pub fn reload_from_disk(&self) -> Result<(), String> {
-        let content = std::fs::read_to_string(&self.path)
-            .map_err(|e| format!("could not re-read {}: {e}", self.path.display()))?;
+        let binding = self.save_binding.as_ref().map_err(Clone::clone)?;
+        let (content, snapshot) = binding.reload().map_err(|error| {
+            format!("could not re-read {}: {error}", self.path.display())
+        })?;
         if content == self.text() {
+            *binding.base.borrow_mut() = snapshot;
+            self.saved.set(content);
             return Ok(());
         }
 
@@ -127,6 +374,7 @@ impl EditorHandle {
         );
         // The file on disk is now what the buffer holds, so the tab is clean.
         self.saved.set(content);
+        *binding.base.borrow_mut() = snapshot;
         Ok(())
     }
 
@@ -136,10 +384,11 @@ impl EditorHandle {
     /// `Ok(true)`: it has been deleted or is momentarily absent mid-rename, and
     /// neither is a reason to interrupt somebody with a reload prompt.
     pub fn matches_disk(&self) -> bool {
-        match std::fs::read_to_string(&self.path) {
-            Ok(on_disk) => on_disk == self.text(),
-            Err(_) => true,
-        }
+        self.save_binding.as_ref().is_ok_and(|binding| {
+            binding
+                .snapshot()
+                .is_ok_and(|observed| observed == *binding.base.borrow())
+        })
     }
 
     /// Run an edit command — what the Edit menu dispatches.
@@ -247,6 +496,7 @@ impl EditorHandle {
 pub fn code_editor(path: PathBuf, content: &str) -> (impl IntoView, EditorHandle) {
     let revision = RwSignal::new(0u64);
     let diagnostics = RwSignal::new(0u64);
+    let save_binding = SaveBinding::open(&path, content).map(Rc::new);
 
     // Syntax colouring and inline diagnostics share one `Styling` impl.
     let styling = std::rc::Rc::new(SyntaxStyling::new(13));
@@ -336,6 +586,7 @@ pub fn code_editor(path: PathBuf, content: &str) -> (impl IntoView, EditorHandle
         doc,
         editor: editor_ref,
         styling,
+        save_binding,
     };
 
     (view, handle)
@@ -818,5 +1069,167 @@ mod tests {
             OnExternalChange::Reload,
             "reloading over unsaved edits without asking loses them with no undo"
         );
+    }
+
+    /// Tab switches used to rebuild the editor from `BufferManager`'s load-time
+    /// text. That lost edits, caret position and the document-owned undo stack
+    /// together, while leaving a tab that still looked open.
+    #[test]
+    fn switching_tabs_retains_text_dirty_cursor_and_undo_in_one_document() {
+        let sessions = EditorSessions::new();
+        let first_id = BufferId::new();
+        let second_id = BufferId::new();
+        let (_first_view, first) =
+            code_editor(PathBuf::from("/tmp/retained-first.rs"), "one\ntwo\n");
+        let (_second_view, second) =
+            code_editor(PathBuf::from("/tmp/retained-second.rs"), "other\n");
+        sessions.register(first_id, first.clone());
+        sessions.register(second_id, second);
+
+        first.goto_line(2);
+        first.select_all();
+        first.run_edit(EditCommand::DeleteSelection);
+        assert!(first.is_dirty(), "fixture must edit the retained document");
+        let cursor_before_switch = first.caret_position();
+        let _switched_to = sessions.get(second_id).unwrap();
+        let returned = sessions.get(first_id).unwrap();
+
+        assert_eq!(returned.text(), "");
+        assert!(returned.is_dirty());
+        assert_eq!(returned.caret_position(), cursor_before_switch);
+        returned.undo();
+        assert_eq!(returned.text(), "one\ntwo\n");
+        assert!(!returned.is_dirty());
+    }
+
+    /// A duplicate keyed-row construction must not replace the authoritative
+    /// document. Otherwise review and close prompts inspect one handle while the
+    /// user is typing into another.
+    #[test]
+    fn each_open_buffer_id_keeps_its_first_retained_document() {
+        let sessions = EditorSessions::new();
+        let id = BufferId::new();
+        let (_first_view, first) = code_editor(PathBuf::from("/tmp/first.rs"), "first\n");
+        let (_duplicate_view, duplicate) =
+            code_editor(PathBuf::from("/tmp/duplicate.rs"), "duplicate\n");
+
+        sessions.register(id, first);
+        sessions.register(id, duplicate);
+
+        assert_eq!(sessions.ids(), vec![id]);
+        assert_eq!(sessions.get(id).unwrap().text(), "first\n");
+    }
+
+    /// Project switching rebases the single watcher, so an old-root tab cannot
+    /// rely on another notification. Its immutable save binding must catch the
+    /// disk change by itself.
+    #[test]
+    fn an_old_project_tab_refuses_to_overwrite_changes_after_project_switch() {
+        let old = tempfile::tempdir().unwrap();
+        let new = tempfile::tempdir().unwrap();
+        let path = old.path().join("old.rs");
+        std::fs::write(&path, "opened\n").unwrap();
+        let (_view, handle) = code_editor(path.clone(), "opened\n");
+        handle.run_edit(EditCommand::InsertNewLine);
+
+        let _new_project = Workspace::open(new.path()).unwrap();
+        std::fs::write(&path, "changed outside Smithy\n").unwrap();
+
+        let error = handle.save().unwrap_err();
+        assert!(error.is_conflict(), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "changed outside Smithy\n"
+        );
+        assert!(handle.is_dirty());
+    }
+
+    /// Exact bytes are not sufficient on Unix: replacing a file with a new
+    /// inode carrying the same content still invalidates metadata and any
+    /// assumptions attached to the original object.
+    #[cfg(unix)]
+    #[test]
+    fn same_content_inode_replacement_is_a_save_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.rs");
+        let replacement = dir.path().join("replacement.rs");
+        std::fs::write(&path, "same\n").unwrap();
+        let (_view, handle) = code_editor(path.clone(), "same\n");
+        handle.run_edit(EditCommand::InsertNewLine);
+        std::fs::write(&replacement, "same\n").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+
+        let error = handle.save().unwrap_err();
+        assert!(error.is_conflict(), "{error}");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "same\n");
+    }
+
+    /// Deletion is a disk-state change, not permission to recreate a file from
+    /// an old retained tab.
+    #[test]
+    fn deleting_an_open_file_blocks_save_instead_of_recreating_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deleted.rs");
+        std::fs::write(&path, "opened\n").unwrap();
+        let (_view, handle) = code_editor(path.clone(), "opened\n");
+        handle.run_edit(EditCommand::InsertNewLine);
+        std::fs::remove_file(&path).unwrap();
+
+        assert!(handle.save().unwrap_err().is_conflict());
+        assert!(!path.exists());
+    }
+
+    /// A path opened as missing has a Missing base. If another process creates
+    /// it before the user saves, that new file owns the name.
+    #[test]
+    fn creating_a_previously_missing_file_blocks_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("created.rs");
+        let (_view, handle) = code_editor(path.clone(), "");
+        handle.run_edit(EditCommand::InsertNewLine);
+        std::fs::write(&path, "external\n").unwrap();
+
+        assert!(handle.save().unwrap_err().is_conflict());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "external\n");
+    }
+
+    /// Smithy's own atomic rename changes the inode. Refreshing the exact base
+    /// after publication is what permits the next ordinary save.
+    #[test]
+    fn clean_saves_advance_the_exact_base_for_the_next_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clean-save.rs");
+        std::fs::write(&path, "opened\n").unwrap();
+        let (_view, handle) = code_editor(path.clone(), "opened\n");
+        handle.run_edit(EditCommand::InsertNewLine);
+        handle.save().unwrap();
+        handle.run_edit(EditCommand::InsertNewLine);
+        handle.save().unwrap();
+
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "\n\nopened\n");
+        assert!(!handle.is_dirty());
+    }
+
+    /// Accepted review publication replaces the inode outside the editor save
+    /// path. Reloading the clean retained document must refresh its save base as
+    /// well as its visible text.
+    #[test]
+    fn review_refresh_advances_the_save_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reviewed.rs");
+        std::fs::write(&path, "before\n").unwrap();
+        let sessions = EditorSessions::new();
+        let id = BufferId::new();
+        let (_view, handle) = code_editor(path.clone(), "before\n");
+        sessions.register(id, handle.clone());
+        let replacement = dir.path().join("review.tmp");
+        std::fs::write(&replacement, "reviewed\n").unwrap();
+        std::fs::rename(replacement, &path).unwrap();
+
+        sessions.reload_clean_path(&path).unwrap();
+        handle.run_edit(EditCommand::InsertNewLine);
+        handle.save().unwrap();
+
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "\nreviewed\n");
     }
 }

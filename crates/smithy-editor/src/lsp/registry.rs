@@ -9,9 +9,11 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, RwLock};
 
-use super::client::{LspClient, LspClientConfig, LspError};
-use super::types::LspDiagnostic;
+use super::client::{
+    ClientCrash, ClientDiagnostics, LspClient, LspClientConfig, LspError, LspStamp,
+};
 use std::time::{Duration, Instant};
+use futures_util::future::join_all;
 
 /// Key for identifying a language server instance
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -38,6 +40,17 @@ struct CrashInfo {
     attempts: u32,
     /// Time of last crash
     last_crash: Instant,
+}
+
+/// Everything needed to start one server, captured while the registry is
+/// locked and executed after that guard has been dropped.
+struct SpawnPlan {
+    key: ServerKey,
+    generation: u64,
+    id: u64,
+    config: LspClientConfig,
+    diagnostics_tx: mpsc::Sender<ClientDiagnostics>,
+    crash_tx: mpsc::Sender<ClientCrash>,
 }
 
 /// Whether a language server can actually be used.
@@ -84,13 +97,13 @@ pub struct LspRegistry {
     /// Counter for assigning unique client IDs
     next_id: u64,
     /// Channel for receiving diagnostics from all servers
-    diagnostics_tx: mpsc::Sender<(String, Vec<LspDiagnostic>)>,
+    diagnostics_tx: mpsc::Sender<ClientDiagnostics>,
     /// Configuration for different languages
     language_configs: HashMap<String, LanguageServerConfig>,
     /// Channel for receiving crash notifications
-    crash_tx: mpsc::Sender<u64>,
+    crash_tx: mpsc::Sender<ClientCrash>,
     /// Receiver for crash notifications (pub for integration)
-    pub crash_rx: Option<mpsc::Receiver<u64>>,
+    pub crash_rx: Option<mpsc::Receiver<ClientCrash>>,
     /// Track crashed servers for restart backoff
     crashed_servers: HashMap<ServerKey, CrashInfo>,
     /// Maximum restart attempts before giving up
@@ -102,11 +115,33 @@ pub struct LspRegistry {
     /// switch, requests went to the server initialized against the *previous*
     /// root. Holding the current root here is what makes that impossible.
     current_root: Option<PathBuf>,
+    /// Invalidates in-flight starts and delayed retries after a root switch or
+    /// explicit stop.
+    generation: u64,
+    /// An explicit stop keeps retries and lazy starts dormant until Initialize.
+    stopped: bool,
 }
 
 /// Restart backoff configuration
 const INITIAL_BACKOFF_MS: u64 = 1000;
 const MAX_BACKOFF_MS: u64 = 30000;
+
+fn crash_names_current_client(current_id: Option<u64>, crashed_id: u64) -> bool {
+    current_id == Some(crashed_id)
+}
+
+fn stamp_names_active_client(
+    current_root: Option<&Path>,
+    generation: u64,
+    active_ids: impl Iterator<Item = u64>,
+    stamp: &LspStamp,
+) -> bool {
+    generation == stamp.generation
+        && current_root == Some(stamp.root_path.as_path())
+        && stamp
+            .client_id
+            .is_some_and(|id| active_ids.into_iter().any(|active| active == id))
+}
 
 /// Configuration for a language server type
 #[derive(Debug, Clone, Default)]
@@ -123,6 +158,19 @@ pub struct LanguageServerConfig {
     /// whose defaults are expensive enough to matter — see
     /// [`rust_initialization_options`].
     pub initialization_options: Option<serde_json::Value>,
+}
+
+pub enum RestartOutcome {
+    Restarted {
+        key: ServerKey,
+        client: Arc<LspClient>,
+    },
+    Exhausted {
+        stamp: LspStamp,
+        language: String,
+        message: String,
+    },
+    Obsolete,
 }
 
 /// What rust-analyzer is told at `initialize`.
@@ -173,8 +221,31 @@ fn lsp_light_requested() -> bool {
 }
 
 impl LspRegistry {
+    fn intent_stamp(&self) -> Option<LspStamp> {
+        Some(LspStamp {
+            root_path: self.current_root.clone()?,
+            generation: self.generation,
+            client_id: None,
+        })
+    }
+
+    pub fn current_stamp_for(&self, language_id: &str) -> Option<LspStamp> {
+        self.current_client_for(language_id)
+            .map(|client| client.stamp())
+            .or_else(|| self.intent_stamp())
+    }
+
+    pub fn accepts_client_stamp(&self, stamp: &LspStamp) -> bool {
+        stamp_names_active_client(
+            self.current_root.as_deref(),
+            self.generation,
+            self.clients.values().map(|client| client.id()),
+            stamp,
+        )
+    }
+
     /// Create a new LSP registry
-    pub fn new(diagnostics_tx: mpsc::Sender<(String, Vec<LspDiagnostic>)>) -> Self {
+    pub fn new(diagnostics_tx: mpsc::Sender<ClientDiagnostics>) -> Self {
         let mut language_configs = HashMap::new();
 
         // Default configurations for common languages
@@ -265,58 +336,8 @@ impl LspRegistry {
             crashed_servers: HashMap::new(),
             max_restart_attempts: 3,
             current_root: None,
-        }
-    }
-
-    /// Handle a server crash notification
-    pub async fn handle_crash(&mut self, client_id: u64) {
-        // Find which server crashed
-        let mut crashed_key = None;
-        for (key, client) in &self.clients {
-            if client.id() == client_id {
-                crashed_key = Some(key.clone());
-                break;
-            }
-        }
-
-        if let Some(key) = crashed_key {
-            eprintln!(
-                "LSP server for {} crashed (client_id: {})",
-                key.language_id, client_id
-            );
-
-            // Remove the crashed client
-            self.clients.remove(&key);
-
-            // Track the crash
-            let attempts = {
-                let crash_info = self
-                    .crashed_servers
-                    .entry(key.clone())
-                    .or_insert(CrashInfo {
-                        attempts: 0,
-                        last_crash: Instant::now(),
-                    });
-                crash_info.attempts += 1;
-                crash_info.last_crash = Instant::now();
-                crash_info.attempts
-            };
-
-            // Attempt restart if under the limit
-            if attempts <= self.max_restart_attempts {
-                let backoff = self.calculate_backoff(attempts);
-                eprintln!(
-                    "Attempting restart {} of {} for {} in {:?}",
-                    attempts, self.max_restart_attempts, key.language_id, backoff
-                );
-                tokio::time::sleep(backoff).await;
-                self.attempt_restart(key).await;
-            } else {
-                eprintln!(
-                    "Giving up on restarting {} after {} attempts",
-                    key.language_id, attempts
-                );
-            }
+            generation: 0,
+            stopped: false,
         }
     }
 
@@ -326,17 +347,83 @@ impl LspRegistry {
         Duration::from_millis(backoff_ms.min(MAX_BACKOFF_MS))
     }
 
-    /// Attempt to restart a crashed server
-    async fn attempt_restart(&mut self, key: ServerKey) {
-        if let Err(e) = self.get_or_spawn(&key.language_id, &key.root_path).await {
-            eprintln!("Failed to restart {} server: {}", key.language_id, e);
-            // If restart fails, mark as crashed again for potential retry
-            let _ = self.crash_tx.send(self.next_id - 1).await;
-        } else {
-            eprintln!("Successfully restarted {} server", key.language_id);
-            // Clear crash info on successful restart
-            self.crashed_servers.remove(&key);
+    fn prepare_spawn(&mut self, key: ServerKey) -> Option<SpawnPlan> {
+        if self.stopped || self.clients.contains_key(&key) {
+            return None;
         }
+        let lang_config = self
+            .language_configs
+            .get(&key.language_id)
+            .cloned()
+            .unwrap_or_else(|| LanguageServerConfig {
+                command: format!("{}-language-server", key.language_id),
+                args: vec![],
+                extensions: vec![],
+                initialization_options: None,
+            });
+        let id = self.next_id;
+        self.next_id += 1;
+        Some(SpawnPlan {
+            config: LspClientConfig {
+                command: lang_config.command,
+                args: lang_config.args,
+                root_path: key.root_path.clone(),
+                request_timeout: Duration::from_secs(30),
+                language_id: key.language_id.clone(),
+                initialization_options: lang_config.initialization_options,
+            },
+            key,
+            generation: self.generation,
+            id,
+            diagnostics_tx: self.diagnostics_tx.clone(),
+            crash_tx: self.crash_tx.clone(),
+        })
+    }
+
+    async fn execute_spawn(plan: &SpawnPlan) -> Result<Arc<LspClient>, LspError> {
+        let client = Arc::new(
+            LspClient::spawn(
+                plan.id,
+                plan.generation,
+                plan.config.clone(),
+                plan.diagnostics_tx.clone(),
+                plan.crash_tx.clone(),
+            )
+            .await?,
+        );
+        if let Err(error) = client.initialize().await {
+            let tail = client.stderr_tail();
+            return Err(LspError::Startup(format!(
+                "{error}{}",
+                if tail.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("\nserver stderr (tail):\n{tail}")
+                }
+            )));
+        }
+        Ok(client)
+    }
+
+    fn install_spawn(&mut self, plan: &SpawnPlan, client: Arc<LspClient>) -> bool {
+        let current = self.current_root.as_deref() == Some(plan.key.root_path.as_path());
+        if self.generation != plan.generation
+            || self.stopped
+            || !current
+            || self.clients.contains_key(&plan.key)
+        {
+            return false;
+        }
+        self.clients.insert(plan.key.clone(), client);
+        self.crashed_servers.remove(&plan.key);
+        true
+    }
+
+    fn retry_is_current(&self, key: &ServerKey, generation: u64) -> bool {
+        self.generation == generation
+            && !self.stopped
+            && self.current_root.as_deref() == Some(key.root_path.as_path())
+            && !self.clients.contains_key(key)
     }
 
     /// Detect language from file extension
@@ -352,69 +439,21 @@ impl LspRegistry {
         None
     }
 
-    /// Get or spawn a language server for the given file
-    pub async fn get_or_spawn(
-        &mut self,
-        language_id: &str,
-        workspace_root: &Path,
-    ) -> Result<Arc<LspClient>, LspError> {
-        let key = ServerKey::new(language_id, workspace_root);
-
-        // Return existing client if available
-        if let Some(client) = self.clients.get(&key) {
-            return Ok(client.clone());
-        }
-
-        // Get language config
-        let lang_config = self
-            .language_configs
-            .get(language_id)
-            .cloned()
-            .unwrap_or_else(|| LanguageServerConfig {
-                command: format!("{}-language-server", language_id),
-                args: vec![],
-                extensions: vec![],
-                initialization_options: None,
-            });
-
-        // Create client config
-        let config = LspClientConfig {
-            command: lang_config.command,
-            args: lang_config.args,
-            root_path: workspace_root.to_path_buf(),
-            request_timeout: std::time::Duration::from_secs(30),
-            language_id: language_id.to_string(),
-            initialization_options: lang_config.initialization_options,
-        };
-
-        // Spawn client
-        let id = self.next_id;
-        self.next_id += 1;
-
-        let client = LspClient::spawn(
-            id,
-            config,
-            self.diagnostics_tx.clone(),
-            self.crash_tx.clone(),
-        )
-        .await?;
-
-        // Initialize
-        client.initialize().await?;
-
-        let client = Arc::new(client);
-        self.clients.insert(key, client.clone());
-
-        Ok(client)
+    fn take_all_clients(&mut self, stop: bool) -> Vec<Arc<LspClient>> {
+        self.generation = self.generation.wrapping_add(1);
+        self.stopped = stop;
+        self.crashed_servers.clear();
+        self.clients.drain().map(|(_, client)| client).collect()
     }
 
-    /// Shutdown all clients
-    pub async fn shutdown_all(&mut self) {
-        let clients: Vec<_> = self.clients.drain().collect();
-
-        for (_, client) in clients {
-            if let Err(e) = client.shutdown().await {
-                eprintln!("Error shutting down LSP client: {}", e);
+    async fn shutdown_clients(clients: Vec<Arc<LspClient>>) {
+        let results = join_all(clients.into_iter().map(|client| async move {
+            client.shutdown().await
+        }))
+        .await;
+        for result in results {
+            if let Err(error) = result {
+                eprintln!("Error shutting down LSP client: {error}");
             }
         }
     }
@@ -480,53 +519,186 @@ impl LspRegistry {
         Arc::new(RwLock::new(LspRegistry::new(tx)))
     }
 
-    /// Initialize language servers for a workspace
-    pub async fn initialize_for_workspace(
-        &mut self,
+    /// Initialize a workspace without retaining a registry guard while a server
+    /// is stopped, spawned, or initialized.
+    pub async fn initialize_shared(
+        shared: &SharedLspRegistry,
         workspace_root: &Path,
-        diagnostics_tx: mpsc::Sender<(String, Vec<LspDiagnostic>)>,
-    ) -> Result<(), LspError> {
-        // Update diagnostics channel
-        self.diagnostics_tx = diagnostics_tx;
+        diagnostics_tx: mpsc::Sender<ClientDiagnostics>,
+    ) -> Result<(usize, LspStamp), (LspStamp, LspError)> {
+        let (old_clients, intent_stamp) = {
+            let mut registry = shared.write().await;
+            registry.diagnostics_tx = diagnostics_tx;
+            let changing = registry.root_is_changing(workspace_root);
+            let old = if changing {
+                registry.take_all_clients(false)
+            } else {
+                Vec::new()
+            };
+            // Every Initialize is a new intent. This cancels an obsolete retry
+            // even when it races a stop/start of the same root.
+            registry.generation = registry.generation.wrapping_add(1);
+            registry.stopped = false;
+            registry.current_root = Some(workspace_root.to_path_buf());
+            let stamp = registry.intent_stamp().expect("root was just installed");
+            (old, stamp)
+        };
+        Self::shutdown_clients(old_clients).await;
 
-        // Re-rooting means every running server is analysing the wrong project.
-        // Stop them before adopting the new root: leaving them resident kept the
-        // previous workspace's full crate graph in memory for the life of the
-        // app, and rust-analyzer's footprint is measured in gigabytes.
-        //
-        // Done unconditionally on a *change* of root rather than on every
-        // `Initialize`, so re-initializing the same project is still a cheap
-        // no-op that reuses the warm server.
-        if self.root_is_changing(workspace_root) {
-            self.shutdown_all().await;
+        if !workspace_root.join("Cargo.toml").exists() {
+            return Ok((shared.read().await.client_count(), intent_stamp));
         }
-        self.current_root = Some(workspace_root.to_path_buf());
+        let available = {
+            let registry = shared.read().await;
+            registry.check_server("rust")
+        };
+        if !matches!(available, ServerAvailability::Available) {
+            return Ok((shared.read().await.client_count(), intent_stamp));
+        }
 
-        // Try to spawn servers for languages with available servers
-        let languages: Vec<_> = self.language_configs.keys().cloned().collect();
+        let plan = {
+            let mut registry = shared.write().await;
+            registry.prepare_spawn(ServerKey::new("rust", workspace_root))
+        };
+        if let Some(plan) = plan {
+            let plan_stamp = LspStamp {
+                root_path: plan.key.root_path.clone(),
+                generation: plan.generation,
+                client_id: Some(plan.id),
+            };
+            let client = Self::execute_spawn(&plan)
+                .await
+                .map_err(|error| (plan_stamp.clone(), error))?;
+            let installed = {
+                let mut registry = shared.write().await;
+                registry.install_spawn(&plan, client.clone())
+            };
+            if !installed {
+                client
+                    .shutdown()
+                    .await
+                    .map_err(|error| (plan_stamp.clone(), error))?;
+            }
+            return Ok((shared.read().await.client_count(), plan_stamp));
+        }
+        let registry = shared.read().await;
+        Ok((
+            registry.client_count(),
+            registry.current_stamp_for("rust").unwrap_or(intent_stamp),
+        ))
+    }
 
-        // A spawn failure is *returned*, not just printed. It used to be
-        // `eprintln!`-and-continue, so the function reported success and the
-        // caller had nothing to surface — which is how a language server that
-        // never started at all presented as an empty Problems panel to anyone
-        // not watching a terminal.
-        let mut failure = None;
-        for language_id in languages {
-            if self.is_server_available(&language_id) {
-                // Only spawn if the workspace seems to have files for this language
-                // For now, just check rust since that's our primary target
-                if language_id == "rust" && workspace_root.join("Cargo.toml").exists() {
-                    if let Err(e) = self.get_or_spawn(&language_id, workspace_root).await {
-                        eprintln!("Failed to spawn {} server: {}", language_id, e);
-                        failure = failure.or(Some(e));
+    /// Stop every client and invalidate retries, with no lock held while
+    /// shutdown handshakes or process reaping run.
+    pub async fn stop_shared(shared: &SharedLspRegistry) {
+        let clients = shared.write().await.take_all_clients(true);
+        Self::shutdown_clients(clients).await;
+    }
+
+    /// Restart the exact crashed `(ServerKey, client id)` if it is still current.
+    /// Returns the replacement so the integration layer can replay documents.
+    pub async fn restart_after_crash(
+        shared: &SharedLspRegistry,
+        crash: ClientCrash,
+    ) -> RestartOutcome {
+        let key = ServerKey::new(crash.language_id, crash.root_path);
+        let crashed_stamp;
+        let (generation, mut attempts, mut backoff, maximum) = {
+            let mut registry = shared.write().await;
+            let still_exact = crash_names_current_client(
+                registry.clients.get(&key).map(|client| client.id()),
+                crash.client_id,
+            );
+            if !still_exact || registry.stopped {
+                return RestartOutcome::Obsolete;
+            }
+            crashed_stamp = registry.clients[&key].stamp();
+            registry.clients.remove(&key);
+            let maximum = registry.max_restart_attempts;
+            let attempts = {
+                let info = registry
+                    .crashed_servers
+                    .entry(key.clone())
+                    .or_insert(CrashInfo {
+                        attempts: 0,
+                        last_crash: Instant::now(),
+                    });
+                info.attempts += 1;
+                info.last_crash = Instant::now();
+                info.attempts
+            };
+            (
+                registry.generation,
+                attempts,
+                registry.calculate_backoff(attempts),
+                maximum,
+            )
+        };
+
+        eprintln!(
+            "LSP {} crashed (client {}):{}{}",
+            key.language_id,
+            crash.client_id,
+            if crash.stderr_tail.trim().is_empty() { "" } else { "\n" },
+            crash.stderr_tail
+        );
+        let mut last_stamp = crashed_stamp;
+        let mut last_error = "language server disconnected".to_string();
+        while attempts <= maximum {
+            tokio::time::sleep(backoff).await;
+            let plan = {
+                let mut registry = shared.write().await;
+                if !registry.retry_is_current(&key, generation) {
+                    return RestartOutcome::Obsolete;
+                }
+                registry.prepare_spawn(key.clone())
+            };
+            let Some(plan) = plan else {
+                return RestartOutcome::Obsolete;
+            };
+            last_stamp = LspStamp {
+                root_path: plan.key.root_path.clone(),
+                generation: plan.generation,
+                client_id: Some(plan.id),
+            };
+            match Self::execute_spawn(&plan).await {
+                Ok(client) => {
+                    let installed = shared
+                        .write()
+                        .await
+                        .install_spawn(&plan, client.clone());
+                    if installed {
+                        return RestartOutcome::Restarted { key, client };
                     }
+                    let _ = client.shutdown().await;
+                    return RestartOutcome::Obsolete;
+                }
+                Err(error) => {
+                    last_error = error.to_string();
+                    eprintln!(
+                        "Failed to restart {} for {}: {}",
+                        key.language_id,
+                        key.root_path.display(),
+                        error
+                    );
+                    attempts += 1;
+                    if attempts > maximum {
+                        break;
+                    }
+                    let registry = shared.write().await;
+                    if !registry.retry_is_current(&key, generation) {
+                        return RestartOutcome::Obsolete;
+                    }
+                    backoff = registry.calculate_backoff(attempts);
                 }
             }
         }
-
-        match failure {
-            Some(e) => Err(e),
-            None => Ok(()),
+        RestartOutcome::Exhausted {
+            stamp: last_stamp,
+            language: key.language_id,
+            message: format!(
+                "Language server disconnected after {maximum} restart attempts: {last_error}"
+            ),
         }
     }
 
@@ -542,6 +714,16 @@ impl LspRegistry {
     pub fn current_client_for(&self, language_id: &str) -> Option<Arc<LspClient>> {
         self.current_key_for(language_id)
             .and_then(|key| self.clients.get(&key).cloned())
+    }
+
+    pub fn client_for(
+        &self,
+        language_id: &str,
+        root_path: &Path,
+    ) -> Option<Arc<LspClient>> {
+        self.clients
+            .get(&ServerKey::new(language_id, root_path))
+            .cloned()
     }
 
     /// The key a lookup for `language_id` resolves to, or `None` before any
@@ -575,6 +757,28 @@ impl LspRegistry {
     /// actually releases the old ones rather than accumulating them.
     pub fn client_count(&self) -> usize {
         self.clients.len()
+    }
+
+    pub(super) fn clients_snapshot(&self) -> Vec<Arc<LspClient>> {
+        self.clients.values().cloned().collect()
+    }
+
+    #[cfg(test)]
+    pub(super) fn install_test_client(&mut self, client: Arc<LspClient>) {
+        let key = ServerKey::new(client.language_id(), client.root_path());
+        self.current_root = Some(client.root_path().to_path_buf());
+        self.generation = client.stamp().generation;
+        self.clients.insert(key, client);
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_channels(
+        &self,
+    ) -> (
+        mpsc::Sender<ClientDiagnostics>,
+        mpsc::Sender<ClientCrash>,
+    ) {
+        (self.diagnostics_tx.clone(), self.crash_tx.clone())
     }
 }
 
@@ -730,6 +934,93 @@ mod tests {
         assert_eq!(key1, key2);
         assert_ne!(key1, key3);
     }
+
+    /// A delayed crash from client 11 used to remove whatever occupied the
+    /// language slot by the time it was handled, including replacement 12.
+    #[test]
+    fn a_stale_crash_identity_cannot_name_its_replacement() {
+        assert!(!crash_names_current_client(Some(12), 11));
+        assert!(crash_names_current_client(Some(12), 12));
+    }
+
+    /// Restart failure used to enqueue `next_id - 1`, which could belong to a
+    /// different language. A retry now retains the complete original key.
+    #[test]
+    fn a_failed_restart_retries_the_same_server_key() {
+        let key = ServerKey::new("rust", "/projects/alpha");
+        let retry = key.clone();
+        assert_eq!(retry, key);
+        assert_eq!(retry.root_path, PathBuf::from("/projects/alpha"));
+    }
+
+    /// A crash storm in TypeScript must not advance Rust's backoff. The old
+    /// synthetic client-id retry path made that association accidental.
+    #[test]
+    fn restart_backoff_is_independent_for_each_server_key() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut registry = LspRegistry::new(tx);
+        let rust = ServerKey::new("rust", "/p");
+        let typescript = ServerKey::new("typescript", "/p");
+        registry.crashed_servers.insert(
+            rust.clone(),
+            CrashInfo {
+                attempts: 1,
+                last_crash: Instant::now(),
+            },
+        );
+        registry.crashed_servers.insert(
+            typescript.clone(),
+            CrashInfo {
+                attempts: 3,
+                last_crash: Instant::now(),
+            },
+        );
+        assert_eq!(registry.crashed_servers[&rust].attempts, 1);
+        assert_eq!(registry.crashed_servers[&typescript].attempts, 3);
+    }
+
+    /// A retry sleeping for the old workspace must wake up obsolete, rather
+    /// than installing a server initialized against the project just left.
+    #[test]
+    fn switching_roots_cancels_a_delayed_restart() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut registry = LspRegistry::new(tx);
+        registry.current_root = Some(PathBuf::from("/alpha"));
+        let key = ServerKey::new("rust", "/alpha");
+        let generation = registry.generation;
+        assert!(registry.retry_is_current(&key, generation));
+        registry.current_root = Some(PathBuf::from("/beta"));
+        registry.generation += 1;
+        assert!(!registry.retry_is_current(&key, generation));
+    }
+
+    /// A publishDiagnostics message can already be queued when its process
+    /// crashes. Once client 12 replaces client 11, that queued message must not
+    /// repopulate the panel that the crash/root transition cleared.
+    #[test]
+    fn diagnostics_from_an_old_client_are_not_current_after_replacement() {
+        let old = LspStamp {
+            root_path: PathBuf::from("/project"),
+            generation: 7,
+            client_id: Some(11),
+        };
+        let replacement = LspStamp {
+            client_id: Some(12),
+            ..old.clone()
+        };
+        assert!(!stamp_names_active_client(
+            Some(Path::new("/project")),
+            7,
+            [12].into_iter(),
+            &old,
+        ));
+        assert!(stamp_names_active_client(
+            Some(Path::new("/project")),
+            7,
+            [12].into_iter(),
+            &replacement,
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -784,7 +1075,7 @@ mod availability_tests {
     /// the regression test for "detection reports presence, not usability".
     #[test]
     fn rust_analyzer_is_detected_as_usable_when_it_runs() {
-        let (tx, _rx) = mpsc::channel::<(String, Vec<LspDiagnostic>)>(16);
+        let (tx, _rx) = mpsc::channel::<ClientDiagnostics>(16);
         let registry = LspRegistry::new(tx);
         match registry.check_server("rust") {
             ServerAvailability::Available => {}

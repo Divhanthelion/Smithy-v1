@@ -4,7 +4,10 @@
 //! PTY support and vte for ANSI escape sequence parsing.
 
 use std::io::{Read, Write};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::ops::Range;
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -43,7 +46,7 @@ pub enum TerminalColor {
 }
 
 /// A single cell in the terminal grid
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TerminalCell {
     /// The character in this cell
     pub c: char,
@@ -70,7 +73,7 @@ impl TerminalCell {
 }
 
 /// Terminal grid containing all cells
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct TerminalGrid {
     /// Grid cells stored row-major
     cells: Vec<TerminalCell>,
@@ -104,6 +107,20 @@ pub struct TerminalGrid {
 /// How many scrolled-off lines to retain.
 const SCROLLBACK_LIMIT: usize = 5_000;
 
+/// The part of a terminal grid needed to render one viewport.
+///
+/// Rows are absolute across scrollback and the live grid. Keeping the absolute
+/// start beside them prevents a caller from accidentally painting a viewport
+/// snapshot at row zero.
+#[derive(Clone, Debug)]
+pub struct TerminalSnapshot {
+    pub start_row: usize,
+    pub rows: Vec<Vec<TerminalCell>>,
+    pub total_rows: usize,
+    pub cols: usize,
+    pub cursor: (usize, usize),
+}
+
 impl TerminalGrid {
     /// Create a new terminal grid with the given dimensions
     pub fn new(cols: usize, rows: usize) -> Self {
@@ -121,6 +138,7 @@ impl TerminalGrid {
     }
 
     /// Lines that have scrolled off the top, oldest first.
+    #[cfg(test)]
     pub fn scrollback(&self) -> &std::collections::VecDeque<Vec<TerminalCell>> {
         &self.scrollback
     }
@@ -128,6 +146,30 @@ impl TerminalGrid {
     /// Scrolled-off lines plus the live grid.
     pub fn total_rows(&self) -> usize {
         self.scrollback.len() + self.rows
+    }
+
+    /// Clone only the requested absolute rows plus the metadata needed to
+    /// position them.
+    pub fn snapshot_rows(&self, range: Range<usize>) -> TerminalSnapshot {
+        let total_rows = self.total_rows();
+        let start = range.start.min(total_rows);
+        let end = range.end.min(total_rows).max(start);
+        let scrollback_len = self.scrollback.len();
+        let mut rows = Vec::with_capacity(end - start);
+        for row in start..end {
+            if row < scrollback_len {
+                rows.push(self.scrollback[row].clone());
+            } else if let Some(cells) = self.get_row(row - scrollback_len) {
+                rows.push(cells.to_vec());
+            }
+        }
+        TerminalSnapshot {
+            start_row: start,
+            rows,
+            total_rows,
+            cols: self.cols,
+            cursor: (self.cursor_col, scrollback_len + self.cursor_row),
+        }
     }
 
     /// Get the number of columns
@@ -141,11 +183,13 @@ impl TerminalGrid {
     }
 
     /// Get the cursor position (col, row)
+    #[cfg(test)]
     pub fn cursor_position(&self) -> (usize, usize) {
         (self.cursor_col, self.cursor_row)
     }
 
     /// Get a cell at the given position
+    #[cfg(test)]
     pub fn get_cell(&self, col: usize, row: usize) -> Option<&TerminalCell> {
         if col < self.cols && row < self.rows {
             Some(&self.cells[row * self.cols + col])
@@ -301,19 +345,48 @@ impl TerminalGrid {
 }
 
 /// VTE performer that updates the terminal grid
-struct TerminalPerformer {
-    grid: TerminalGrid,
+struct TerminalPerformer<G> {
+    grid: G,
 }
 
-impl TerminalPerformer {
+#[cfg(test)]
+struct OwnedGrid(TerminalGrid);
+
+#[cfg(test)]
+impl Deref for OwnedGrid {
+    type Target = TerminalGrid;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl DerefMut for OwnedGrid {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+#[cfg(test)]
+impl TerminalPerformer<OwnedGrid> {
     fn new(cols: usize, rows: usize) -> Self {
         Self {
-            grid: TerminalGrid::new(cols, rows),
+            grid: OwnedGrid(TerminalGrid::new(cols, rows)),
         }
     }
 }
 
-impl Perform for TerminalPerformer {
+impl<G> TerminalPerformer<G> {
+    fn from_grid(grid: G) -> Self {
+        Self { grid }
+    }
+}
+
+impl<G> Perform for TerminalPerformer<G>
+where
+    G: Deref<Target = TerminalGrid> + DerefMut,
+{
     fn print(&mut self, c: char) {
         self.grid.put_char(c);
     }
@@ -461,7 +534,10 @@ impl Perform for TerminalPerformer {
     }
 }
 
-impl TerminalPerformer {
+impl<G> TerminalPerformer<G>
+where
+    G: Deref<Target = TerminalGrid> + DerefMut,
+{
     /// Handle SGR (Select Graphic Rendition) parameters
     fn handle_sgr(&mut self, params: &[u16]) {
         let mut i = 0;
@@ -530,8 +606,9 @@ impl TerminalPerformer {
 /// Events emitted by the terminal
 #[derive(Clone, Debug)]
 pub enum TerminalEvent {
-    /// Terminal output data
-    Output(Vec<u8>),
+    /// At least one PTY read completed. The revision is monotonic, but wakes
+    /// are coalesced so a stalled UI retains one small value, never the bytes.
+    Activity(u64),
     /// Terminal process exited with status code
     Exit(i32),
     /// Bell character received
@@ -546,23 +623,15 @@ pub struct TerminalManager {
     writer: Box<dyn Write + Send>,
     /// Terminal grid state
     grid: Arc<Mutex<TerminalGrid>>,
-    /// Kept only so the channel stays open for as long as the manager lives.
-    /// The reader thread holds its own clone and does the actual sending; if
-    /// this were dropped, `try_recv` would report the channel closed the moment
-    /// that thread exited rather than when the terminal is closed.
-    #[allow(dead_code)]
-    event_tx: Sender<TerminalEvent>,
-    /// Event receiver
-    event_rx: Receiver<TerminalEvent>,
+    /// One queued activity wake is enough: the grid already contains the
+    /// newest state and the revision says whether anything changed.
+    activity_rx: Receiver<u64>,
+    activity_revision: Arc<AtomicU64>,
+    /// Exit and bell coalesce independently, so a bell storm cannot crowd an
+    /// exit out of a queue while the UI is not polling.
+    lifecycle: Arc<Mutex<LifecycleState>>,
     /// Whether the terminal is closed
     closed: bool,
-    /// A size the reader thread should apply to its parser grid.
-    ///
-    /// The reader thread owns a `TerminalPerformer` with its own grid and
-    /// copies it over the shared one after every read, so resizing the shared
-    /// grid alone is undone on the next byte that arrives. The thread picks
-    /// this up and resizes the grid the parser is actually writing into.
-    pending_resize: Arc<Mutex<Option<(usize, usize)>>>,
     /// Reader thread handle
     _reader_thread: Option<thread::JoinHandle<()>>,
     /// The shell process.
@@ -575,6 +644,39 @@ pub struct TerminalManager {
     /// handle left to stop it — which is the one process leak `kill_on_drop` and
     /// the foreground process group do not cover between them.
     child: ShellHandle,
+}
+
+#[derive(Default)]
+struct LifecycleState {
+    exit: Option<i32>,
+    bell: bool,
+}
+
+fn publish_activity(tx: &SyncSender<u64>, revision: &AtomicU64) {
+    let revision = revision.fetch_add(1, Ordering::Release) + 1;
+    // A full channel already represents the same fact: there is unread
+    // activity. Never wait behind the UI.
+    let _ = tx.try_send(revision);
+}
+
+/// Change parser geometry before notifying the PTY.
+///
+/// Redraw bytes can arrive immediately after SIGWINCH. Updating the shared
+/// parser/view grid first means every byte parsed from that point onward sees
+/// the new geometry. The lock is deliberately released before `notify`: a PTY
+/// backend is an external call and must never block while excluding the reader
+/// thread.
+fn resize_before_notify<E>(
+    grid: &Arc<Mutex<TerminalGrid>>,
+    cols: usize,
+    rows: usize,
+    notify: impl FnOnce() -> Result<(), E>,
+) -> Result<(), E> {
+    {
+        let mut grid = grid.lock().unwrap();
+        grid.resize(cols, rows);
+    }
+    notify()
 }
 
 /// A shell process, shared so a signal handler can reach it.
@@ -608,11 +710,10 @@ pub fn kill_all_shells() {
         Err(_) => return,
     };
     for handle in handles {
-        if let Ok(mut slot) = handle.lock() {
-            if let Some(mut child) = slot.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+        let child = handle.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(mut child) = child {
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 }
@@ -713,58 +814,50 @@ impl TerminalManager {
             .try_clone_reader()
             .map_err(|e| TerminalError::PtySpawnFailed(e.to_string()))?;
 
-        let (event_tx, event_rx) = mpsc::channel();
+        let (activity_tx, activity_rx) = mpsc::sync_channel(1);
+        let activity_revision = Arc::new(AtomicU64::new(0));
+        let lifecycle = Arc::new(Mutex::new(LifecycleState::default()));
         let grid = Arc::new(Mutex::new(TerminalGrid::new(cols as usize, rows as usize)));
-        let parser = Arc::new(Mutex::new(Parser::new()));
 
         // Clone for the reader thread
         let grid_clone = Arc::clone(&grid);
-        let parser_clone = Arc::clone(&parser);
-        let event_tx_clone = event_tx.clone();
-        let pending_resize: Arc<Mutex<Option<(usize, usize)>>> = Arc::new(Mutex::new(None));
-        let resize_clone = Arc::clone(&pending_resize);
+        let revision_clone = Arc::clone(&activity_revision);
+        let lifecycle_clone = Arc::clone(&lifecycle);
 
         // Spawn reader thread
         let reader_thread = thread::spawn(move || {
             let mut buf = [0u8; 4096];
-            let mut performer = TerminalPerformer::new(cols as usize, rows as usize);
+            let mut parser = Parser::new();
 
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => {
                         // EOF - terminal closed
-                        let _ = event_tx_clone.send(TerminalEvent::Exit(0));
+                        if let Ok(mut state) = lifecycle_clone.lock() {
+                            state.exit = Some(0);
+                        }
                         break;
                     }
                     Ok(n) => {
-                        // Adopt a new size before parsing, so the bytes that
-                        // follow are laid out against the geometry the shell
-                        // was just told about.
-                        if let Ok(mut pending) = resize_clone.lock() {
-                            if let Some((cols, rows)) = pending.take() {
-                                performer.grid.resize(cols, rows);
-                            }
-                        }
-
-                        // Parse the data through VTE
-                        {
-                            let mut parser = parser_clone.lock().unwrap();
-                            // vte 0.15 takes the whole slice; the old per-byte
-                            // loop is gone and with it a call per byte read.
+                        // Parsing and resize mutate this same grid. The mutex
+                        // is held for one 4 KiB parser batch, not for the
+                        // blocking PTY read or the UI's text layout work.
+                        if let Ok(mut grid) = grid_clone.lock() {
+                            let mut performer = TerminalPerformer::from_grid(&mut *grid);
                             parser.advance(&mut performer, &buf[..n]);
                         }
 
-                        // Update the shared grid
-                        {
-                            let mut grid = grid_clone.lock().unwrap();
-                            *grid = performer.grid.clone();
+                        if buf[..n].contains(&0x07) {
+                            if let Ok(mut state) = lifecycle_clone.lock() {
+                                state.bell = true;
+                            }
                         }
-
-                        // Send output event
-                        let _ = event_tx_clone.send(TerminalEvent::Output(buf[..n].to_vec()));
+                        publish_activity(&activity_tx, &revision_clone);
                     }
                     Err(_) => {
-                        let _ = event_tx_clone.send(TerminalEvent::Exit(-1));
+                        if let Ok(mut state) = lifecycle_clone.lock() {
+                            state.exit = Some(-1);
+                        }
                         break;
                     }
                 }
@@ -775,10 +868,10 @@ impl TerminalManager {
             pty_pair,
             writer,
             grid,
-            event_tx,
-            event_rx,
+            activity_rx,
+            activity_revision,
+            lifecycle,
             closed: false,
-            pending_resize,
             _reader_thread: Some(reader_thread),
             child,
         })
@@ -820,28 +913,18 @@ impl TerminalManager {
             return Err(TerminalError::AlreadyClosed);
         }
 
-        self.pty_pair
-            .master
-            .resize(PtySize {
+        // Grid first, PTY second. SIGWINCH can trigger output synchronously
+        // from the shell's point of view, so notifying first permits those
+        // bytes to race ahead and parse with the old width.
+        resize_before_notify(&self.grid, cols as usize, rows as usize, || {
+            self.pty_pair.master.resize(PtySize {
                 rows,
                 cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(|e| TerminalError::PtySpawnFailed(e.to_string()))?;
-
-        // Resize the grid the view reads...
-        {
-            let mut grid = self.grid.lock().unwrap();
-            grid.resize(cols as usize, rows as usize);
-        }
-        // ...and the one the parser writes into, which would otherwise
-        // overwrite the above on the very next read.
-        if let Ok(mut pending) = self.pending_resize.lock() {
-            *pending = Some((cols as usize, rows as usize));
-        }
-
-        Ok(())
+            .map_err(|e| TerminalError::PtySpawnFailed(e.to_string()))
+        })
     }
 
     /// Close the terminal, killing the shell.
@@ -865,15 +948,32 @@ impl TerminalManager {
 
     /// Kill and reap this terminal's shell, and stop tracking it.
     fn reap(&mut self) {
-        if let Ok(mut slot) = self.child.lock() {
-            if let Some(mut child) = slot.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
+        self.reap_child(true);
+    }
+
+    /// Take sole ownership of the child, untrack it, then wait exactly once.
+    ///
+    /// Taking the `Option` is the synchronization point shared with
+    /// [`kill_all_shells`]: exactly one path receives the child and therefore
+    /// exactly one path calls `wait`. Neither the child lock nor the global
+    /// registry lock is held during `kill`/`wait`.
+    fn reap_child(&mut self, kill_first: bool) {
+        let child = self.child.lock().ok().and_then(|mut slot| slot.take());
         if let Ok(mut live) = live_shells().lock() {
             live.retain(|h| !Arc::ptr_eq(h, &self.child));
         }
+        if let Some(mut child) = child {
+            if kill_first {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+        }
+    }
+
+    /// Reap a child that has already exited, retaining its final grid.
+    fn observe_exit(&mut self) {
+        self.closed = true;
+        self.reap_child(false);
     }
 
     /// Check if the terminal is closed
@@ -881,9 +981,9 @@ impl TerminalManager {
         self.closed
     }
 
-    /// Get a copy of the current terminal grid
-    pub fn grid(&self) -> TerminalGrid {
-        self.grid.lock().unwrap().clone()
+    /// Clone only the absolute rows needed by a viewport.
+    pub fn snapshot_rows(&self, range: Range<usize>) -> TerminalSnapshot {
+        self.grid.lock().unwrap().snapshot_rows(range)
     }
 
     /// Get the terminal dimensions (cols, rows)
@@ -893,8 +993,28 @@ impl TerminalManager {
     }
 
     /// Try to receive a terminal event (non-blocking)
-    pub fn try_recv_event(&self) -> Option<TerminalEvent> {
-        self.event_rx.try_recv().ok()
+    pub fn try_recv_event(&mut self) -> Option<TerminalEvent> {
+        let lifecycle_event = if let Ok(mut lifecycle) = self.lifecycle.lock() {
+            if let Some(code) = lifecycle.exit.take() {
+                Some(TerminalEvent::Exit(code))
+            } else if lifecycle.bell {
+                lifecycle.bell = false;
+                Some(TerminalEvent::Bell)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(event) = lifecycle_event {
+            if matches!(event, TerminalEvent::Exit(_)) {
+                self.observe_exit();
+            }
+            return Some(event);
+        }
+        self.activity_rx.try_recv().ok().map(|_| {
+            TerminalEvent::Activity(self.activity_revision.load(Ordering::Acquire))
+        })
     }
 
     /// Send a key press to the terminal
@@ -1090,6 +1210,50 @@ mod tests {
             "a reaped shell must stop being tracked, or the list grows for the life of the app"
         );
         assert!(manager.is_closed());
+    }
+
+    /// A shell that exits by itself is already beyond killing, but still needs
+    /// one `wait` or it remains a zombie. This must happen when any tab's exit
+    /// event is polled, while its final parsed output remains available.
+    #[test]
+    fn a_naturally_exited_shell_is_reaped_once_and_keeps_its_final_grid() {
+        let mut manager = TerminalManager::spawn(&default_shell()).expect("spawn a shell");
+        let handle = manager.child.clone();
+        manager
+            .write_str("printf '\\nSMITHY_FINAL_GRID\\n'; exit\n")
+            .expect("tell shell to exit");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let exit = loop {
+            if let Some(TerminalEvent::Exit(code)) = manager.try_recv_event() {
+                break code;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shell never reported exit"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+
+        assert_eq!(exit, 0);
+        assert!(manager.is_closed());
+        assert!(handle.lock().unwrap().is_none(), "child was not waited");
+        assert!(!is_tracked(&handle), "exited child stayed globally tracked");
+        let snapshot = manager.snapshot_rows(0..usize::MAX);
+        let text: String = snapshot
+            .rows
+            .iter()
+            .flat_map(|row| row.iter().map(|cell| cell.c))
+            .collect();
+        assert!(
+            text.contains("SMITHY_FINAL_GRID"),
+            "reaping discarded the final terminal grid"
+        );
+
+        // The child Option was taken by the first observer. Drop, close, and
+        // signal cleanup therefore have no second child on which to call wait.
+        manager.reap_child(false);
+        assert!(handle.lock().unwrap().is_none());
     }
 
     /// Dropping a manager any other way — a panic, a torn-down tab — must also
@@ -1319,6 +1483,80 @@ mod tests {
         assert_eq!(first_row, "hello", "content survives a widening resize");
         assert_eq!(grid.cols(), 40);
         assert_eq!(grid.rows(), 10);
+    }
+
+    /// The parser used to own a private grid and copy it over the UI's resized
+    /// grid after every read. The first byte after SIGWINCH therefore restored
+    /// the stale dimensions and laid text out against the wrong width.
+    #[test]
+    fn resize_and_parser_mutate_the_same_grid_without_stale_overwrite() {
+        let grid = Arc::new(Mutex::new(TerminalGrid::new(5, 2)));
+        resize_before_notify(&grid, 10, 3, || -> Result<(), ()> {
+            // This closure stands in for redraw bytes racing directly behind
+            // SIGWINCH. It must already observe the new dimensions, and it can
+            // acquire the grid lock because no external PTY call holds it.
+            let mut guard = grid.lock().unwrap();
+            assert_eq!((guard.cols(), guard.rows()), (10, 3));
+            let mut performer = TerminalPerformer::from_grid(&mut *guard);
+            let mut parser = Parser::new();
+            parser.advance(&mut performer, b"after");
+            Ok(())
+        })
+        .unwrap();
+        let guard = grid.lock().unwrap();
+        assert_eq!((guard.cols(), guard.rows()), (10, 3));
+        assert_eq!(guard.get_cell(4, 0).unwrap().c, 'r');
+    }
+
+    /// Rendering a small viewport in a 5,000-line history must not clone any
+    /// row outside that viewport. The old full-grid snapshot paid for every
+    /// retained cell on every poll.
+    #[test]
+    fn a_row_snapshot_contains_no_rows_outside_the_request() {
+        let mut grid = TerminalGrid::new(4, 2);
+        for line in ["aaaa", "bbbb", "cccc", "dddd"] {
+            for ch in line.chars() {
+                grid.put_char(ch);
+            }
+        }
+        let snapshot = grid.snapshot_rows(1..3);
+        assert_eq!(snapshot.start_row, 1);
+        assert_eq!(snapshot.rows.len(), 2);
+        assert_eq!(
+            snapshot
+                .rows
+                .iter()
+                .map(|row| row.iter().map(|cell| cell.c).collect::<String>())
+                .collect::<Vec<_>>(),
+            ["bbbb", "cccc"]
+        );
+    }
+
+    /// The cursor row is live-grid-relative internally. Once scrollback
+    /// exists, exposing that raw number draws the cursor over old output.
+    #[test]
+    fn a_snapshot_reports_the_cursor_at_its_absolute_row() {
+        let mut grid = TerminalGrid::new(3, 2);
+        for ch in "abcdefg".chars() {
+            grid.put_char(ch);
+        }
+        let snapshot = grid.snapshot_rows(0..0);
+        assert_eq!(snapshot.cursor.1, grid.scrollback.len() + grid.cursor_row);
+        assert!(snapshot.cursor.1 >= grid.scrollback.len());
+    }
+
+    /// A PTY flood used to allocate one `Vec<u8>` and one unbounded channel
+    /// node per read while an inactive tab could not consume them. Activity is
+    /// a monotonic scalar now, and one queued wake covers the whole flood.
+    #[test]
+    fn an_output_flood_retains_one_wake_and_constant_sized_state() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let revision = AtomicU64::new(0);
+        for _ in 0..100_000 {
+            publish_activity(&tx, &revision);
+        }
+        assert_eq!(revision.load(Ordering::Acquire), 100_000);
+        assert_eq!(rx.try_iter().count(), 1);
     }
 
     #[test]

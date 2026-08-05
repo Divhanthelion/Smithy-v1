@@ -78,6 +78,22 @@ pub struct FuzzyMatch {
     pub auto_apply: bool,
 }
 
+/// More than one region survived the same tier with the same confidence.
+#[derive(Debug, Clone)]
+pub struct AmbiguousMatch {
+    pub tier: MatchTier,
+    pub confidence: f64,
+    /// Byte-exact candidate text, capped for a useful error message.
+    pub candidates: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum MatchSearch {
+    None,
+    Unique(FuzzyMatch),
+    Ambiguous(AmbiguousMatch),
+}
+
 impl FuzzyMatch {
     pub fn byte_range(&self) -> std::ops::Range<usize> {
         self.byte_offset..self.byte_offset + self.matched_text.len()
@@ -98,15 +114,24 @@ impl FuzzyMatch {
     }
 }
 
-/// Run the full cascade. Returns the first tier that matched.
-pub fn find(content: &str, old_text: &str) -> Option<FuzzyMatch> {
+/// Run the full cascade. A tier with multiple equally-good regions is a refusal,
+/// not permission to use source order as a hidden tie-breaker.
+pub fn find(content: &str, old_text: &str) -> MatchSearch {
     if old_text.is_empty() {
-        return None;
+        return MatchSearch::None;
     }
 
     // Tier 1: exact — cheapest and most certain, so it goes first.
-    if let Some(offset) = content.find(old_text) {
-        return Some(FuzzyMatch {
+    let exact_offsets: Vec<_> = content.match_indices(old_text).map(|(offset, _)| offset).collect();
+    if exact_offsets.len() > 1 {
+        return MatchSearch::Ambiguous(AmbiguousMatch {
+            tier: MatchTier::Exact,
+            confidence: 1.0,
+            candidates: vec![old_text.to_string(); exact_offsets.len().min(3)],
+        });
+    }
+    if let Some(&offset) = exact_offsets.first() {
+        return MatchSearch::Unique(FuzzyMatch {
             matched_text: old_text.to_string(),
             byte_offset: offset,
             tier: MatchTier::Exact,
@@ -117,8 +142,16 @@ pub fn find(content: &str, old_text: &str) -> Option<FuzzyMatch> {
 
     // Tier 2: the model pasted `read` output verbatim, gutter and all.
     if let Some(stripped) = strip_line_number_gutter(old_text) {
-        if let Some(offset) = content.find(&stripped) {
-            return Some(FuzzyMatch {
+        let offsets: Vec<_> = content.match_indices(&stripped).map(|(offset, _)| offset).collect();
+        if offsets.len() > 1 {
+            return MatchSearch::Ambiguous(AmbiguousMatch {
+                tier: MatchTier::GutterStripped,
+                confidence: 1.0,
+                candidates: vec![stripped; offsets.len().min(3)],
+            });
+        }
+        if let Some(&offset) = offsets.first() {
+            return MatchSearch::Unique(FuzzyMatch {
                 matched_text: stripped,
                 byte_offset: offset,
                 tier: MatchTier::GutterStripped,
@@ -128,22 +161,32 @@ pub fn find(content: &str, old_text: &str) -> Option<FuzzyMatch> {
         }
         // The gutter was real but the payload still doesn't match exactly —
         // hand the stripped form to the fuzzier tiers rather than the raw one.
-        if let Some(mut m) = fuzzy_tiers(content, &stripped) {
-            m.confidence *= 0.99;
-            return Some(m);
+        match fuzzy_tiers(content, &stripped) {
+            MatchSearch::Unique(mut found) => {
+                found.confidence *= 0.99;
+                return MatchSearch::Unique(found);
+            }
+            MatchSearch::Ambiguous(mut ambiguous) => {
+                ambiguous.confidence *= 0.99;
+                return MatchSearch::Ambiguous(ambiguous);
+            }
+            MatchSearch::None => {}
         }
     }
 
     fuzzy_tiers(content, old_text)
 }
 
-fn fuzzy_tiers(content: &str, old_text: &str) -> Option<FuzzyMatch> {
-    try_whitespace_normalized(content, old_text).or_else(|| try_line_fuzzy(content, old_text))
+fn fuzzy_tiers(content: &str, old_text: &str) -> MatchSearch {
+    match try_whitespace_normalized(content, old_text) {
+        MatchSearch::None => try_line_fuzzy(content, old_text),
+        found => found,
+    }
 }
 
 /// Count how many times `old_text` matches exactly. Used for the uniqueness
-/// check, which only applies to exact matches — a fuzzy match is by definition
-/// a single best region.
+/// check. Approximate tiers perform their own ambiguity check after
+/// normalization/scoring.
 pub fn count_exact(content: &str, old_text: &str) -> usize {
     if old_text.is_empty() {
         return 0;
@@ -224,10 +267,10 @@ fn normalize_whitespace(s: &str) -> String {
 /// whitespace. Comparing normalized *line windows* is slower but is exact by
 /// construction, because each window's byte range comes straight from the
 /// original text.
-pub fn try_whitespace_normalized(content: &str, old_text: &str) -> Option<FuzzyMatch> {
+pub fn try_whitespace_normalized(content: &str, old_text: &str) -> MatchSearch {
     let norm_old = normalize_whitespace(old_text);
     if norm_old.trim().is_empty() {
-        return None;
+        return MatchSearch::None;
     }
 
     let line_starts = line_start_offsets(content);
@@ -235,9 +278,10 @@ pub fn try_whitespace_normalized(content: &str, old_text: &str) -> Option<FuzzyM
     let target_lines = old_text.lines().count().max(1);
 
     if target_lines > content_lines.len() {
-        return None;
+        return MatchSearch::None;
     }
 
+    let mut matches = Vec::new();
     for start in 0..=(content_lines.len() - target_lines) {
         let end = start + target_lines;
         let window = &content_lines[start..end];
@@ -249,7 +293,7 @@ pub fn try_whitespace_normalized(content: &str, old_text: &str) -> Option<FuzzyM
         let last = window.last().unwrap();
         let end_offset = line_starts[end - 1] + last.len();
 
-        return Some(FuzzyMatch {
+        matches.push(FuzzyMatch {
             matched_text: content[byte_offset..end_offset].to_string(),
             byte_offset,
             tier: MatchTier::WhitespaceNormalized,
@@ -257,7 +301,7 @@ pub fn try_whitespace_normalized(content: &str, old_text: &str) -> Option<FuzzyM
             auto_apply: true,
         });
     }
-    None
+    unique_or_ambiguous(matches, MatchTier::WhitespaceNormalized, 0.98)
 }
 
 // ============================================================================
@@ -265,7 +309,7 @@ pub fn try_whitespace_normalized(content: &str, old_text: &str) -> Option<FuzzyM
 // ============================================================================
 
 /// Slide a window over the file and score each with `similar`'s diff ratio.
-pub fn try_line_fuzzy(content: &str, old_text: &str) -> Option<FuzzyMatch> {
+pub fn try_line_fuzzy(content: &str, old_text: &str) -> MatchSearch {
     try_line_fuzzy_with_threshold(content, old_text, 0.85)
 }
 
@@ -273,11 +317,11 @@ pub fn try_line_fuzzy_with_threshold(
     content: &str,
     old_text: &str,
     threshold: f64,
-) -> Option<FuzzyMatch> {
+) -> MatchSearch {
     let content_lines: Vec<&str> = content.lines().collect();
     let old_len = old_text.lines().count();
     if old_len == 0 || content_lines.is_empty() {
-        return None;
+        return MatchSearch::None;
     }
 
     let line_starts = line_start_offsets(content);
@@ -288,7 +332,8 @@ pub fn try_line_fuzzy_with_threshold(
     let granularity =
         Granularity::for_sweep(old_text, content_lines.len(), max_window - min_window);
 
-    let mut best: Option<(f64, usize, usize)> = None;
+    let mut best_score = f64::NEG_INFINITY;
+    let mut best = Vec::new();
 
     for window_size in min_window..=max_window {
         if window_size > content_lines.len() {
@@ -298,30 +343,58 @@ pub fn try_line_fuzzy_with_threshold(
             let end = start + window_size;
             let window_text = content_lines[start..end].join("\n");
             let score = similarity(old_text, &window_text, granularity);
-            if best.map(|(b, _, _)| score > b).unwrap_or(true) {
-                best = Some((score, start, end));
+            if score > best_score + f64::EPSILON {
+                best_score = score;
+                best.clear();
+                best.push((start, end));
+            } else if (score - best_score).abs() <= f64::EPSILON {
+                best.push((start, end));
             }
         }
     }
 
-    let (score, start, end) = best?;
-    if score < threshold {
-        return None;
+    if best_score < threshold {
+        return MatchSearch::None;
     }
 
-    let byte_offset = line_starts[start];
-    let last = content_lines[end - 1];
-    let end_offset = line_starts[end - 1] + last.len();
+    let matches = best
+        .into_iter()
+        .map(|(start, end)| {
+            let byte_offset = line_starts[start];
+            let last = content_lines[end - 1];
+            let end_offset = line_starts[end - 1] + last.len();
+            FuzzyMatch {
+                matched_text: content[byte_offset..end_offset].to_string(),
+                byte_offset,
+                tier: MatchTier::LineFuzzy,
+                confidence: best_score,
+                // A line-fuzzy hit rewrites text the model did not reproduce exactly.
+                // Require a high score before doing that without review.
+                auto_apply: best_score >= 0.95,
+            }
+        })
+        .collect();
+    unique_or_ambiguous(matches, MatchTier::LineFuzzy, best_score)
+}
 
-    Some(FuzzyMatch {
-        matched_text: content[byte_offset..end_offset].to_string(),
-        byte_offset,
-        tier: MatchTier::LineFuzzy,
-        confidence: score,
-        // A line-fuzzy hit rewrites text the model did not reproduce exactly.
-        // Require a high score before doing that without review.
-        auto_apply: score >= 0.95,
-    })
+fn unique_or_ambiguous(
+    matches: Vec<FuzzyMatch>,
+    tier: MatchTier,
+    confidence: f64,
+) -> MatchSearch {
+    match matches.len() {
+        0 => MatchSearch::None,
+        1 => MatchSearch::Unique(matches.into_iter().next().unwrap()),
+        _ => MatchSearch::Ambiguous(AmbiguousMatch {
+            tier,
+            confidence,
+            candidates: matches
+                .into_iter()
+                .take(3)
+                .map(|found| found.matched_text)
+                .collect(),
+        }),
+    }
 }
 
 /// What a single comparison in the sweep is scored over.
@@ -417,9 +490,16 @@ mod tests {
 
     const SAMPLE: &str = "fn main() {\n    let retry_limit = 5;\n    println!(\"hi\");\n}\n";
 
+    fn unique(search: MatchSearch) -> FuzzyMatch {
+        match search {
+            MatchSearch::Unique(found) => found,
+            other => panic!("expected one match, got {other:?}"),
+        }
+    }
+
     #[test]
     fn exact_match_wins() {
-        let m = find(SAMPLE, "let retry_limit = 5;").unwrap();
+        let m = unique(find(SAMPLE, "let retry_limit = 5;"));
         assert_eq!(m.tier, MatchTier::Exact);
         assert_eq!(m.confidence, 1.0);
         assert_eq!(&SAMPLE[m.byte_range()], "let retry_limit = 5;");
@@ -431,7 +511,7 @@ mod tests {
     #[test]
     fn strips_read_output_gutter() {
         let pasted = "     2\t    let retry_limit = 5;\n     3\t    println!(\"hi\");";
-        let m = find(SAMPLE, pasted).unwrap();
+        let m = unique(find(SAMPLE, pasted));
         assert_eq!(m.tier, MatchTier::GutterStripped);
         assert_eq!(
             &SAMPLE[m.byte_range()],
@@ -461,23 +541,52 @@ mod tests {
 
     #[test]
     fn whitespace_normalized_match() {
-        let m = find(SAMPLE, "let    retry_limit=5;").unwrap_or_else(|| {
-            find(SAMPLE, "let retry_limit  =  5;").expect("should normalize whitespace")
-        });
+        let m = unique(find(SAMPLE, "let retry_limit  =  5;"));
         assert_ne!(m.tier, MatchTier::Exact);
     }
 
     #[test]
     fn whitespace_match_maps_back_to_original_bytes() {
         let content = "struct A {\n\tfield: u8,   \n}\n";
-        let m = try_whitespace_normalized(content, "field: u8,").unwrap();
+        let m = unique(try_whitespace_normalized(content, "field: u8,"));
         assert_eq!(&content[m.byte_range()], "\tfield: u8,   ");
+    }
+
+    /// Normalization can erase the only difference between two source regions.
+    /// Source order is not evidence of intent, so neither region may win.
+    #[test]
+    fn whitespace_normalization_refuses_two_equally_valid_regions() {
+        let content = "let  value = 1;\nother();\nlet value  = 1;\n";
+        assert!(matches!(
+            find(content, "let   value   = 1;"),
+            MatchSearch::Ambiguous(AmbiguousMatch {
+                tier: MatchTier::WhitespaceNormalized,
+                ..
+            })
+        ));
+    }
+
+    /// Pasting a numbered line does not make a repeated payload unique. The old
+    /// cascade stripped the gutter and silently chose the first copy.
+    #[test]
+    fn gutter_stripping_refuses_a_repeated_payload() {
+        let content = "same();\nbetween();\nsame();\n";
+        assert!(matches!(
+            find(content, "    42\tsame();"),
+            MatchSearch::Ambiguous(AmbiguousMatch {
+                tier: MatchTier::GutterStripped,
+                ..
+            })
+        ));
     }
 
     #[test]
     fn line_fuzzy_tolerates_a_reworded_line() {
         let content = "fn a() {\n    let x = compute_value(1, 2);\n    return x;\n}\n";
-        let m = try_line_fuzzy(content, "    let x = compute_value(1, 3);\n    return x;").unwrap();
+        let m = unique(try_line_fuzzy(
+            content,
+            "    let x = compute_value(1, 3);\n    return x;",
+        ));
         assert_eq!(m.tier, MatchTier::LineFuzzy);
         assert!(m.confidence >= 0.85);
         assert!(content[m.byte_range()].contains("compute_value"));
@@ -485,7 +594,24 @@ mod tests {
 
     #[test]
     fn line_fuzzy_refuses_unrelated_text() {
-        assert!(try_line_fuzzy(SAMPLE, "totally unrelated content here\nand more of it").is_none());
+        assert!(matches!(
+            try_line_fuzzy(SAMPLE, "totally unrelated content here\nand more of it"),
+            MatchSearch::None
+        ));
+    }
+
+    /// Two regions with the same best score are ambiguous even when that score
+    /// is high enough to auto-apply. Keeping the first was a hidden tie-breaker.
+    #[test]
+    fn line_fuzzy_refuses_tied_best_regions() {
+        let content = "let value = compute(1);\nbetween();\nlet value = compute(1);\n";
+        assert!(matches!(
+            find(content, "let value = compute(2);"),
+            MatchSearch::Ambiguous(AmbiguousMatch {
+                tier: MatchTier::LineFuzzy,
+                ..
+            })
+        ));
     }
 
     /// rustcoder computed offsets as `sum(line.len() + 1)`, which is wrong for
@@ -499,14 +625,14 @@ mod tests {
         assert_eq!(offsets[0], 0);
         assert_eq!(offsets[1], 7);
         assert_eq!(offsets[2], 13);
-        let m = try_whitespace_normalized(content, "gamma").unwrap();
+        let m = unique(try_whitespace_normalized(content, "gamma"));
         assert!(content[m.byte_range()].starts_with("gamma"));
     }
 
     #[test]
     fn offsets_are_correct_without_trailing_newline() {
         let content = "alpha\nbeta";
-        let m = try_whitespace_normalized(content, "beta").unwrap();
+        let m = unique(try_whitespace_normalized(content, "beta"));
         assert_eq!(&content[m.byte_range()], "beta");
     }
 
@@ -555,7 +681,10 @@ mod tests {
             .collect();
 
         let started = std::time::Instant::now();
-        assert!(find(&content, &missing).is_none(), "nothing should match");
+        assert!(
+            matches!(find(&content, &missing), MatchSearch::None),
+            "nothing should match"
+        );
         let elapsed = started.elapsed();
 
         assert!(
@@ -573,6 +702,6 @@ mod tests {
 
     #[test]
     fn empty_old_text_never_matches() {
-        assert!(find(SAMPLE, "").is_none());
+        assert!(matches!(find(SAMPLE, ""), MatchSearch::None));
     }
 }
