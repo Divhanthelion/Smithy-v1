@@ -49,3 +49,13 @@ script.sh
 # history. They are readable at every commit before this one.
 AGENTS.md
 docs/
+
+# GH_Audit hygiene
+.DS_Store
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+target/
+dist/

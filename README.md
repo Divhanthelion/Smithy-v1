@@ -82,8 +82,8 @@ You need [Rust](https://rustup.rs) and, for the agent,
 [LM Studio](https://lmstudio.ai) with a tool-capable model loaded.
 
 ```bash
-git clone <this repo>
-cd smithy
+git clone https://github.com/Divhanthelion/Smithy-v1.git
+cd Smithy-v1
 cargo run -p smithy -- ~/code/your-project
 ```
 
