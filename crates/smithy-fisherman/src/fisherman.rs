@@ -639,9 +639,6 @@ pub fn line_path(tip: Point, depth: f64, sway: f64) -> BezPath {
     path
 }
 
-/// How long this session has been running, in seconds.
-///
-
 /// The stage along the rail: his scale, where it starts, and how far it runs.
 ///
 /// Shared with the preview harness, because a layout that exists in two
@@ -679,6 +676,7 @@ pub struct Scene {
 /// nowhere else — `launched` is a parameter rather than `session_seconds()`
 /// because that OnceLock cannot be reset, and two scenes in one process would
 /// otherwise share a launch time (the preview's whole reason for existing).
+#[allow(clippy::too_many_arguments)]
 pub fn scene_at(
     width: f64,
     height: f64,

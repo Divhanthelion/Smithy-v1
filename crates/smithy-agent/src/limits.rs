@@ -5,9 +5,10 @@
 //! the model does. Step and time budgets are per user-turn; the context budget
 //! is cumulative and read from the endpoint's own token accounting.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use smithy_tools::GatePause;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Limits {
@@ -100,6 +101,10 @@ pub struct Budget {
     tool_result_chars: usize,
     warned: bool,
     warned_steps: bool,
+    /// Shared with tool-ctx hooks so Review wait is not counted as a loop.
+    gate: GatePause,
+    /// Actual tool calls this turn, including parallel ones in a step.
+    tool_calls: usize,
 }
 
 impl Budget {
@@ -113,6 +118,12 @@ impl Budget {
     /// context ceiling can only fire *after* a doomed first call has already
     /// been billed — exactly the failure at 130k against a 110k hard stop.
     pub fn seeded(limits: Limits, last_prompt_tokens: i64) -> Self {
+        Self::with_gate(limits, last_prompt_tokens, GatePause::default())
+    }
+
+    /// Same as [`Self::seeded`], sharing a pause with the tool context so a
+    /// Review wait does not burn the wall clock.
+    pub fn with_gate(limits: Limits, last_prompt_tokens: i64, gate: GatePause) -> Self {
         Budget {
             limits,
             started: Instant::now(),
@@ -121,7 +132,14 @@ impl Budget {
             tool_result_chars: 0,
             warned: false,
             warned_steps: false,
+            gate,
+            tool_calls: 0,
         }
+    }
+
+    fn elapsed_at(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.started)
+            .saturating_sub(self.gate.paused_at(now))
     }
 
     /// The step at which the model is told to start wrapping up.
@@ -139,26 +157,34 @@ impl Budget {
     /// never been told it was running out, so it neither finished nor reported
     /// what remained.
     pub fn should_warn_steps(&mut self) -> Option<String> {
-        if self.warned_steps || self.steps < self.wrap_up_step() {
+        let used = self.tool_calls.max(self.steps);
+        if self.warned_steps || used < self.wrap_up_step() {
             return None;
         }
         self.warned_steps = true;
-        let left = self.limits.max_steps.saturating_sub(self.steps);
+        let left = self.limits.max_steps.saturating_sub(used);
         Some(format!(
-            "You have used {} of {} tool calls for this turn; about {left} remain. Start \
+            "You have used {used} of {} tool calls for this turn; about {left} remain. Start \
              finishing: verify what you have already changed, then reply with what is done and \
              what is still outstanding. Do not begin new work you cannot complete.",
-            self.steps, self.limits.max_steps
+            self.limits.max_steps
         ))
     }
 
     /// Call at the top of each loop iteration. `Err` means a ceiling was hit.
     pub fn tick(&mut self) -> Result<(), Stop> {
+        self.tick_at(Instant::now())
+    }
+
+    fn tick_at(&mut self, now: Instant) -> Result<(), Stop> {
         self.steps += 1;
         if self.steps > self.limits.max_steps {
             return Err(Stop::Steps(self.limits.max_steps));
         }
-        if self.started.elapsed().as_secs() > self.limits.max_seconds {
+        if self.tool_calls >= self.limits.max_steps {
+            return Err(Stop::Steps(self.limits.max_steps));
+        }
+        if self.elapsed_at(now) >= Duration::from_secs(self.limits.max_seconds) {
             return Err(Stop::Time(self.limits.max_seconds));
         }
         if self.last_prompt_tokens > self.limits.context_hard {
@@ -169,6 +195,21 @@ impl Budget {
 
     pub fn step(&self) -> usize {
         self.steps
+    }
+
+    /// Remaining wall-clock budget, ignoring time spent waiting on the user.
+    pub fn remaining(&self) -> Duration {
+        let cap = Duration::from_secs(self.limits.max_seconds);
+        cap.saturating_sub(self.elapsed_at(Instant::now()))
+    }
+
+    /// Count tools executed in this step, including parallel ones.
+    pub fn record_tool_calls(&mut self, n: usize) {
+        self.tool_calls = self.tool_calls.saturating_add(n);
+    }
+
+    pub fn tool_calls(&self) -> usize {
+        self.tool_calls
     }
 
     /// Record the prompt token count from the last completion. Returns a warning
@@ -326,7 +367,41 @@ mod tests {
     #[test]
     fn stop_reasons_are_legible() {
         assert_eq!(Stop::Steps(60).to_string(), "step limit reached (60)");
+        assert_eq!(Stop::Time(3600).to_string(), "time limit reached (3600s)");
         assert!(Stop::Context(120_000).to_string().contains("120000 tokens"));
+    }
+
+    #[test]
+    fn stops_at_the_time_ceiling() {
+        let mut b = Budget::new(Limits {
+            max_seconds: 10,
+            ..limits()
+        });
+        let later = Instant::now() + Duration::from_secs(11);
+        assert_eq!(b.tick_at(later), Err(Stop::Time(10)));
+    }
+
+    /// A human reading a diff is not a runaway loop. The wall clock has to
+    /// ignore the wait or walking away from Review kills the turn.
+    #[test]
+    fn waiting_on_the_user_does_not_count_against_the_clock() {
+        let gate = GatePause::default();
+        let mut b = Budget::with_gate(
+            Limits {
+                max_seconds: 10,
+                ..limits()
+            },
+            0,
+            gate.clone(),
+        );
+        let t0 = Instant::now();
+        let _hold = gate.hold();
+        let later = t0 + Duration::from_secs(30);
+        assert_eq!(
+            b.tick_at(later),
+            Ok(()),
+            "Review wait must not burn the turn clock"
+        );
     }
 
     /// One web_fetch at default is ~64k chars. Without an aggregate cap those
@@ -350,10 +425,7 @@ mod tests {
             second.contains("narrow the query"),
             "over the cap must tell the model what to do: {second}"
         );
-        assert!(
-            second.contains("running long"),
-            "and say why: {second}"
-        );
+        assert!(second.contains("running long"), "and say why: {second}");
         // The body is still intact — we warn, we do not truncate.
         assert!(second.starts_with(&"y".repeat(50)));
         assert_eq!(b.tool_result_chars(), 110);
@@ -365,5 +437,34 @@ mod tests {
         let large = tool_result_warn_for_window(1_000_000);
         assert!(large > small);
         assert_eq!(small, ((32_768.0_f64) * 0.08 * 4.0) as usize);
+    }
+
+    #[test]
+    fn the_step_warning_counts_tool_calls_not_just_loop_iterations() {
+        let mut b = Budget::new(Limits {
+            max_steps: 10,
+            ..limits()
+        });
+        b.tick().ok();
+        b.record_tool_calls(8);
+        let warning = b.should_warn_steps().expect("warned");
+        assert!(
+            warning.contains("used 8 of 10 tool calls"),
+            "the counted unit is what the message must name: {warning}"
+        );
+    }
+
+    #[test]
+    fn remaining_budget_shrinks_with_elapsed_time() {
+        let b = Budget::new(Limits {
+            max_seconds: 10,
+            ..limits()
+        });
+        let left = b.remaining();
+        assert!(left <= Duration::from_secs(10));
+        assert!(
+            left > Duration::from_secs(8),
+            "a fresh budget still has nearly all of it: {left:?}"
+        );
     }
 }

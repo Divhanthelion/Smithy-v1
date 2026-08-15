@@ -466,7 +466,7 @@ mod tests {
     fn a_file_already_attached_is_not_attached_again() {
         let tmp = tempfile::tempdir().unwrap();
         let path = write(tmp.path(), "a.rs", b"fn a() {}");
-        let first = collect(&[path.clone()], tmp.path(), &[]);
+        let first = collect(std::slice::from_ref(&path), tmp.path(), &[]);
         let second = collect(&[path], tmp.path(), &first);
         assert!(second.is_empty(), "{second:?}");
     }

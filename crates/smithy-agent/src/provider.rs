@@ -77,6 +77,20 @@ pub struct CompletionRequest<'a> {
     /// The tool schema array, built once per session and reused verbatim.
     pub tools: &'a Value,
     pub sampling: &'a Sampling,
+    /// Remaining turn budget. Providers apply `min(this, their configured
+    /// timeout)` on the HTTP request so a stuck completion cannot outlive the
+    /// turn clock. `None` keeps the client-level timeout (tests, probes).
+    pub timeout: Option<std::time::Duration>,
+}
+
+impl CompletionRequest<'_> {
+    /// Bound this request by both the turn clock and the backend's own cap.
+    pub fn http_timeout(&self, configured: std::time::Duration) -> std::time::Duration {
+        match self.timeout {
+            Some(remaining) => remaining.min(configured),
+            None => configured,
+        }
+    }
 }
 
 /// A streamed fragment.
@@ -152,6 +166,18 @@ pub trait Provider: Send + Sync {
         request: CompletionRequest<'_>,
         on_delta: Option<&(dyn Fn(Delta) + Send + Sync)>,
     ) -> Result<Completion, ProviderError>;
+
+    /// JSON body this provider would POST for `request`.
+    ///
+    /// Inspection reads this, not a reconstruction, so an adapter that munges
+    /// the messages is visible. The default is the OpenAI `messages` + `tools`
+    /// pair; real providers add sampling and stream flags.
+    fn build_body(&self, request: &CompletionRequest<'_>) -> Value {
+        serde_json::json!({
+            "messages": request.history.to_api(),
+            "tools": request.tools,
+        })
+    }
 }
 
 /// A provider that replays a script, and the helpers for writing one.
@@ -204,6 +230,48 @@ pub mod test_support {
                 .unwrap()
                 .pop_front()
                 .ok_or_else(|| ProviderError::Other("script exhausted".into()))
+        }
+    }
+
+    /// A provider whose `complete` never returns. The turn clock has to cut it
+    /// off — a client-level HTTP timeout of an hour would not.
+    pub struct HangingProvider {
+        pub calls: Mutex<usize>,
+    }
+
+    impl Default for HangingProvider {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl HangingProvider {
+        pub fn new() -> Self {
+            Self {
+                calls: Mutex::new(0),
+            }
+        }
+
+        pub fn call_count(&self) -> usize {
+            *self.calls.lock().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl Provider for HangingProvider {
+        fn name(&self) -> &str {
+            "hanging"
+        }
+        fn model(&self) -> &str {
+            "hang"
+        }
+        async fn complete(
+            &self,
+            _request: CompletionRequest<'_>,
+            _on_delta: Option<&(dyn Fn(Delta) + Send + Sync)>,
+        ) -> Result<Completion, ProviderError> {
+            *self.calls.lock().unwrap() += 1;
+            std::future::pending().await
         }
     }
 

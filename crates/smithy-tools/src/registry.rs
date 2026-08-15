@@ -13,7 +13,8 @@
 //! the security scanner all attach through it without any tool knowing they
 //! exist.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -28,17 +29,96 @@ pub struct Todo {
     pub status: String,
 }
 
+/// Time spent waiting on the user, which the turn clock must not treat as a
+/// runaway loop.
+///
+/// Review and shell approval hold this while a human decides. [`Clone`] shares
+/// the same pause with the agent's wall clock — the type lives here because
+/// the hooks that wait are the ones that know the wait started.
+///
+/// A tool must not touch this. It is a hook seam.
+#[derive(Clone, Default)]
+pub struct GatePause {
+    inner: Arc<Mutex<GatePauseInner>>,
+}
+
+#[derive(Default)]
+struct GatePauseInner {
+    depth: u32,
+    paused_at: Option<Instant>,
+    accumulated: Duration,
+}
+
+/// RAII hold: the clock stays paused until this is dropped, including when the
+/// future waiting on the user is cancelled.
+pub struct GateHold {
+    gate: GatePause,
+}
+
+impl Drop for GateHold {
+    fn drop(&mut self) {
+        self.gate.release();
+    }
+}
+
+impl GatePause {
+    /// Pause until the returned guard is dropped.
+    pub fn hold(&self) -> GateHold {
+        self.acquire();
+        GateHold { gate: self.clone() }
+    }
+
+    fn acquire(&self) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.depth == 0 {
+            inner.paused_at = Some(Instant::now());
+        }
+        inner.depth = inner.depth.saturating_add(1);
+    }
+
+    fn release(&self) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.depth == 0 {
+            return;
+        }
+        inner.depth -= 1;
+        if inner.depth == 0 {
+            if let Some(since) = inner.paused_at.take() {
+                inner.accumulated += Instant::now().saturating_duration_since(since);
+            }
+        }
+    }
+
+    /// How long this pause has been held, as of `now`.
+    ///
+    /// An open hold counts the interval through `now` so a budget tick during
+    /// a wait sees the wait, not wall time.
+    pub fn paused_at(&self, now: Instant) -> Duration {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut total = inner.accumulated;
+        if let Some(since) = inner.paused_at {
+            total += now.saturating_duration_since(since);
+        }
+        total
+    }
+}
+
 /// Everything a tool is allowed to reach.
 ///
 /// Deliberately minimal: a tool gets the workspace capability and the shared
 /// todo list, and nothing else. It cannot reach the model, the UI, or the
 /// filesystem outside the workspace.
 ///
+/// [`Self::gate`] is for hooks, not tools: Review and shell approval pause the
+/// turn clock while the user decides. A human reading a diff is not a runaway
+/// loop.
+///
 /// `Mutex` rather than coda's `RefCell` because tools now run on an async
 /// runtime and the context is shared across tasks.
 pub struct ToolCtx {
     pub workspace: Workspace,
     pub todos: Mutex<Vec<Todo>>,
+    pub gate: GatePause,
 }
 
 impl ToolCtx {
@@ -46,6 +126,7 @@ impl ToolCtx {
         Self {
             workspace,
             todos: Mutex::new(Vec::new()),
+            gate: GatePause::default(),
         }
     }
 
@@ -57,7 +138,7 @@ impl ToolCtx {
 /// A callable tool.
 #[async_trait]
 pub trait Tool: Send + Sync {
-    fn name(&self) -> &'static str;
+    fn name(&self) -> &str;
 
     /// The schema advertised to the model. Must be constant for the lifetime of
     /// a session — see [`crate::schema`] on prefix-cache stability.
@@ -160,7 +241,7 @@ impl Registry {
         self
     }
 
-    pub fn names(&self) -> Vec<&'static str> {
+    pub fn names(&self) -> Vec<&str> {
         self.tools.iter().map(|t| t.name()).collect()
     }
 
@@ -233,6 +314,19 @@ impl Registry {
             }
         }
 
+        // After hooks have had their say: a Deny already returned. Absence of a
+        // hook that speaks for bash is still deny. Write-review and similar
+        // hooks must not accidentally open the shell. `cd ..` out of the
+        // project remains possible — that is why the default is closed.
+        if call.name == "bash" && !self.bash_is_governed() {
+            return ToolResult::err(
+                call,
+                "`bash` was not run: no shell policy is installed. A subprocess is not confined \
+                 by the workspace capability; install a shell-approval (or allow-bash) hook \
+                 before this tool can run.",
+            );
+        }
+
         let output = tool.run(&args, ctx).await;
         ToolResult {
             tool_call_id: call.id.clone(),
@@ -241,11 +335,30 @@ impl Registry {
             is_error: output.is_error,
         }
     }
+
+    fn bash_is_governed(&self) -> bool {
+        self.hooks
+            .iter()
+            .any(|h| matches!(h.name(), "shell-approval" | "allow-bash"))
+    }
 }
 
 impl Default for Registry {
     fn default() -> Self {
         Registry::core()
+    }
+}
+
+/// For tests and non-UI consumers that have already decided bash may run.
+///
+/// Named so [`Registry::execute`] treats it as a shell policy. The app's
+/// `ShellApprovalHook` is the production equivalent.
+pub struct AllowBash;
+
+#[async_trait]
+impl ToolHook for AllowBash {
+    fn name(&self) -> &'static str {
+        "allow-bash"
     }
 }
 
@@ -409,5 +522,62 @@ mod tests {
     #[test]
     fn middle_truncate_leaves_short_text_alone() {
         assert_eq!(middle_truncate("short", 100), "short");
+    }
+
+    /// An open hold must count through the Instant the budget tick uses, not
+    /// through a second `now()` that would miss the wait.
+    #[test]
+    fn an_open_hold_counts_through_the_tick_instant() {
+        let gate = GatePause::default();
+        let t0 = Instant::now();
+        let _hold = gate.hold();
+        let later = t0 + Duration::from_secs(30);
+        assert!(
+            gate.paused_at(later) >= Duration::from_secs(29),
+            "the wait the user spent reading has to be visible to the clock"
+        );
+    }
+
+    #[test]
+    fn dropping_the_hold_stops_the_pause_from_growing() {
+        let gate = GatePause::default();
+        let t0 = Instant::now();
+        {
+            let _hold = gate.hold();
+        }
+        let after = gate.paused_at(t0 + Duration::from_secs(1));
+        let later = gate.paused_at(t0 + Duration::from_secs(60));
+        assert_eq!(after, later, "released pause must not keep accumulating");
+    }
+
+    #[tokio::test]
+    async fn core_registry_refuses_bash_until_a_policy_is_installed() {
+        let (_t, ctx) = ctx();
+        let result = Registry::core()
+            .execute(
+                &ToolCall::new("1", "bash", r#"{"command":"echo hi"}"#),
+                &ctx,
+            )
+            .await;
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("no shell policy"),
+            "{}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn an_allow_bash_hook_lets_the_command_run() {
+        let (_t, ctx) = ctx();
+        let result = Registry::core()
+            .with_hook(AllowBash)
+            .execute(
+                &ToolCall::new("1", "bash", r#"{"command":"echo hi"}"#),
+                &ctx,
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(result.content, "hi");
     }
 }

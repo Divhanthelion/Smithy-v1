@@ -35,10 +35,13 @@ from the provider's cache rather than being paid for again. On a recent session
 that was 76–79%. Most tools show you a spend figure; this one shows you where
 it went.
 
-**The sandbox is a capability, not a path check.** The tool layer holds a
+**The sandbox is a capability, not a path check.** Filesystem tools hold a
 `cap-std` directory handle for your project root, so the operating system itself
-refuses to let the agent out — symlinks included. There is no string comparison
-to outwit.
+refuses to let those reads and writes out — symlinks included. There is no
+string comparison to outwit. Shell is different: `bash` is a subprocess, not a
+capability, and it does not run until a shell-approval hook is installed.
+Environment names matching `*_API_KEY`, `*_TOKEN`, and `*_SECRET` are scrubbed
+from the child; `cd ..` out of the project remains possible.
 
 **The call graph is resolved by the compiler.** Edges come from rust-analyzer
 via SCIP, not from matching names. Name matching was tried first and measured:
@@ -67,9 +70,10 @@ your data — applied to the part of coding nobody wants to type.
 **Honestly, what it is not:** macOS only, and Apple Silicon is where it makes
 sense. The deep features — symbol index, call graph — are Rust; other languages
 get syntax highlighting, LSP and the agent, but not the map. Dictation costs
-what it saves: the editor is 200 MB until you load Whisper, and about 3.2 GB
-after, because the weights are currently loaded at f32 on the CPU. That is a
-known and fixable inefficiency rather than a floor — see
+what it saves: the editor is 200 MB until you load Whisper, and about 1.5 GB
+after, because the weights are held as f16 on the CPU. English only, in 30-second
+chunks with no overlap. Metal is out of scope. That is a known and fixable
+inefficiency rather than a floor — see
 [known gaps](#known-gaps). It is young, and that list is the real one, not a
 polite one. If you want the most mature agent IDE, it is not this. If you want
 one whose claims you can verify, that is the whole idea.
@@ -200,11 +204,12 @@ landed. A measured session made 25 edits in a single turn and spent **26 of its
 76 tool calls** re-editing files and polling them with `grep` and escalating
 `sleep`s, trying to find out. The edits had all been approved and written.
 
-The trade: a turn blocked on a review counts against its wall-clock budget, so
-walking away mid-review will eventually end the turn. The header says which mode
-you are in — **`✓ edits reviewed`** or **`⚠ edits land directly`**. Click it to
-switch. Auto-approve is worth it for a long implementation run against a plan you
-have already read; it skips the modal entirely.
+The wait itself does not count against the turn's wall-clock budget — a human
+reading a diff is not a runaway loop. Walking away mid-review no longer kills
+the turn. The header says which mode you are in — **`✓ edits reviewed`** or
+**`⚠ edits land directly`**. Click it to switch. Auto-approve is worth it for a
+long implementation run against a plan you have already read; it skips the modal
+entirely.
 
 **New session** in the panel header (or **Agent → New Session**) is the one that
 forgets. The `↺` icon beside it only clears the transcript you're looking at —
@@ -252,13 +257,47 @@ cargo run -p smithy-project --example symbols -- . DesktopMsg
 With a Brave Search API key set under Backend Settings, the agent gets
 `web_search`. Without one it still gets `web_fetch`, so it can read any URL you
 or it names — it just can't discover URLs. `web_fetch` refuses non-http schemes
-and private/loopback addresses, including after a redirect.
+and private/loopback addresses, including numeric, hex, octal, and IPv6 forms,
+and it re-checks every redirect hop (and the resolved address) before requesting
+it. That closes casual DNS rebinding, not a determined attacker flipping TTLs.
 
 It also gets `explore`: a read-only sub-agent that answers one bounded question
 by searching on its own and returning a short written answer with `path:line`
 citations. Its intermediate reads stay in its own context instead of filling
 yours. It can't write, edit, run commands, or call itself, and it stops after
-about a dozen tool calls and reports partially rather than grinding.
+about a dozen tool calls and reports partially rather than grinding. That bound
+is deliberate — Explore is not Research.
+
+**`/research`** starts a Research Session: Brave search without the coding
+"two or three searches is enough" cap, fetch, read, and one `write` of a note
+at `docs/research/YYYY-MM-DD-<slug>.md` through Review. No `bash`, `edit`, or
+`explore`. Two hours on the clock. Sequential — one model.
+
+**`/grill-me`** starts a Grill Session: an interview that asks the whole
+frontier as `❓ Qn` and waits. It can `read` / `explore` for facts. It cannot
+`write`, `edit`, or `bash`. When you confirm a shared understanding, start a
+coding Session to implement.
+
+Type `/` in the composer for the picker. `@path` on a command becomes an
+Attachment, same as drop. Click a budget-bar row (system prompt, map, tool
+JSON, conversation) or **last request** to see exactly what was sent.
+
+### MCP
+
+Servers listed in `.smithy/mcp.json` (Project, then `~/.smithy/mcp.json`;
+Project replaces a whole entry on name conflict) are wrapped as Smithy tools
+when `"enabled": true`. Smithy still dispatches; the names are `{server}_{tool}`
+(`github_get_me`). Edit the file, then **New session** — the tool list is frozen
+for the Session, like the core set. Explore does not inherit MCP tools.
+
+Omitted `enabled` is off. `allowed_tools` is the server's names before prefixing;
+omit it for every tool `list_tools` returned, `[]` for none. Secrets in headers
+use `${NAME}` and resolve keychain-first (GitHub PAT account `github-pat`, env
+`GITHUB_PERSONAL_ACCESS_TOKEN`). A dead server is omitted with a Notice; the
+Session still starts.
+
+HTTP and stdio in v1. Sample row: [`docs/mcp.json.example`](docs/mcp.json.example).
+There is no marketplace and no `/mcp` Command.
 
 ### Reference setup
 
@@ -382,8 +421,9 @@ measurable accuracy cost.
 
 ### The terminal
 
-A real shell, with scrollback, in a panel at the bottom. New terminals open at
-your project root.
+A shell-output panel at the bottom, with scrollback. New terminals open at
+your project root. It is not a fullscreen TTY: TUIs that need alternate screens
+or raw cursor addressing are unsupported.
 
 ---
 
@@ -411,6 +451,11 @@ rest have no UI and are read every time.
 | `BRAVE_API_KEY` | *(none)* | Brave Search key, if it isn't in the credential store. Absent means no `web_search` tool |
 | `SMITHY_WORKER_THREADS` | core count | background threads; kept modest, since the machine is also serving a model |
 | `SMITHY_LSP_LIGHT=1` | off | trades real compiler diagnostics for rust-analyzer's largest memory saving |
+| `SMITHY_SKY_LAT` / `SMITHY_SKY_LON` | San Francisco | observer location for the Forged sky backdrop |
+
+Sessions and settings live under `~/.local/share/smithy`. That is the XDG data
+directory, used on macOS as well so a single path works everywhere the crates
+run. Conversations are per-project: `~/.local/share/smithy/projects/<project>/sessions/*.json`.
 
 The dictation hotkey is stored in `~/.local/share/smithy/voice-hotkey` as the
 string you'd type — `cmd+shift+v`, any order, any case. Edit it to rebind.
@@ -480,11 +525,15 @@ most of the build, and are not worth it.
 ## Budgets
 
 A turn stops on whichever ceiling it reaches first: tool calls, wall clock, or
-context. The step ceiling **scales with the model's context window** — 60 at 32k,
-120 at 128k, 180 at 1M — because a flat 60 killed a turn that had used 6% of its
-context budget. At four-fifths of the way through, the agent is told how many
-calls remain and asked to finish and report what is outstanding, rather than
-being cut off mid-edit with no warning.
+context. On LM Studio the clock is **one hour**; Review (and shell approval)
+wait does not count. The panel repeats the Stop reason (`time limit reached
+(3600s)`, `step limit reached (N)`, `context ceiling reached (N tokens)`) next
+to the budget bar so it is not buried in the transcript. The step ceiling
+**scales with the model's context window** — 60 at 32k, 120 at 128k, 180 at 1M
+— because a flat 60 killed a turn that had used 6% of its context budget. At
+four-fifths of the way through, the agent is told how many calls remain and
+asked to finish and report what is outstanding, rather than being cut off
+mid-edit with no warning.
 
 Project context scales the same way: ~5% of the window rather than a flat 6k
 tokens, floored at the old value and capped at 40k.
@@ -525,13 +574,14 @@ Honest list, short:
 
 - **Reconnect doesn't notice a model unloaded underneath it.** Restart to clear.
 - **A running tool can't be interrupted** — Stop applies between steps.
-- **Only rust-analyzer is exercised.** Other language servers are configured but
-  untried; if you use one, we'd like to hear how it went.
+- **Only rust-analyzer is spawned.** Other language servers are configured for
+  detection and PATH checks; they are not started. Full-document `did_change` is
+  sent on every keystroke — incremental edits are not implemented.
 - **The agent's picture of your project is a snapshot** from when the session
   started. After restructuring a project, start a new conversation.
-- **Whisper costs about 3.2 GB resident, and it should not.** The weights ship
-  as f16 and are loaded as f32 — 809M parameters at four bytes each — on the CPU,
-  while the GPU idles. Loading at f16 halves it; a quantized GGUF
+- **Whisper costs about 1.5 GB resident.** The weights ship and load as f16
+  (809M parameters). English only, 30-second chunks, no overlap. The GPU is not
+  used; Metal is out of scope. A quantized GGUF
   (`candle-transformers` already ships `whisper::quantized_model`) should reach
   roughly 400–600 MB. Until then, dictation is by far the most expensive thing
   in the editor.
@@ -546,9 +596,10 @@ or LSP layer, the output from the relevant debug flag above.
 ## Building on it
 
 ```bash
-cargo test --workspace     # 963 passing
-cargo build --workspace    # 0 warnings, and it stays 0
-cargo clippy --workspace --all-targets
+cargo test --workspace
+cargo test -p smithy-fisherman --features harness   # golden raster checks; also run in CI
+cargo build --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 Eight crates. `apps/smithy` is the binary; the rest are libraries:
@@ -567,9 +618,10 @@ Eight crates. `apps/smithy` is the binary; the rest are libraries:
 `smithy-voice` have **no UI dependency**, so a different front-end would be a
 new consumer of the same core rather than a rewrite.
 
-The sandbox is a capability, not a path check: the tool layer holds a `cap-std`
-directory handle for your project root, so the OS itself refuses to let the
-agent out — symlinks included.
+The sandbox for filesystem tools is a capability, not a path check: those tools
+hold a `cap-std` directory handle for your project root, so the OS itself refuses
+to let those reads and writes out — symlinks included. Shell is gated by
+approval, not by that capability.
 
 ## Licence
 

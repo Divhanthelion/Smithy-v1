@@ -210,7 +210,11 @@ async fn list_deepseek(base_url: &str, api_key: Option<&str>) -> Result<Vec<Mode
         })
         .collect();
 
-    entries.sort_by(|a, b| b.context_length.cmp(&a.context_length).then(a.id.cmp(&b.id)));
+    entries.sort_by(|a, b| {
+        b.context_length
+            .cmp(&a.context_length)
+            .then(a.id.cmp(&b.id))
+    });
     Ok(entries)
 }
 
@@ -230,10 +234,7 @@ fn client(timeout: u64) -> Result<reqwest::Client, String> {
         .map_err(|e| format!("could not build an HTTP client: {e}"))
 }
 
-async fn list_openrouter(
-    base_url: &str,
-    api_key: Option<&str>,
-) -> Result<Vec<ModelEntry>, String> {
+async fn list_openrouter(base_url: &str, api_key: Option<&str>) -> Result<Vec<ModelEntry>, String> {
     let url = format!("{}/models", base_url.trim_end_matches('/'));
     let mut request = client(20)?.get(&url);
     if let Some(key) = api_key.filter(|k| !k.trim().is_empty()) {
@@ -312,11 +313,10 @@ fn price(model: &serde_json::Value, field: &str) -> Option<f64> {
 
 async fn list_lmstudio(base_url: &str) -> Result<Vec<ModelEntry>, String> {
     let url = native_models_url(base_url);
-    let response = client(10)?
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("could not reach LM Studio at {url}: {e}. Is the server running?"))?;
+    let response =
+        client(10)?.get(&url).send().await.map_err(|e| {
+            format!("could not reach LM Studio at {url}: {e}. Is the server running?")
+        })?;
     if !response.status().is_success() {
         return Err(format!(
             "LM Studio returned HTTP {} when listing models. The native API needs a recent build.",
@@ -360,10 +360,19 @@ fn parse_lmstudio_entry(model: &serde_json::Value) -> Option<ModelEntry> {
         .map(|i| !i.is_empty())
         .unwrap_or(false);
 
+    let loaded_ctx = model["loaded_instances"]
+        .as_array()
+        .and_then(|i| i.first())
+        .and_then(|i| i["config"]["context_length"].as_i64());
+    // Loaded KV wins. The spec (`max_context_length`) is what an unloaded
+    // model *can* take, and advertising it for a 32k instance is how the
+    // picker used to imply a 262k session.
+    let context_length = loaded_ctx.or_else(|| model["max_context_length"].as_i64());
+
     Some(ModelEntry {
         label: model["display_name"].as_str().unwrap_or(&id).to_string(),
         id,
-        context_length: model["max_context_length"].as_i64(),
+        context_length,
         // Absent means yes, matching `probe_model`'s existing default: an older
         // build that does not report capabilities should not have its whole
         // library hidden behind the tool-capable filter.
@@ -565,7 +574,12 @@ mod tests {
 
     // --- OpenRouter ---
 
-    fn openrouter_model(id: &str, prompt: &str, completion: &str, tools: bool) -> serde_json::Value {
+    fn openrouter_model(
+        id: &str,
+        prompt: &str,
+        completion: &str,
+        tools: bool,
+    ) -> serde_json::Value {
         json!({
             "id": id,
             "name": format!("Name of {id}"),
@@ -645,8 +659,7 @@ mod tests {
             openrouter_model("free", "0", "0", true),
         ]});
         let data = body["data"].as_array().unwrap();
-        let mut entries: Vec<ModelEntry> =
-            data.iter().filter_map(parse_openrouter_entry).collect();
+        let mut entries: Vec<ModelEntry> = data.iter().filter_map(parse_openrouter_entry).collect();
         entries.sort_by(|a, b| {
             b.tier
                 .is_free()
@@ -689,6 +702,25 @@ mod tests {
     fn an_unloaded_local_model_says_only_its_size() {
         let entry = parse_lmstudio_entry(&lmstudio_model("m", false, true, "llm")).unwrap();
         assert!(!entry.badge().contains("loaded"), "{}", entry.badge());
+        assert_eq!(entry.context_length, Some(262144));
+    }
+
+    /// The 262k-vs-32k confusion: a loaded instance is bounded by its KV, not
+    /// by the architecture's maximum.
+    #[test]
+    fn a_loaded_instance_reports_its_kv_window_not_the_spec() {
+        let model = json!({
+            "type": "llm",
+            "key": "qwen",
+            "display_name": "Qwen",
+            "max_context_length": 262144,
+            "size_bytes": 1u64,
+            "loaded_instances": [{ "config": { "context_length": 32768 } }],
+            "capabilities": { "trained_for_tool_use": true }
+        });
+        let entry = parse_lmstudio_entry(&model).unwrap();
+        assert_eq!(entry.context_length, Some(32_768));
+        assert_eq!(entry.context_label(), "32k ctx");
     }
 
     /// TTS and ASR entries are typed `llm` by LM Studio and are the reason the
@@ -742,7 +774,10 @@ mod tests {
 
     #[test]
     fn a_flat_error_string_is_also_understood() {
-        assert_eq!(explain_error(r#"{"error":"out of memory"}"#, 500), "out of memory");
+        assert_eq!(
+            explain_error(r#"{"error":"out of memory"}"#, 500),
+            "out of memory"
+        );
         assert_eq!(explain_error(r#"{"message":"nope"}"#, 500), "nope");
     }
 
@@ -752,7 +787,10 @@ mod tests {
     fn an_unusable_body_falls_back_to_the_status_code() {
         assert_eq!(explain_error("", 503), "HTTP 503");
         assert_eq!(explain_error("{", 500), "HTTP 500");
-        assert_eq!(explain_error("plain text failure", 500), "plain text failure");
+        assert_eq!(
+            explain_error("plain text failure", 500),
+            "plain text failure"
+        );
     }
 
     #[test]

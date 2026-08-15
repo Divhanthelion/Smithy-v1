@@ -26,10 +26,12 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::limits::Limits;
 use crate::message::{History, Message};
 use crate::provider::Sampling;
+use crate::skill::SessionKind;
 
 /// A stored session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +66,16 @@ pub struct StoredSession {
     /// `#[serde(default)]` so every session written before this parses.
     #[serde(default)]
     pub reasoning: Vec<ReasoningEntry>,
+    /// Tool profile this conversation was built with. Default Coding so every
+    /// session written before kinds existed still resumes as a coding Session.
+    #[serde(default)]
+    pub kind: SessionKind,
+    /// Frozen OpenAI `tools` array. Resume sends these bytes even if an MCP
+    /// server is down; execute then errors for missing names. Absent on
+    /// sessions written before this field existed — those recompute from the
+    /// live registry, as before.
+    #[serde(default)]
+    pub tools: Option<Value>,
 }
 
 /// One completion's reasoning, with enough context to line it up afterwards.
@@ -79,7 +91,7 @@ pub struct ReasoningEntry {
     pub text: String,
 }
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 impl StoredSession {
     pub fn from_history(
@@ -90,7 +102,16 @@ impl StoredSession {
         sampling: &Sampling,
         limits: &Limits,
     ) -> StoredSession {
-        Self::from_history_with_reasoning(id, workspace, model, history, sampling, limits, Vec::new())
+        Self::from_history_with_reasoning(
+            id,
+            workspace,
+            model,
+            history,
+            sampling,
+            limits,
+            Vec::new(),
+            SessionKind::Coding,
+        )
     }
 
     /// As [`StoredSession::from_history`], keeping the reasoning sidecar.
@@ -103,6 +124,7 @@ impl StoredSession {
         sampling: &Sampling,
         limits: &Limits,
         reasoning: Vec<ReasoningEntry>,
+        kind: SessionKind,
     ) -> StoredSession {
         let now = unix_seconds();
         let messages = history.messages().to_vec();
@@ -118,7 +140,15 @@ impl StoredSession {
             limits: limits.clone(),
             messages,
             reasoning,
+            kind,
+            tools: None,
         }
+    }
+
+    /// Pin the tool JSON that was advertised when this Session was built.
+    pub fn with_tools(mut self, tools: Value) -> StoredSession {
+        self.tools = Some(tools);
+        self
     }
 
     /// Rebuild the history exactly as it was.
@@ -166,7 +196,12 @@ impl SessionStore {
         Ok(SessionStore { root })
     }
 
-    /// The default location: `~/.local/share/smithy/sessions`.
+    /// Fallback location: `~/.local/share/smithy/sessions`.
+    ///
+    /// That is the XDG data directory. The app uses it on macOS as well, so a
+    /// single path works everywhere this crate might run. The editor itself
+    /// stores conversations under `~/.local/share/smithy/projects/<project>/sessions`;
+    /// this method is the crate-level default for non-UI consumers.
     pub fn default_location() -> Result<SessionStore, String> {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
@@ -528,6 +563,63 @@ mod tests {
         );
         store.save(&stored).unwrap();
         assert_eq!(store.load("s1").unwrap().model, "qwen3.6-27b · MLX 4bit");
+    }
+
+    #[test]
+    fn session_kind_round_trips_instead_of_collapsing_to_coding() {
+        let (_t, store) = store();
+        let stored = StoredSession::from_history_with_reasoning(
+            "s1",
+            Path::new("/tmp"),
+            "m",
+            &sample_history(),
+            &Sampling::default(),
+            &Limits::default(),
+            Vec::new(),
+            SessionKind::Research,
+        );
+        store.save(&stored).unwrap();
+        assert_eq!(store.load("s1").unwrap().kind, SessionKind::Research);
+    }
+
+    #[test]
+    fn frozen_tools_round_trip_instead_of_being_recomputed() {
+        let (_t, store) = store();
+        let tools = serde_json::json!([{"type":"function","function":{"name":"github_get_me"}}]);
+        let stored = StoredSession::from_history(
+            "s1",
+            Path::new("/tmp"),
+            "m",
+            &sample_history(),
+            &Sampling::default(),
+            &Limits::default(),
+        )
+        .with_tools(tools.clone());
+        store.save(&stored).unwrap();
+        assert_eq!(store.load("s1").unwrap().tools, Some(tools));
+    }
+
+    #[test]
+    fn sessions_written_before_tools_still_load() {
+        let (_t, store) = store();
+        let stored = StoredSession::from_history(
+            "s1",
+            Path::new("/tmp"),
+            "m",
+            &sample_history(),
+            &Sampling::default(),
+            &Limits::default(),
+        );
+        let mut value = serde_json::to_value(&stored).unwrap();
+        value.as_object_mut().unwrap().remove("tools");
+        value["version"] = serde_json::json!(1);
+        std::fs::write(
+            store.root().join("s1.json"),
+            serde_json::to_string(&value).unwrap(),
+        )
+        .unwrap();
+        let loaded = store.load("s1").unwrap();
+        assert!(loaded.tools.is_none());
     }
 
     #[test]

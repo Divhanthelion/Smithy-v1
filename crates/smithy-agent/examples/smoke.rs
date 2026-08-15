@@ -14,7 +14,8 @@
 use std::sync::Arc;
 
 use smithy_agent::{
-    create_provider_from_env, session::default_system_prompt, Outcome, Session, SessionConfig, TurnEvent,
+    create_provider_from_env, session::default_system_prompt, Outcome, Session, SessionConfig,
+    TurnEvent,
 };
 use smithy_tools::{Registry, ToolCtx, Workspace};
 
@@ -56,12 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let prompt = default_system_prompt(ws.root(), &registry.names(), None);
     let ctx = Arc::new(ToolCtx::new(ws));
 
-    let mut session = Session::new(
-        provider.clone(),
-        registry,
-        ctx,
-        SessionConfig::new(prompt),
-    );
+    let mut session = Session::new(provider.clone(), registry, ctx, SessionConfig::new(prompt));
 
     let sink = |event: TurnEvent| match event {
         TurnEvent::ToolStarted {

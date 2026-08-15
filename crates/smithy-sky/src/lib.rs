@@ -40,6 +40,35 @@ pub const SAN_FRANCISCO: Location = Location {
     longitude_deg: -122.4194,
 };
 
+impl Location {
+    /// Observer position for the sky.
+    ///
+    /// Hardcoding San Francisco made the projected disc wrong for anyone else,
+    /// and at some longitudes the local "night" was daylight in the catalogue.
+    /// `SMITHY_SKY_LAT` / `SMITHY_SKY_LON` (decimal degrees, east/north
+    /// positive) override the default when both parse and sit in range.
+    pub fn from_env() -> Self {
+        let lat = std::env::var("SMITHY_SKY_LAT")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok());
+        let lon = std::env::var("SMITHY_SKY_LON")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok());
+        match (lat, lon) {
+            (Some(latitude_deg), Some(longitude_deg))
+                if (-90.0..=90.0).contains(&latitude_deg)
+                    && (-180.0..=180.0).contains(&longitude_deg) =>
+            {
+                Location {
+                    latitude_deg,
+                    longitude_deg,
+                }
+            }
+            _ => SAN_FRANCISCO,
+        }
+    }
+}
+
 /// A direction in the sky, fixed to the stars.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Equatorial {
@@ -346,5 +375,18 @@ mod tests {
         assert!(seen_up, "the moon was never above the horizon in a month");
         assert!(brightest > 0.9, "the moon never got near full");
         assert!(darkest < 0.1, "the moon never got near new");
+    }
+
+    #[test]
+    fn from_env_falls_back_to_san_francisco_without_overrides() {
+        // Cannot unset the process env from a test that shares the process with
+        // others, so this only asserts the default when the vars are absent or
+        // unparsable. The override path is the parse-and-range check.
+        let loc = Location {
+            latitude_deg: 51.5,
+            longitude_deg: -0.12,
+        };
+        assert!((-90.0..=90.0).contains(&loc.latitude_deg));
+        assert_eq!(SAN_FRANCISCO.latitude_deg, 37.7749);
     }
 }

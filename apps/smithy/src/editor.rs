@@ -31,6 +31,7 @@ impl EditorComponent {
         active_buffer: RwSignal<Option<BufferId>>,
         buffer_manager: Rc<RefCell<BufferManager>>,
         open_editor: RwSignal<Option<smithy_editor::EditorHandle>>,
+        aesthetic: RwSignal<smithy_editor::Aesthetic>,
     ) -> impl IntoView {
         dyn_container(
             move || active_buffer.get(),
@@ -50,7 +51,8 @@ impl EditorComponent {
 
                     match loaded {
                         Some((path, content)) => {
-                            let (view, handle) = smithy_editor::code_editor(path, &content);
+                            let (view, handle) =
+                                smithy_editor::code_editor(path, &content, aesthetic);
                             open_editor.set(Some(handle));
                             Box::new(
                                 Container::new(view)
@@ -58,18 +60,22 @@ impl EditorComponent {
                             ) as Box<dyn View>
                         }
                         None => Box::new(
-                            Container::new(smithy_editor::empty_editor_with_map(project_map)).style(
-                                |s| s.width_full().height_full().min_height(0.0),
-                            ),
-                        )
-                            as Box<dyn View>,
+                            Container::new(smithy_editor::empty_editor_with_map(
+                                project_map,
+                                aesthetic,
+                            ))
+                            .style(|s| s.width_full().height_full().min_height(0.0)),
+                        ) as Box<dyn View>,
                     }
                 }
                 None => {
                     open_editor.set(None);
                     Box::new(
-                        Container::new(smithy_editor::empty_editor_with_map(project_map))
-                            .style(|s| s.width_full().height_full().min_height(0.0)),
+                        Container::new(smithy_editor::empty_editor_with_map(
+                            project_map,
+                            aesthetic,
+                        ))
+                        .style(|s| s.width_full().height_full().min_height(0.0)),
                     ) as Box<dyn View>
                 }
             },
@@ -131,6 +137,35 @@ pub fn handle_file_open(
     }
 }
 
+/// Open an inspection buffer. Not a Project file: no LSP, no watcher, no save.
+pub fn handle_scratch_open(
+    name: String,
+    content: String,
+    buffer_manager: &Rc<RefCell<BufferManager>>,
+    active_buffer: RwSignal<Option<BufferId>>,
+    buffer_states: RwSignal<Vec<BufferState>>,
+    open_editor: RwSignal<Option<smithy_editor::EditorHandle>>,
+) {
+    let path = std::path::PathBuf::from("inspect").join(&name);
+    let Ok(mut manager) = buffer_manager.try_borrow_mut() else {
+        return;
+    };
+    let id = manager.open_scratch(path.clone(), &content);
+    let already_active = manager.active_id() == Some(id);
+    manager.set_active(Some(id));
+    update_buffer_states(&manager, buffer_states);
+    drop(manager);
+
+    if already_active {
+        if let Some(handle) = open_editor.get_untracked() {
+            if handle.path == path {
+                handle.replace_content(&content);
+            }
+        }
+    }
+    active_buffer.set(Some(id));
+}
+
 /// Update buffer states signal from manager
 fn update_buffer_states(manager: &BufferManager, buffer_states: RwSignal<Vec<BufferState>>) {
     let states: Vec<BufferState> = manager
@@ -146,7 +181,7 @@ fn update_buffer_states(manager: &BufferManager, buffer_states: RwSignal<Vec<Buf
                         .and_then(|n| n.to_str())
                         .map(String::from)
                         .unwrap_or_else(|| "Untitled".to_string()),
-                    is_dirty: buffer.is_dirty(),
+                    is_dirty: false,
                     path: buffer.path().map(|p| p.display().to_string()),
                 }
             })

@@ -119,7 +119,9 @@ impl DeepSeek {
             )
         })?;
         if api_key.trim().is_empty() {
-            return Err(ProviderError::Other("DEEPSEEK_API_KEY is empty.".to_string()));
+            return Err(ProviderError::Other(
+                "DEEPSEEK_API_KEY is empty.".to_string(),
+            ));
         }
         let base_url = std::env::var("DEEPSEEK_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
         let model = std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
@@ -190,8 +192,7 @@ impl Provider for DeepSeek {
         if status.as_u16() == 401 || status.as_u16() == 403 {
             return Err(ProviderError::Http {
                 status: status.as_u16(),
-                body: "DeepSeek rejected the API key. Check it under Settings → Agent."
-                    .to_string(),
+                body: "DeepSeek rejected the API key. Check it under Settings → Agent.".to_string(),
             });
         }
         Ok(())
@@ -253,6 +254,7 @@ impl Provider for DeepSeek {
             .post(self.chat_url())
             .bearer_auth(&self.api_key)
             .json(&self.build_body(&request))
+            .timeout(request.http_timeout(REQUEST_TIMEOUT))
             .send()
             .await
             .map_err(|e| ProviderError::Unreachable {
@@ -291,6 +293,10 @@ impl Provider for DeepSeek {
 
         out.tool_calls = build_tool_calls(partials);
         Ok(out)
+    }
+
+    fn build_body(&self, request: &CompletionRequest<'_>) -> Value {
+        DeepSeek::build_body(self, request)
     }
 }
 
@@ -371,6 +377,7 @@ mod tests {
             history: &history,
             tools: &tools,
             sampling: &sampling,
+            timeout: None,
         });
         assert_eq!(body["stream"], json!(true));
         assert_eq!(body["stream_options"]["include_usage"], json!(true));

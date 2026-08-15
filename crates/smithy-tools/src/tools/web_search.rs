@@ -38,6 +38,23 @@ const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 const DEFAULT_COUNT: i64 = 8;
 const MAX_COUNT: i64 = 20;
 
+const DESCRIPTION: &str =
+    "Search the web and return titles, URLs and short descriptions. Use it when the \
+             answer depends on something outside this repository — a library's current API, an \
+             error message you do not recognise, a version's release notes. Do not use it for \
+             anything about this codebase; `grep` and `read` are faster and authoritative. \
+             Search returns descriptions, not pages: follow up with `web_fetch` on the one or \
+             two URLs that look right. Two or three searches is usually enough; if that has not \
+             answered it, say so rather than searching again.";
+
+const RESEARCH_DESCRIPTION: &str =
+    "Search the web and return titles, URLs and short descriptions. Use it when the \
+             answer depends on something outside this repository. Do not use it for anything \
+             about this codebase; `grep` and `read` are faster and authoritative. Search returns \
+             descriptions, not pages: follow up with `web_fetch` on the URLs that look right. \
+             Keep searching while a query would produce diagnostic evidence against a frozen \
+             hypothesis. Stop when a pass adds none.";
+
 /// How much of a description survives. Brave's are already short; this catches
 /// the occasional one that is a whole paragraph.
 const MAX_DESCRIPTION_CHARS: usize = 300;
@@ -56,6 +73,8 @@ pub enum KeySource {
 pub struct WebSearch {
     http: reqwest::Client,
     key: KeySource,
+    /// Research Sessions must not reuse the coding "two or three is enough" line.
+    research: bool,
 }
 
 impl WebSearch {
@@ -67,6 +86,7 @@ impl WebSearch {
                 .build()
                 .unwrap_or_default(),
             key: KeySource::Ready(api_key.into()),
+            research: false,
         }
     }
 
@@ -78,7 +98,15 @@ impl WebSearch {
                 .build()
                 .unwrap_or_default(),
             key: KeySource::Deferred(Arc::new(lookup)),
+            research: false,
         }
+    }
+
+    /// Description without the coding-session search budget. Frozen into the
+    /// tool JSON for a Research Session.
+    pub fn for_research(mut self) -> Self {
+        self.research = true;
+        self
     }
 
     fn resolve_key(&self) -> Result<String, String> {
@@ -101,13 +129,11 @@ impl Tool for WebSearch {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::new(
             "web_search",
-            "Search the web and return titles, URLs and short descriptions. Use it when the \
-             answer depends on something outside this repository — a library's current API, an \
-             error message you do not recognise, a version's release notes. Do not use it for \
-             anything about this codebase; `grep` and `read` are faster and authoritative. \
-             Search returns descriptions, not pages: follow up with `web_fetch` on the one or \
-             two URLs that look right. Two or three searches is usually enough; if that has not \
-             answered it, say so rather than searching again.",
+            if self.research {
+                RESEARCH_DESCRIPTION
+            } else {
+                DESCRIPTION
+            },
             vec![
                 ToolParameter::string(
                     "query",
@@ -193,8 +219,9 @@ fn describe_failure(status: u16) -> String {
         429 => "Brave Search is rate limiting. Wait before searching again, or answer from what \
                 you already have."
             .to_string(),
-        500..=599 => "Brave Search is having trouble. Try once more, then proceed without it."
-            .to_string(),
+        500..=599 => {
+            "Brave Search is having trouble. Try once more, then proceed without it.".to_string()
+        }
         other => format!("Brave Search returned HTTP {other}."),
     }
 }
@@ -330,8 +357,14 @@ mod tests {
         assert_eq!(shorten("short"), "short");
     }
 
-    /// A bad key and a rate limit call for opposite responses, so they must not
-    /// share a message.
+    #[test]
+    fn a_research_description_does_not_cap_searches_at_two_or_three() {
+        let coding = WebSearch::new("k").definition().description;
+        let research = WebSearch::new("k").for_research().definition().description;
+        assert!(coding.contains("Two or three searches is usually enough"));
+        assert!(!research.contains("Two or three"));
+        assert!(research.contains("diagnostic evidence"));
+    }
     #[test]
     fn failures_are_distinguished_by_what_to_do_about_them() {
         assert!(describe_failure(401).contains("Do not retry"));

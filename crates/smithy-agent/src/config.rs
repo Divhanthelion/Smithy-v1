@@ -53,6 +53,9 @@ pub const OPENROUTER_KEY: &str = "openrouter-api-key";
 /// Credential-store account name for the Brave Search key.
 pub const BRAVE_KEY: &str = "brave-api-key";
 
+/// Credential-store account name for a GitHub PAT (MCP servers).
+pub const GITHUB_PAT: &str = "github-pat";
+
 /// Credential-store account name for the DeepSeek key.
 pub const DEEPSEEK_KEY: &str = "deepseek-api-key";
 
@@ -129,6 +132,17 @@ impl ProviderChoice {
     pub fn api_key(self) -> Option<String> {
         let (account, env_var) = self.key_names()?;
         api_key(account, env_var)
+    }
+
+    /// How long one coding turn may run before the wall-clock ceiling fires.
+    ///
+    /// Local models think slowly; fifteen minutes was the wall while testing
+    /// Qwen 3.8 on-device. Hosted endpoints keep the original quarter-hour.
+    pub fn turn_seconds(self) -> u64 {
+        match self {
+            ProviderChoice::LmStudio => 3600,
+            ProviderChoice::OpenRouter | ProviderChoice::DeepSeek => 900,
+        }
     }
 }
 
@@ -447,11 +461,7 @@ pub mod secrets {
     /// successfully read. The settings dialog uses this so opening it does not
     /// cost a password prompt.
     pub fn is_stored(account: &str) -> bool {
-        if cache()
-            .lock()
-            .ok()
-            .is_some_and(|c| c.contains_key(account))
-        {
+        if cache().lock().ok().is_some_and(|c| c.contains_key(account)) {
             return true;
         }
         read_presence().get(account).copied().unwrap_or(false)
@@ -556,10 +566,18 @@ mod tests {
     #[test]
     fn settings_survive_a_round_trip() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut config = AgentConfig::default();
-        config.provider = ProviderChoice::OpenRouter;
-        config.openrouter.model = "anthropic/claude-opus-4".to_string();
-        config.lmstudio.model = "qwen3.6-27b".to_string();
+        let config = AgentConfig {
+            provider: ProviderChoice::OpenRouter,
+            openrouter: Endpoint {
+                model: "anthropic/claude-opus-4".to_string(),
+                ..Endpoint::openrouter_default()
+            },
+            lmstudio: Endpoint {
+                model: "qwen3.6-27b".to_string(),
+                ..Endpoint::lmstudio_default()
+            },
+            ..AgentConfig::default()
+        };
 
         config.save(tmp.path()).unwrap();
         assert_eq!(AgentConfig::load(tmp.path()), config);
@@ -579,9 +597,17 @@ mod tests {
     #[test]
     fn both_endpoints_are_kept_across_a_switch() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut config = AgentConfig::default();
-        config.lmstudio.model = "local-model".to_string();
-        config.openrouter.model = "cloud-model".to_string();
+        let mut config = AgentConfig {
+            lmstudio: Endpoint {
+                model: "local-model".to_string(),
+                ..Endpoint::lmstudio_default()
+            },
+            openrouter: Endpoint {
+                model: "cloud-model".to_string(),
+                ..Endpoint::openrouter_default()
+            },
+            ..AgentConfig::default()
+        };
 
         config.provider = ProviderChoice::OpenRouter;
         config.save(tmp.path()).unwrap();
@@ -594,8 +620,10 @@ mod tests {
 
     #[test]
     fn the_active_endpoint_follows_the_selection() {
-        let mut config = AgentConfig::default();
-        config.provider = ProviderChoice::LmStudio;
+        let mut config = AgentConfig {
+            provider: ProviderChoice::LmStudio,
+            ..AgentConfig::default()
+        };
         assert_eq!(config.active().base_url, "http://localhost:1234/v1");
         config.provider = ProviderChoice::OpenRouter;
         assert_eq!(config.active().base_url, "https://openrouter.ai/api/v1");
@@ -616,6 +644,14 @@ mod tests {
         assert!(ProviderChoice::OpenRouter.needs_api_key());
         assert!(ProviderChoice::DeepSeek.needs_api_key());
         assert!(!ProviderChoice::LmStudio.needs_api_key());
+    }
+
+    /// On-device with thinking cannot do thorough work in fifteen minutes.
+    #[test]
+    fn a_local_backend_gets_an_hour_hosted_keeps_a_quarter() {
+        assert_eq!(ProviderChoice::LmStudio.turn_seconds(), 3600);
+        assert_eq!(ProviderChoice::OpenRouter.turn_seconds(), 900);
+        assert_eq!(ProviderChoice::DeepSeek.turn_seconds(), 900);
     }
 
     /// The whole point of `ALL`: a backend added to the enum but not the list
@@ -644,7 +680,10 @@ mod tests {
 
         let config = AgentConfig::load(tmp.path());
         assert_eq!(config.provider, ProviderChoice::OpenRouter);
-        assert_eq!(config.openrouter.model, "gpt-oss-20b:free", "kept, not reset");
+        assert_eq!(
+            config.openrouter.model, "gpt-oss-20b:free",
+            "kept, not reset"
+        );
         assert_eq!(config.lmstudio.model, "qwen3.6-27b", "kept, not reset");
         assert_eq!(
             config.deepseek.base_url,
@@ -656,11 +695,21 @@ mod tests {
     #[test]
     fn all_three_endpoints_survive_a_round_trip() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut config = AgentConfig::default();
-        config.provider = ProviderChoice::DeepSeek;
-        config.deepseek.model = "deepseek-v4-pro".to_string();
-        config.openrouter.model = "cloud".to_string();
-        config.lmstudio.model = "local".to_string();
+        let config = AgentConfig {
+            provider: ProviderChoice::DeepSeek,
+            deepseek: Endpoint {
+                model: "deepseek-v4-pro".to_string(),
+                ..Endpoint::deepseek_default()
+            },
+            openrouter: Endpoint {
+                model: "cloud".to_string(),
+                ..Endpoint::openrouter_default()
+            },
+            lmstudio: Endpoint {
+                model: "local".to_string(),
+                ..Endpoint::lmstudio_default()
+            },
+        };
 
         config.save(tmp.path()).unwrap();
         let reloaded = AgentConfig::load(tmp.path());

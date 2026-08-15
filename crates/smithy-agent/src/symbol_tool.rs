@@ -115,11 +115,7 @@ impl Tool for SymbolLookup {
 }
 
 impl SymbolLookup {
-    fn render_definitions(
-        &self,
-        name: &str,
-        hits: &[smithy_project::symbols::Symbol],
-    ) -> String {
+    fn render_definitions(&self, name: &str, hits: &[smithy_project::symbols::Symbol]) -> String {
         let mut out = String::new();
         let shown = hits.len().min(MAX_DEFINITIONS);
 
@@ -198,9 +194,8 @@ impl SymbolLookup {
             );
         }
 
-        let mut out = format!(
-            "No symbol is named exactly `{name}`. Similar names that do exist:\n\n"
-        );
+        let mut out =
+            format!("No symbol is named exactly `{name}`. Similar names that do exist:\n\n");
         for symbol in near {
             out.push_str(&format!("- {} — {}\n", symbol.name, symbol.render()));
         }
@@ -241,7 +236,11 @@ mod tests {
     async fn asking_for_an_enum_returns_every_variant() {
         let out = ask(index_from(SOURCE), "DesktopMsg").await;
         assert!(!out.is_error, "{}", out.content);
-        assert!(out.content.contains("CloseWindow(String)"), "{}", out.content);
+        assert!(
+            out.content.contains("CloseWindow(String)"),
+            "{}",
+            out.content
+        );
         assert!(out.content.contains("DesktopClick"), "{}", out.content);
         assert!(out.content.contains("2 variants"), "{}", out.content);
     }

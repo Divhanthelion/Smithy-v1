@@ -23,10 +23,8 @@ mod voice;
 
 /// Temporary: log every key event a handler actually receives.
 ///
-/// Off unless `SMITHY_KEY_DEBUG=1`. Here because static reading of the event
-/// migration could not distinguish "the handler never fires" from "it fires but
-/// the match fails" — and those have opposite fixes. Delete once the keyboard
-/// regressions are closed.
+/// Off unless `SMITHY_KEY_DEBUG=1`. Distinguishes "the handler never fires"
+/// from "it fires but the match fails" — those have opposite fixes.
 pub fn key_debug(where_: &str, ev: &floem::prelude::KeyboardEvent) {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -39,8 +37,10 @@ pub fn key_debug(where_: &str, ev: &floem::prelude::KeyboardEvent) {
     );
 }
 
-use app_state::{connect_agent, init_state, setup_agent_effect, submit_task};
-use editor::{handle_file_open, handle_tab_click, handle_tab_close, EditorComponent};
+use app_state::{connect_agent, init_state, reconnect_agent, setup_agent_effect, submit_task};
+use editor::{
+    handle_file_open, handle_scratch_open, handle_tab_click, handle_tab_close, EditorComponent,
+};
 use terminal::MultiTerminalComponent;
 
 /// Everything that has to be told to stop, reachable from a signal handler.
@@ -414,6 +414,7 @@ fn app_view() -> impl IntoView {
                         signals.active_buffer,
                         buffer_manager_for_editor.clone(),
                         open_editor,
+                        signals.aesthetic,
                     ))
                     .style(|s| s.flex_grow(1.0).width_full().min_height(0.0)),
                 ))
@@ -454,14 +455,26 @@ fn app_view() -> impl IntoView {
         // started afterwards was unreachable without restarting the editor.
         let for_reconnect = agent_state.clone();
         let on_reconnect = move || {
-            for_reconnect.panel.connected.set(false);
-            for_reconnect.panel.model_label.set("connecting…".into());
-            connect_agent(&for_reconnect);
+            reconnect_agent(&for_reconnect);
         };
         let settings_dir_for_open = settings_dir.clone();
         let on_settings = move || settings::open(settings_state, &settings_dir_for_open);
         let for_clear = agent_state.clone();
         let on_clear_context = move || app_state::clear_context(&for_clear);
+        let inspect_buffers = app_state.buffer_manager.clone();
+        let inspect_active = signals.active_buffer;
+        let inspect_states = signals.buffer_states;
+        let inspect_editor = open_editor;
+        let on_inspect = std::rc::Rc::new(move |name: String, body: String| {
+            handle_scratch_open(
+                name,
+                body,
+                &inspect_buffers,
+                inspect_active,
+                inspect_states,
+                inspect_editor,
+            );
+        });
         smithy_editor::agent_panel(
             agent_state.panel,
             on_send,
@@ -471,6 +484,7 @@ fn app_view() -> impl IntoView {
             on_reconnect,
             on_settings,
             on_clear_context,
+            on_inspect,
             voice_hotkey.describe(),
         )
     };
@@ -695,6 +709,30 @@ fn app_view() -> impl IntoView {
     // outlives the borrow.
     let aesthetic_data_dir = agent_state.registry.data_dir().to_path_buf();
 
+    // File → Open Project and ⌘O both open a native modal. That cannot run
+    // inside a winit event handler: `rfd`'s blocking picker pumps AppKit while
+    // winit still holds the current event, and the next window event panics
+    // with "tried to handle event while another event is currently being
+    // handled". The async dialog is started from tokio; the chosen directory
+    // comes back through this channel so the project switch happens in a
+    // reactive effect rather than mid-event.
+    let (project_pick_tx, project_pick_rx) = crossbeam_channel::unbounded::<std::path::PathBuf>();
+    let project_pick_signal = floem::reactive::RwSignal::new(None::<std::path::PathBuf>);
+    // The one bridge that is right to leave carrying a payload. Coalescing to the
+    // last value is the *correct* semantics here: open the dialog three times and
+    // you want the project you finally chose, not three switches in a row. Every
+    // other bridge went through `app_state::bridge` for exactly the opposite
+    // reason.
+    floem::ext_event::update_signal_from_channel(project_pick_signal.write_only(), project_pick_rx);
+    {
+        let agent_for_pick = agent_state.clone();
+        floem::reactive::Effect::new(move |_| {
+            if let Some(dir) = project_pick_signal.get() {
+                switch_project(&agent_for_pick, dir);
+            }
+        });
+    }
+
     // --- Menu bar ---
     let menu_state = smithy_editor::MenuBarState::new();
     // Whether a language server is meant to be up. Drives the memory meter's
@@ -708,8 +746,8 @@ fn app_view() -> impl IntoView {
                     "Open Project…",
                     smithy_editor::accel("O"),
                     {
-                        let agent_state = agent_state.clone();
-                        move || open_project_dialog(&agent_state)
+                        let tx = project_pick_tx.clone();
+                        move || request_open_project(tx.clone())
                     },
                 ),
                 smithy_editor::MenuItem::action_with(
@@ -851,11 +889,7 @@ fn app_view() -> impl IntoView {
                 }),
                 smithy_editor::MenuItem::action("Reconnect", {
                     let agent_state = agent_state.clone();
-                    move || {
-                        agent_state.panel.connected.set(false);
-                        agent_state.panel.model_label.set("connecting…".into());
-                        connect_agent(&agent_state);
-                    }
+                    move || reconnect_agent(&agent_state)
                 }),
             ],
         ),
@@ -946,26 +980,6 @@ fn app_view() -> impl IntoView {
     let agent_visible_signal = signals.agent_visible;
     let terminal_visible_signal = signals.terminal_visible;
     let sidebar_visible_signal = signals.sidebar_visible;
-    // ⌘O opens a native modal, which cannot be done from inside the keyboard
-    // event handler (see `file_dialog::pick_folder_async`). The dialog runs on
-    // the tokio runtime and the chosen directory comes back through a channel,
-    // so the project switch happens in a reactive effect rather than mid-event.
-    let (project_pick_tx, project_pick_rx) = crossbeam_channel::unbounded::<std::path::PathBuf>();
-    let project_pick_signal = floem::reactive::RwSignal::new(None::<std::path::PathBuf>);
-    // The one bridge that is right to leave carrying a payload. Coalescing to the
-    // last value is the *correct* semantics here: open the dialog three times and
-    // you want the project you finally chose, not three switches in a row. Every
-    // other bridge went through `app_state::bridge` for exactly the opposite
-    // reason.
-    floem::ext_event::update_signal_from_channel(project_pick_signal.write_only(), project_pick_rx);
-    {
-        let agent_for_pick = agent_state.clone();
-        floem::reactive::Effect::new(move |_| {
-            if let Some(dir) = project_pick_signal.get() {
-                switch_project(&agent_for_pick, dir);
-            }
-        });
-    }
 
     // One tick a minute drives the sky. The sky moves a quarter degree in that
     // time, which is already finer than the backdrop can show.
@@ -986,7 +1000,7 @@ fn app_view() -> impl IntoView {
         smithy_editor::celestial::sky_backdrop(
             aesthetic,
             sky_tick,
-            smithy_editor::celestial::DEFAULT_LOCATION,
+            smithy_editor::celestial::current_location(),
         ),
         smithy_editor::circuit_backdrop(aesthetic, diagnostics.by_file),
         editor_view,
@@ -1059,16 +1073,7 @@ fn app_view() -> impl IntoView {
                 // first commit without anything ever being bound to it.
                 if key_event.key == floem::prelude::Key::Character("o".into()) && cmd {
                     handled = true;
-                    // Not called inline: the blocking dialog re-enters AppKit
-                    // while it is still dispatching this key, and winit aborts.
-                    // The async dialog yields instead, so this handler returns
-                    // first and the chosen directory arrives over the channel.
-                    let tx = project_pick_tx.clone();
-                    crate::runtime::tokio_runtime().spawn(async move {
-                        if let Some(dir) = smithy_editor::file_dialog::pick_folder_async().await {
-                            let _ = tx.send(dir);
-                        }
-                    });
+                    request_open_project(project_pick_tx.clone());
                 }
                 // Hover at the caret.
                 if key_event.key == floem::prelude::Key::Character("k".into())
@@ -1157,7 +1162,6 @@ fn app_view() -> impl IntoView {
     let review_project = agent_state.project.clone();
     let pending_changes = agent_state.review.pending.clone();
 
-    // Resolve the reviewed change and surface the next queued one, if any.
     // Resolve *this* review and surface the next queued one, if any.
     //
     // Takes the id, not the path: one turn can queue two writes to the same
@@ -1167,10 +1171,6 @@ fn app_view() -> impl IntoView {
         move |id: String| current_diff.set(agent::discard_change(&pending_changes, &id))
     };
 
-    // Both the panel and the model learn how a review resolved. The panel entry
-    // is immediate feedback for the user; the queued note reaches the model at
-    // the head of its next turn, because by now its tool result is frozen in
-    // history. See `agent::describe_review_outcome`.
     // Deliver a review decision to whoever is waiting for it.
     //
     // The tool call is suspended inside `WriteReviewHook`, so the answer goes
@@ -1341,9 +1341,7 @@ fn app_view() -> impl IntoView {
                             if switched {
                                 app_state::clear_context(&agent_state);
                             } else {
-                                agent_state.panel.connected.set(false);
-                                agent_state.panel.model_label.set("connecting…".into());
-                                connect_agent(&agent_state);
+                                reconnect_agent(&agent_state);
                             }
                         }
                         Err(e) => settings_state.report(e, true),
@@ -1480,7 +1478,7 @@ fn shell_approval_modal(
 /// like a wall of `pub struct` and nothing like the Benzi-style call map.
 fn refresh_project_map(agent: &app_state::AgentState, map: floem::reactive::RwSignal<String>) {
     let project = agent.project.borrow().clone();
-    let (tx, rx) = crossbeam_channel::bounded::<String>(1);
+    let tx = project_map_tx(map);
 
     runtime::tokio_runtime().spawn(async move {
         let rendered = tokio::task::spawn_blocking(move || project.outline())
@@ -1488,23 +1486,46 @@ fn refresh_project_map(agent: &app_state::AgentState, map: floem::reactive::RwSi
             .unwrap_or_default();
         let _ = tx.send(rendered);
     });
-
-    // Same bridge every other payload uses.
-    let (tick, inbox) = app_state::bridge(rx);
-    floem::reactive::Effect::new(move |_| {
-        tick.get();
-        for rendered in app_state::drain(&inbox) {
-            map.set(rendered);
-        }
-    });
 }
 
-/// Ask for a directory, then ground the agent in it.
-fn open_project_dialog(agent: &app_state::AgentState) {
-    let Some(dir) = smithy_editor::file_dialog::pick_folder() else {
-        return;
-    };
-    switch_project(agent, dir);
+/// One channel and one Effect for the map, for the life of the process.
+///
+/// Installing a new Effect on every project switch leaked the previous
+/// listener: each still woke on its tick and wrote into the same signal.
+fn project_map_tx(map: floem::reactive::RwSignal<String>) -> crossbeam_channel::Sender<String> {
+    use std::sync::OnceLock;
+    static TX: OnceLock<crossbeam_channel::Sender<String>> = OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = crossbeam_channel::bounded::<String>(1);
+        let (tick, inbox) = app_state::bridge(rx);
+        floem::reactive::Effect::new(move |_| {
+            tick.get();
+            for rendered in app_state::drain(&inbox) {
+                map.set(rendered);
+            }
+        });
+        tx
+    })
+    .clone()
+}
+
+/// Ask for a directory without re-entering the native event loop.
+///
+/// The blocking picker runs `NSOpenPanel.runModal()`, which pumps AppKit while
+/// winit still holds the current event. The next mouse-move then panics:
+/// "tried to handle event while another event is currently being handled".
+/// Starting the async sheet from a tokio worker lets this handler return first;
+/// [`switch_project`] runs later, from the channel effect.
+fn request_open_project(tx: crossbeam_channel::Sender<std::path::PathBuf>) {
+    // Queue past the current winit event so rfd's hop onto the main thread
+    // cannot nest inside it. Zero is enough: `exec_after` does not run inline.
+    floem::action::exec_after(std::time::Duration::ZERO, move |_| {
+        crate::runtime::tokio_runtime().spawn(async move {
+            if let Some(dir) = smithy_editor::file_dialog::pick_folder_async().await {
+                let _ = tx.send(dir);
+            }
+        });
+    });
 }
 
 /// Re-ground the agent in a different project.
@@ -1585,6 +1606,9 @@ fn switch_project(agent: &app_state::AgentState, root: std::path::PathBuf) {
     // in — the same class of mistake `review.abandon` above exists to prevent.
     agent.panel.clear_attachments();
     agent.panel.project_root.set(project.root.clone());
+    *agent.pending_task.borrow_mut() = None;
+    *agent.pending_skill.borrow_mut() = None;
+    agent.session_kind.set(smithy_agent::SessionKind::Coding);
     // The map behind an empty editor belongs to the project, so it moves too.
     agent.project_map.set(String::new());
     refresh_project_map(agent, agent.project_map);

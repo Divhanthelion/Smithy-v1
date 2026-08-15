@@ -113,6 +113,7 @@ pub fn run_with_timeout(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    scrub_secret_env(&mut builder);
 
     // Put the shell in a process group of its own, so the timeout can kill
     // everything it started rather than just the shell.
@@ -207,6 +208,31 @@ pub fn run_with_timeout(
         result = "[no output]".to_string();
     }
     Ok(result)
+}
+
+/// Hygiene, not a boundary: the child inherits the process environment, which
+/// can include `OPENROUTER_API_KEY` when the env fallback is in use. Approval
+/// is the boundary for shell; this only stops the obvious leak of named
+/// secrets. `cd ..` out of the project remains possible.
+fn scrub_secret_env(cmd: &mut Command) {
+    let keys: Vec<String> = std::env::vars_os()
+        .filter_map(|(k, _)| {
+            let key = k.to_str()?;
+            if is_secret_env(key) {
+                Some(key.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    for key in keys {
+        cmd.env_remove(key);
+    }
+}
+
+fn is_secret_env(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    upper.ends_with("_API_KEY") || upper.ends_with("_TOKEN") || upper.ends_with("_SECRET")
 }
 
 #[cfg(test)]
@@ -369,6 +395,32 @@ mod tests {
         assert!(
             !out.content.contains("killed after"),
             "got: {}",
+            out.content
+        );
+    }
+
+    /// Hygiene, not a sandbox: approval is the boundary for shell. This only
+    /// asserts a planted `*_API_KEY` does not appear in the child. `cd ..`
+    /// out of the project remains possible.
+    #[tokio::test]
+    async fn a_child_process_does_not_see_a_planted_api_key() {
+        let (_t, ctx) = ctx();
+        let planted = "smithy-test-planted-key-9f3a";
+        std::env::set_var("OPENROUTER_API_KEY", planted);
+        std::env::set_var("SMITHY_TEST_API_KEY", planted);
+        let out = Bash
+            .run(
+                &serde_json::json!({
+                    "command": "printf 'OPEN=%s PLANTED=%s' \"$OPENROUTER_API_KEY\" \"$SMITHY_TEST_API_KEY\""
+                }),
+                &ctx,
+            )
+            .await;
+        std::env::remove_var("OPENROUTER_API_KEY");
+        std::env::remove_var("SMITHY_TEST_API_KEY");
+        assert!(
+            !out.content.contains(planted),
+            "child saw a secret: {}",
             out.content
         );
     }

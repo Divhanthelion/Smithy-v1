@@ -134,7 +134,6 @@ impl AudioRecorder {
 
 /// Handle to an active recording
 pub struct RecordingHandle {
-    #[allow(dead_code)]
     stream: Stream,
     samples: Arc<Mutex<Vec<i16>>>,
     sample_rate: u32,
@@ -144,12 +143,16 @@ pub struct RecordingHandle {
 impl RecordingHandle {
     /// Stop recording and return the recorded audio
     pub fn stop(self) -> Result<RecordedAudio> {
-        // Stream is stopped when dropped
-        drop(self.stream);
+        let RecordingHandle {
+            stream,
+            samples,
+            sample_rate,
+            channels,
+        } = self;
+        drop(stream);
         crate::voice_debug!("Recording stopped");
 
-        let samples = self
-            .samples
+        let samples = samples
             .lock()
             .map_err(|_| anyhow::anyhow!("Failed to lock samples buffer"))?
             .clone();
@@ -157,13 +160,13 @@ impl RecordingHandle {
         crate::voice_debug!(
             "Recorded {} samples ({:.2} seconds)",
             samples.len(),
-            samples.len() as f32 / self.sample_rate as f32 / self.channels as f32
+            samples.len() as f32 / sample_rate as f32 / channels as f32
         );
 
         Ok(RecordedAudio {
             samples,
-            sample_rate: self.sample_rate,
-            channels: self.channels,
+            sample_rate,
+            channels,
         })
     }
 }

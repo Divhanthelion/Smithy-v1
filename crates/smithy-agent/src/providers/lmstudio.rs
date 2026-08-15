@@ -20,14 +20,15 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 
-
 use crate::provider::{Completion, CompletionRequest, Delta, Provider, ProviderError, Sampling};
 use crate::providers::sse::{apply_sse_line, build_tool_calls, PartialCall};
 
 /// Cold prefill of a large context genuinely takes minutes on local hardware,
-/// so the request timeout is generous. Connect timeout stays short, because a
-/// server that isn't listening should fail immediately rather than hang.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(900);
+/// and a thinking complete() can too. This timeout must not be shorter than
+/// the local turn clock (one hour) or a single slow completion dies first.
+/// Connect timeout stays short: a server that isn't listening should fail
+/// immediately rather than hang.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(3600);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct LmStudio {
@@ -180,6 +181,7 @@ impl LmStudio {
             .http
             .post(self.chat_url())
             .json(&self.build_body(&request))
+            .timeout(request.http_timeout(REQUEST_TIMEOUT))
             .send()
             .await
             .map_err(|e| ProviderError::Unreachable {
@@ -223,8 +225,6 @@ impl LmStudio {
         Ok(out)
     }
 }
-
-
 
 #[async_trait]
 impl Provider for LmStudio {
@@ -314,6 +314,10 @@ impl Provider for LmStudio {
         // is green over unreachable code is not reporting on the program.
         self.complete_streaming(request, on_delta).await
     }
+
+    fn build_body(&self, request: &CompletionRequest<'_>) -> Value {
+        LmStudio::build_body(self, request)
+    }
 }
 
 /// What LM Studio's native API knows about a model.
@@ -359,6 +363,42 @@ impl ModelInfo {
             ..defaults
         }
     }
+
+    /// Header text: model id, format, and the window this instance actually has.
+    ///
+    /// Names the loaded KV when it is smaller than the spec, which is the
+    /// 262k-vs-32k confusion — the picker used to advertise the maximum.
+    pub fn label(&self) -> String {
+        let mut s = format!("{} · {} {}", self.key, self.format, self.quantization);
+        if let Some(note) = self.window_note() {
+            s.push_str(" · ");
+            s.push_str(&note);
+        }
+        s
+    }
+
+    fn window_note(&self) -> Option<String> {
+        match (self.context_length, self.max_context_length) {
+            (Some(loaded), Some(max)) if loaded < max => Some(format!(
+                "loaded {} / spec {}",
+                fmt_ctx(loaded),
+                fmt_ctx(max)
+            )),
+            (Some(loaded), _) => Some(fmt_ctx(loaded)),
+            (None, Some(max)) => Some(format!("spec {} (load unknown)", fmt_ctx(max))),
+            _ => None,
+        }
+    }
+}
+
+fn fmt_ctx(n: i64) -> String {
+    if n >= 1_000_000 {
+        format!("{}M", n / 1_000_000)
+    } else if n >= 1_000 {
+        format!("{}k", n / 1_000)
+    } else {
+        n.to_string()
+    }
 }
 
 /// How many tool calls one turn may make, given the model's context window.
@@ -387,11 +427,11 @@ fn steps_for_context(context_length: i64) -> usize {
     // Note the floor: DeepSeek advertises 1,000,000 rather than 1 MiB, which is
     // 4.93 doublings and so earns 180, not 210. Rounding down is the right
     // direction for a backstop.
-    let doublings = ((context_length as f64) / (BASELINE_CONTEXT as f64)).log2().floor() as usize;
+    let doublings = ((context_length as f64) / (BASELINE_CONTEXT as f64))
+        .log2()
+        .floor() as usize;
     (BASELINE_STEPS + doublings * PER_DOUBLING).min(CEILING)
 }
-
-
 
 #[cfg(test)]
 mod step_budget_tests {
@@ -415,7 +455,10 @@ mod step_budget_tests {
         let small = info(Some(32_768)).suggested_limits().max_steps;
         let deepseek = info(Some(1_000_000)).suggested_limits().max_steps;
         assert_eq!(small, 60, "the baseline is preserved");
-        assert_eq!(deepseek, 180, "three times the budget the failed session had");
+        assert_eq!(
+            deepseek, 180,
+            "three times the budget the failed session had"
+        );
     }
 
     #[test]
@@ -432,7 +475,11 @@ mod step_budget_tests {
     #[test]
     fn a_partial_doubling_rounds_down() {
         assert_eq!(steps_for_context(1_000_000), 180);
-        assert_eq!(steps_for_context(60_000), 60, "just under the first doubling");
+        assert_eq!(
+            steps_for_context(60_000),
+            60,
+            "just under the first doubling"
+        );
     }
 
     /// A backstop that grew without bound would stop being a backstop.
@@ -805,5 +852,22 @@ mod native_api_tests {
             ..Default::default()
         };
         assert!(info.suggested_limits().context_hard < 8192);
+    }
+
+    /// The 262k-vs-32k confusion: the spec is not the loaded KV. The header
+    /// has to say both or the picker advertising 262k wins by default.
+    #[test]
+    fn a_reduced_load_window_is_named_as_loaded_not_spec() {
+        let info = ModelInfo {
+            key: "qwen".into(),
+            format: "mlx".into(),
+            quantization: "Q4".into(),
+            context_length: Some(32_768),
+            max_context_length: Some(262_144),
+            ..Default::default()
+        };
+        let label = info.label();
+        assert!(label.contains("loaded 32k"), "{label}");
+        assert!(label.contains("spec 262k"), "{label}");
     }
 }

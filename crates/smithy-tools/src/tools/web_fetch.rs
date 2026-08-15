@@ -21,6 +21,7 @@
 
 use async_trait::async_trait;
 use serde_json::Value;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 
 use crate::registry::{Tool, ToolCtx};
 use crate::schema::{arg_i64, arg_str, ToolDefinition, ToolOutput, ToolParameter};
@@ -54,13 +55,66 @@ impl WebFetch {
             http: reqwest::Client::builder()
                 .timeout(TIMEOUT)
                 .user_agent(USER_AGENT)
-                // Redirects are followed, but every hop is re-checked below —
-                // an allowed first URL that redirects to loopback is exactly
-                // the case a scheme check on the input alone would miss.
-                .redirect(reqwest::redirect::Policy::limited(5))
+                // Followed by hand so every hop is re-validated *before* it is
+                // requested. Automatic following would hit a private address
+                // and only refuse the body afterwards.
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
-                .unwrap_or_default(),
+                .unwrap_or_else(|e| {
+                    panic!("web_fetch HTTP client could not be built: {e}");
+                }),
         }
+    }
+
+    /// Follow at most 5 redirects, validating every hop *before* requesting it.
+    ///
+    /// `validate_first` is the production path. Tests set it false so a
+    /// loopback fixture can be the first hop — check_url would otherwise
+    /// refuse before we can observe whether the second hop is requested.
+    async fn get_with_redirects(
+        &self,
+        start: &str,
+        validate_first: bool,
+    ) -> Result<(reqwest::Response, String), String> {
+        let mut current = start.to_string();
+        for hop in 0..=5 {
+            if hop > 0 || validate_first {
+                check_url(&current).map_err(|e| {
+                    if hop == 0 {
+                        e
+                    } else {
+                        format!("`{start}` redirected somewhere it may not go: {e}")
+                    }
+                })?;
+                reject_resolved_host(&current).await.map_err(|e| {
+                    if hop == 0 {
+                        e
+                    } else {
+                        format!("`{start}` redirected somewhere it may not go: {e}")
+                    }
+                })?;
+            }
+            let hop_response = self
+                .http
+                .get(&current)
+                .send()
+                .await
+                .map_err(|e| format!("could not fetch `{current}`: {e}"))?;
+            if hop_response.status().is_redirection() {
+                let loc = hop_response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .ok_or_else(|| format!("`{current}` redirected without a Location header"))?;
+                current = join_redirect(&current, loc)?;
+                if hop == 5 {
+                    return Err(format!("`{start}` redirected more than 5 times"));
+                }
+                continue;
+            }
+            return Ok((hop_response, current));
+        }
+        Err(format!("`{start}` redirected more than 5 times"))
     }
 }
 
@@ -97,27 +151,17 @@ impl Tool for WebFetch {
 
     async fn run(&self, args: &Value, _ctx: &ToolCtx) -> ToolOutput {
         let url = match arg_str(args, "url") {
-            Ok(u) => u.trim(),
+            Ok(u) => u.trim().to_string(),
             Err(e) => return ToolOutput::err(e),
         };
-        if let Err(e) = check_url(url) {
-            return ToolOutput::err(e);
-        }
         let max_chars = arg_i64(args, "max_chars")
             .map(|n| (n.max(500) as usize).min(HARD_MAX_CHARS))
             .unwrap_or(DEFAULT_MAX_CHARS);
 
-        let response = match self.http.get(url).send().await {
-            Ok(r) => r,
-            Err(e) => return ToolOutput::err(format!("could not fetch `{url}`: {e}")),
+        let (response, current) = match self.get_with_redirects(&url, true).await {
+            Ok(pair) => pair,
+            Err(e) => return ToolOutput::err(e),
         };
-
-        // The URL actually reached, after redirects. Checked again because a
-        // permitted URL is allowed to redirect anywhere, including inward.
-        let final_url = response.url().clone();
-        if let Err(e) = check_url(final_url.as_str()) {
-            return ToolOutput::err(format!("`{url}` redirected somewhere it may not go: {e}"));
-        }
 
         let status = response.status();
         if !status.is_success() {
@@ -166,74 +210,185 @@ impl Tool for WebFetch {
             ));
         }
 
-        ToolOutput::ok(truncate(&text, max_chars, final_url.as_str()))
+        ToolOutput::ok(truncate(&text, max_chars, &current))
     }
 }
 
 /// Refuse anything that is not a public http/https URL.
 ///
-/// Written as a deny of the specific shapes that matter rather than an allow of
-/// hostname patterns, because the latter cannot be got right — the point is to
-/// close the obvious holes, not to claim the tool is safe against a host that is
-/// actively trying to be reached.
+/// Syntax and literal-IP checks only. Hostnames are resolved separately
+/// ([`reject_resolved_host`]) so a name that maps to loopback is also refused.
+/// That closes casual DNS rebinding; a determined attacker with a TTL-flipping
+/// nameserver can still race the lookup against the connect.
 pub fn check_url(url: &str) -> Result<(), String> {
-    let lowered = url.to_lowercase();
-    if !lowered.starts_with("http://") && !lowered.starts_with("https://") {
+    let parsed = url::Url::parse(url).map_err(|_| {
+        format!(
+            "`{url}` is not an http:// or https:// URL. This tool only fetches web pages; use \
+             `read` for files on disk."
+        )
+    })?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
         return Err(format!(
             "`{url}` is not an http:// or https:// URL. This tool only fetches web pages; use \
              `read` for files on disk."
         ));
     }
-
-    let host = host_of(&lowered).ok_or_else(|| format!("`{url}` has no host"))?;
-
-    if host == "localhost"
-        || host == "0.0.0.0"
-        || host.ends_with(".localhost")
-        || host.ends_with(".internal")
-        || host.starts_with("127.")
-        || host.starts_with("10.")
-        || host.starts_with("192.168.")
-        || host.starts_with("169.254.")
-        || host == "[::1]"
-        || is_private_172(host)
-    {
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| format!("`{url}` has no host"))?;
+    if forbidden_hostname(host) {
         return Err(format!(
             "`{host}` is a private or loopback address, which this tool will not fetch."
         ));
     }
+    if let Some(ip) = parse_ip_host(host) {
+        if ip_is_forbidden(ip) {
+            return Err(format!(
+                "`{host}` is a private or loopback address, which this tool will not fetch."
+            ));
+        }
+    }
     Ok(())
 }
 
-/// The host portion of an already-lowercased absolute URL, port stripped.
-fn host_of(url: &str) -> Option<&str> {
-    let after_scheme = url.split_once("://")?.1;
-    let authority = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .filter(|a| !a.is_empty())?;
-    // Credentials, if someone put them in the URL.
-    let authority = authority.rsplit('@').next()?;
-    // An IPv6 literal keeps its brackets; anything else loses its port.
-    if authority.starts_with('[') {
-        return authority.split_once(']').map(|(h, _)| {
-            // Put the bracket back so the caller compares against "[::1]".
-            let end = h.len() + 1;
-            &authority[..end]
-        });
-    }
-    Some(authority.split(':').next().unwrap_or(authority))
+fn join_redirect(current: &str, location: &str) -> Result<String, String> {
+    let base = url::Url::parse(current)
+        .map_err(|e| format!("could not parse `{current}` as a URL: {e}"))?;
+    base.join(location)
+        .map(|u| u.to_string())
+        .map_err(|e| format!("redirect Location `{location}` is not a URL: {e}"))
 }
 
-/// `172.16.0.0/12` — the one private range that is not a clean prefix match.
-fn is_private_172(host: &str) -> bool {
-    let Some(rest) = host.strip_prefix("172.") else {
-        return false;
-    };
-    let Some(second) = rest.split('.').next() else {
-        return false;
-    };
-    matches!(second.parse::<u8>(), Ok(16..=31))
+/// Resolve `host` and refuse if any address is private/loopback.
+///
+/// Not a boundary against a TTL-flipping DNS server — the lookup and the
+/// connect are separate. It does stop the ordinary case of a public name that
+/// points at 127.0.0.1.
+async fn reject_resolved_host(url: &str) -> Result<(), String> {
+    let parsed = url::Url::parse(url).map_err(|e| format!("`{url}` is not a URL: {e}"))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| format!("`{url}` has no host"))?
+        .to_string();
+    if parse_ip_host(&host).is_some() {
+        return Ok(());
+    }
+    let host_for_lookup = host.clone();
+    let addrs = tokio::task::spawn_blocking(move || {
+        (host_for_lookup.as_str(), 0u16)
+            .to_socket_addrs()
+            .map(|i| i.map(|a| a.ip()).collect::<Vec<_>>())
+    })
+    .await
+    .map_err(|e| format!("could not resolve `{host}`: {e}"))?
+    .map_err(|e| format!("could not resolve `{host}`: {e}"))?;
+    for ip in addrs {
+        if ip_is_forbidden(ip) {
+            return Err(format!(
+                "`{host}` resolves to {ip}, a private or loopback address, which this tool \
+                 will not fetch."
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn forbidden_hostname(host: &str) -> bool {
+    let h = host.trim_end_matches('.').to_ascii_lowercase();
+    h == "localhost" || h == "localhost." || h.ends_with(".localhost") || h.ends_with(".internal")
+}
+
+fn parse_ip_host(host: &str) -> Option<IpAddr> {
+    let host = host.trim_matches(|c| c == '[' || c == ']');
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Some(unwrap_mapped(ip));
+    }
+    parse_weird_ipv4(host).map(IpAddr::V4)
+}
+
+/// Decimal dword (`2130706433`), octal (`0177.0.0.1`), hex (`0x7f.0.0.1`).
+fn parse_weird_ipv4(host: &str) -> Option<Ipv4Addr> {
+    if let Ok(n) = host.parse::<u32>() {
+        return Some(Ipv4Addr::from(n));
+    }
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.is_empty() || parts.len() > 4 {
+        return None;
+    }
+    let mut nums = [0u32; 4];
+    for (i, part) in parts.iter().enumerate() {
+        nums[i] = parse_ipv4_octet(part)?;
+    }
+    match parts.len() {
+        1 => Some(Ipv4Addr::from(nums[0])),
+        2 => {
+            let a = u8::try_from(nums[0]).ok()?;
+            let rest = (nums[1] <= 0x00ff_ffff).then_some(nums[1])?;
+            Some(Ipv4Addr::from((u32::from(a) << 24) | rest))
+        }
+        3 => {
+            let a = u8::try_from(nums[0]).ok()?;
+            let b = u8::try_from(nums[1]).ok()?;
+            let rest = (nums[2] <= 0xffff).then_some(nums[2])?;
+            Some(Ipv4Addr::from(
+                (u32::from(a) << 24) | (u32::from(b) << 16) | rest,
+            ))
+        }
+        4 => {
+            let octs = [
+                u8::try_from(nums[0]).ok()?,
+                u8::try_from(nums[1]).ok()?,
+                u8::try_from(nums[2]).ok()?,
+                u8::try_from(nums[3]).ok()?,
+            ];
+            Some(Ipv4Addr::from(octs))
+        }
+        _ => None,
+    }
+}
+
+fn parse_ipv4_octet(part: &str) -> Option<u32> {
+    if let Some(hex) = part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
+        return u32::from_str_radix(hex, 16).ok();
+    }
+    if part.len() > 1 && part.starts_with('0') && part.bytes().all(|b| b.is_ascii_digit()) {
+        return u32::from_str_radix(part, 8).ok();
+    }
+    part.parse().ok()
+}
+
+fn unwrap_mapped(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
+        other => other,
+    }
+}
+
+fn ip_is_forbidden(ip: IpAddr) -> bool {
+    match unwrap_mapped(ip) {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.octets()[0] == 0
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || is_ula(v6)
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// Unique local addresses `fc00::/7`.
+fn is_ula(ip: Ipv6Addr) -> bool {
+    (ip.segments()[0] & 0xfe00) == 0xfc00
 }
 
 /// Whether to run the body through the HTML renderer.
@@ -315,7 +470,11 @@ mod tests {
 
     #[test]
     fn other_schemes_are_refused() {
-        for url in ["ftp://example.com/x", "gopher://example.com", "javascript:x"] {
+        for url in [
+            "ftp://example.com/x",
+            "gopher://example.com",
+            "javascript:x",
+        ] {
             assert!(check_url(url).is_err(), "{url} should be refused");
         }
     }
@@ -399,5 +558,76 @@ mod tests {
         let out = truncate(&"x".repeat(200), 50, "https://example.com/");
         assert!(out.contains("Truncated at 50"), "{out}");
         assert!(out.contains("more specific URL"), "{out}");
+    }
+
+    #[test]
+    fn numeric_hex_and_octal_loopback_are_refused() {
+        for url in [
+            "http://2130706433/",
+            "http://0x7f000001/",
+            "http://0177.0.0.1/",
+            "http://[::ffff:127.0.0.1]/",
+            "http://[::ffff:7f00:1]/",
+        ] {
+            assert!(check_url(url).is_err(), "{url} should be refused");
+        }
+    }
+
+    #[test]
+    fn ipv6_ula_and_link_local_are_refused() {
+        assert!(check_url("http://[fc00::1]/").is_err());
+        assert!(check_url("http://[fe80::1]/").is_err());
+    }
+
+    #[tokio::test]
+    async fn a_hostname_that_resolves_to_loopback_is_refused() {
+        let err = reject_resolved_host("http://localhost/")
+            .await
+            .expect_err("localhost must not resolve through");
+        assert!(err.contains("loopback") || err.contains("private"), "{err}");
+    }
+
+    /// A 302 to loopback must never be requested. Two listeners: the first
+    /// redirects, the second records whether anyone connected.
+    #[tokio::test]
+    async fn a_redirect_to_loopback_is_not_followed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let private = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let private_port = private.local_addr().unwrap().port();
+        let hit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hit_flag = hit.clone();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = private.accept().await {
+                hit_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = sock.read(&mut [0u8; 64]).await;
+            }
+        });
+
+        let public = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let public_port = public.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = public.accept().await.unwrap();
+            let mut buf = vec![0u8; 1024];
+            let _ = sock.read(&mut buf).await;
+            let loc = format!("http://127.0.0.1:{private_port}/secret");
+            let resp =
+                format!("HTTP/1.1 302 Found\r\nLocation: {loc}\r\nContent-Length: 0\r\n\r\n");
+            let _ = sock.write_all(resp.as_bytes()).await;
+        });
+
+        let fetch = WebFetch::new();
+        let start = format!("http://127.0.0.1:{public_port}/");
+        let result = fetch.get_with_redirects(&start, false).await;
+        assert!(
+            result.is_err(),
+            "following a 302 to loopback must fail, got {result:?}"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert!(
+            !hit.load(std::sync::atomic::Ordering::SeqCst),
+            "the loopback listener received a request — the redirect was followed"
+        );
     }
 }

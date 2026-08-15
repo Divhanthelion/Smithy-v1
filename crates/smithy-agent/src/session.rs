@@ -1,6 +1,7 @@
 //! The agent loop.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::Value;
 use smithy_tools::{Registry, ToolCtx, ToolResult};
@@ -10,6 +11,7 @@ use crate::limits::{Budget, Limits};
 use crate::message::{History, Message};
 use crate::parse::{parse, Action};
 use crate::provider::{Completion, CompletionRequest, Delta, Provider, ProviderError, Sampling};
+use crate::skill::SessionKind;
 
 /// How a user-turn ended.
 #[derive(Debug, Clone)]
@@ -56,6 +58,7 @@ pub struct SessionConfig {
     pub project_context_chars: usize,
     pub sampling: Sampling,
     pub limits: Limits,
+    pub kind: SessionKind,
 }
 
 impl SessionConfig {
@@ -68,6 +71,7 @@ impl SessionConfig {
             project_context_chars: 0,
             sampling: Sampling::default(),
             limits: Limits::default(),
+            kind: SessionKind::Coding,
         }
     }
 
@@ -75,6 +79,11 @@ impl SessionConfig {
     pub fn with_segments(mut self, system_base_chars: usize, project_context_chars: usize) -> Self {
         self.system_base_chars = system_base_chars;
         self.project_context_chars = project_context_chars;
+        self
+    }
+
+    pub fn with_kind(mut self, kind: SessionKind) -> Self {
+        self.kind = kind;
         self
     }
 }
@@ -116,6 +125,9 @@ pub struct Session {
     ledger_calibration: Option<f64>,
     system_base_chars: usize,
     project_context_chars: usize,
+    /// Last JSON body POSTed (or that would be POSTed). Inspection ground truth.
+    last_request: Mutex<Option<Value>>,
+    kind: SessionKind,
     /// Every reasoning block the model has produced, in order.
     ///
     /// **Deliberately not in [`History`].** The endpoint does not replay
@@ -159,7 +171,12 @@ impl Usage {
     /// DeepSeek's list ratio is roughly a tenth; OpenAI's is roughly half.
     /// Callers that know the provider pass the real rate — see
     /// [`crate::providers::deepseek::pricing_for`] and the meter.
-    pub fn cost(&self, prompt_per_mtok: f64, completion_per_mtok: f64, cached_per_mtok: f64) -> f64 {
+    pub fn cost(
+        &self,
+        prompt_per_mtok: f64,
+        completion_per_mtok: f64,
+        cached_per_mtok: f64,
+    ) -> f64 {
         let cached = self.cached_tokens.max(0) as f64;
         let cold = (self.prompt_tokens as f64 - cached).max(0.0);
         (cold / 1e6) * prompt_per_mtok
@@ -372,6 +389,8 @@ impl Session {
             ledger_calibration: None,
             system_base_chars: config.system_base_chars,
             project_context_chars: config.project_context_chars,
+            last_request: Mutex::new(None),
+            kind: config.kind,
             reasoning: Vec::new(),
         }
     }
@@ -389,6 +408,7 @@ impl Session {
         history: History,
         sampling: Sampling,
         limits: Limits,
+        kind: SessionKind,
     ) -> Session {
         let tools = registry.openai_schemas();
         let system_chars = history
@@ -411,6 +431,8 @@ impl Session {
             ledger_calibration: None,
             system_base_chars: system_chars,
             project_context_chars: 0,
+            last_request: Mutex::new(None),
+            kind,
             reasoning: Vec::new(),
         }
     }
@@ -460,6 +482,15 @@ impl Session {
         &self.sampling
     }
 
+    pub fn kind(&self) -> SessionKind {
+        self.kind
+    }
+
+    pub fn with_kind(mut self, kind: SessionKind) -> Session {
+        self.kind = kind;
+        self
+    }
+
     /// What this session has cost so far, in tokens.
     pub fn usage(&self) -> Usage {
         self.usage
@@ -481,6 +512,48 @@ impl Session {
     /// result in a UI signal — never from a paint/`Label::derived` path.
     pub fn ledger(&self) -> ContextLedger {
         ContextLedger::from_session(self)
+    }
+
+    /// The tool JSON frozen for this Session.
+    pub fn tools_schema(&self) -> &Value {
+        &self.tools
+    }
+
+    /// Replace the advertised tool JSON. Resume uses this so a down MCP server
+    /// cannot rewrite the prefix; [`smithy_tools::Registry::execute`] then
+    /// errors on the name.
+    pub fn freeze_tools(&mut self, tools: Value) {
+        self.tools = tools;
+    }
+
+    /// Last provider request body, pretty-printed. None before the first complete.
+    pub fn last_request_json(&self) -> Option<String> {
+        let body = self.last_request.lock().ok()?.clone()?;
+        Some(serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string()))
+    }
+
+    /// Last provider request as JSON. Used by inspection tests.
+    pub fn last_request(&self) -> Option<Value> {
+        self.last_request.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// The four ledger segments as the text we intend to send.
+    pub fn inspect_segments(&self) -> Vec<(String, String)> {
+        let full = self.history.system_prompt().unwrap_or("");
+        let split = self.system_base_chars.min(full.len());
+        let split = (0..=split)
+            .rev()
+            .find(|&i| full.is_char_boundary(i))
+            .unwrap_or(0);
+        let (base, project) = full.split_at(split);
+        let tools =
+            serde_json::to_string_pretty(&self.tools).unwrap_or_else(|_| self.tools.to_string());
+        vec![
+            ("System prompt".into(), base.to_string()),
+            ("Project context".into(), project.to_string()),
+            ("Tool schemas".into(), tools),
+            ("Conversation".into(), conversation_text(&self.history)),
+        ]
     }
 
     /// Every reasoning block the model has produced, for persistence.
@@ -528,7 +601,11 @@ impl Session {
         // Seed from the previous turn's last prompt. Without this, a session
         // already over the hard ceiling pays for one full prefill per turn
         // before tick() can stop it.
-        let mut budget = Budget::seeded(self.limits.clone(), self.last_prompt_tokens);
+        let mut budget = Budget::with_gate(
+            self.limits.clone(),
+            self.last_prompt_tokens,
+            self.ctx.gate.clone(),
+        );
         let mut consecutive_failures = 0usize;
 
         loop {
@@ -563,12 +640,22 @@ impl Session {
             // it was before the request — which is what keeps the cached prefix
             // valid for the next turn. `biased` makes cancellation win a tie
             // deterministically instead of by scheduler chance.
+            // The turn clock has to bind *during* the request. `tick` only
+            // runs at the loop top; a stuck completion used to run until the
+            // provider's own timeout (an hour on LM Studio) against a 15-minute
+            // default budget. `biased` still makes Stop win a tie.
+            let remaining = budget.remaining();
             let completion = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
                     return Ok(Outcome::Stopped(CANCELLED.into()));
                 }
-                result = self.complete(events) => result?,
+                _ = tokio::time::sleep(remaining) => {
+                    return Ok(Outcome::Stopped(
+                        crate::limits::Stop::Time(self.limits.max_seconds).to_string(),
+                    ));
+                }
+                result = self.complete(events, remaining) => result?,
             };
 
             // Bill it. Recorded before anything can fail below, because a
@@ -712,6 +799,7 @@ impl Session {
                         );
 
                         let mut result: ToolResult = self.registry.execute(call, &self.ctx).await;
+                        budget.record_tool_calls(1);
                         // Shape the result before it enters history — past the
                         // aggregate cap, a narrowing hint; never a rewrite later.
                         budget.annotate_tool_result(&mut result.content);
@@ -733,12 +821,21 @@ impl Session {
         }
     }
 
-    async fn complete(&self, events: Option<&EventSink>) -> Result<Completion, ProviderError> {
+    async fn complete(
+        &self,
+        events: Option<&EventSink>,
+        remaining: Duration,
+    ) -> Result<Completion, ProviderError> {
         let request = CompletionRequest {
             history: &self.history,
             tools: &self.tools,
             sampling: &self.sampling,
+            timeout: Some(remaining),
         };
+        let body = self.provider.build_body(&request);
+        if let Ok(mut slot) = self.last_request.lock() {
+            *slot = Some(body);
+        }
 
         match events {
             Some(sink) => {
@@ -759,6 +856,31 @@ fn emit(events: Option<&EventSink>, event: TurnEvent) {
     if let Some(sink) = events {
         sink(event);
     }
+}
+
+fn conversation_text(history: &History) -> String {
+    let mut out = String::new();
+    for message in history.messages().iter().skip(1) {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str("## ");
+        out.push_str(message.role.as_str());
+        out.push('\n');
+        if !message.content.is_empty() {
+            out.push_str(&message.content);
+        }
+        for call in &message.tool_calls {
+            out.push_str(&format!(
+                "\n- tool {} `{}` {}",
+                call.id, call.name, call.arguments
+            ));
+        }
+        if let Some(id) = &message.tool_call_id {
+            out.push_str(&format!("\n(tool_call_id {id})"));
+        }
+    }
+    out
 }
 
 /// The default system prompt.
@@ -811,6 +933,12 @@ pub fn default_system_prompt(
         tools = tool_names.join(", "),
     );
 
+    with_project_context(base, project_context)
+}
+
+/// Join a Map onto a base system prompt. Shared by coding and skill Sessions
+/// so the snapshot warning cannot drift.
+pub fn with_project_context(base: String, project_context: Option<&str>) -> String {
     match project_context {
         Some(context) if !context.trim().is_empty() => format!(
             "{base}\n\n\
@@ -867,6 +995,45 @@ mod tests {
             provider.call_count(),
             0,
             "stop must precede the network call"
+        );
+    }
+
+    /// A completion that never returns used to run until the provider's own
+    /// timeout, which on LM Studio is an hour against a 15-minute turn. The
+    /// remaining budget has to cut it off.
+    #[tokio::test]
+    async fn a_hanging_completion_is_cut_off_at_the_turn_budget() {
+        use crate::provider::test_support::HangingProvider;
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("notes.txt"), "x\n").unwrap();
+        let ws = Workspace::open(tmp.path()).unwrap();
+        let provider = Arc::new(HangingProvider::new());
+        let mut config = SessionConfig::new("test prompt");
+        config.limits.max_seconds = 1;
+        let mut session = Session::new(
+            provider.clone(),
+            Arc::new(Registry::core()),
+            Arc::new(ToolCtx::new(ws)),
+            config,
+        );
+
+        let started = std::time::Instant::now();
+        let outcome = session.run_turn("hang", None).await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(&outcome, Outcome::Stopped(r) if r.contains("time limit reached")),
+            "got {outcome:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "must not wait out a provider-level timeout: {elapsed:?}"
+        );
+        assert_eq!(
+            provider.call_count(),
+            1,
+            "the request must have started; otherwise this is just tick() at the loop top"
         );
     }
 
@@ -1128,10 +1295,7 @@ mod tests {
     /// the label lied, and a genuinely varying prefix looked the same.
     #[tokio::test]
     async fn frozen_ledger_rows_stay_put_across_completions() {
-        let (_t, mut s, _) = harness(vec![
-            answer_at("first", 4_000),
-            answer_at("second", 8_000),
-        ]);
+        let (_t, mut s, _) = harness(vec![answer_at("first", 4_000), answer_at("second", 8_000)]);
         s.run_turn("hi", None).await.unwrap();
         let first = s.ledger();
         let frozen_first: Vec<(&str, i64)> = first
@@ -1382,6 +1546,27 @@ mod prefix_invariant_tests {
         let first = message_bytes(&session)[0].clone();
         session.run_turn("second", None).await.unwrap();
         assert_eq!(first, message_bytes(&session)[0]);
+    }
+
+    /// Inspection reads the body we would POST, not a reconstruction.
+    #[tokio::test]
+    async fn the_last_request_matches_history_and_tools() {
+        let (_t, mut session) = harness(vec![answer("one")]);
+        session.run_turn("hello", None).await.unwrap();
+        let body = session.last_request().expect("a request was posted");
+        let system = body["messages"][0]["content"].as_str().unwrap();
+        assert_eq!(system, session.history().system_prompt().unwrap());
+        assert_eq!(&body["tools"], session.tools_schema());
+        // The dump is the request *as posted*, before the assistant turn is
+        // appended. History is therefore a prefix of what sits there now.
+        let posted = body["messages"].as_array().unwrap();
+        let now = session.history().to_api();
+        let now = now.as_array().unwrap();
+        assert!(
+            now.len() > posted.len(),
+            "history grows after the completion returns"
+        );
+        assert_eq!(&now[..posted.len()], posted.as_slice());
     }
 
     /// A turn that retries — the empty-answer recovery path — appends its

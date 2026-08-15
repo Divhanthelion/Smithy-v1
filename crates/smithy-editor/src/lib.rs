@@ -59,7 +59,7 @@ pub mod tick;
 pub use aesthetic::Aesthetic;
 pub use agent_panel::{
     agent_panel, AgentPanelState, ContextUsageRow, ContextUsageSnapshot, Entry as AgentEntry,
-    StepStatus,
+    SkillPick, StepStatus,
 };
 pub use attachment::{Attachment, AttachmentKind};
 pub use buffer_manager::{BufferManager, BufferState};

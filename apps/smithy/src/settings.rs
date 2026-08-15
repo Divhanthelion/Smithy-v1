@@ -55,7 +55,9 @@ pub fn open(state: SettingsState, data_dir: &Path) {
     state.forget_typed_secrets();
     state.status.set(String::new());
     // Free-only is meaningless on a local backend, where nothing has a price.
-    state.free_only.set(config.provider == ProviderChoice::OpenRouter);
+    state
+        .free_only
+        .set(config.provider == ProviderChoice::OpenRouter);
     state.open.set(true);
 
     // Populate the picker without being asked. Both catalogues are one cheap
@@ -182,14 +184,8 @@ pub fn load_model(state: SettingsState, data_dir: &Path, model: &str) {
 /// floem's reactive graph is single-threaded and its signals are not `Send`, so
 /// the worker cannot write them directly. This watches the channel from a floem
 /// timer and fires once.
-fn poll_once<T: 'static>(
-    rx: crossbeam_channel::Receiver<T>,
-    deliver: impl Fn(T) + 'static,
-) {
-    fn tick<T: 'static>(
-        rx: crossbeam_channel::Receiver<T>,
-        deliver: std::rc::Rc<dyn Fn(T)>,
-    ) {
+fn poll_once<T: 'static>(rx: crossbeam_channel::Receiver<T>, deliver: impl Fn(T) + 'static) {
+    fn tick<T: 'static>(rx: crossbeam_channel::Receiver<T>, deliver: std::rc::Rc<dyn Fn(T)>) {
         floem::action::exec_after(std::time::Duration::from_millis(60), move |_| {
             match rx.try_recv() {
                 Ok(value) => deliver(value),
@@ -375,7 +371,11 @@ mod tests {
 
     #[test]
     fn an_empty_model_is_rejected_by_name() {
-        let c = config(ProviderChoice::OpenRouter, "https://openrouter.ai/api/v1", "");
+        let c = config(
+            ProviderChoice::OpenRouter,
+            "https://openrouter.ai/api/v1",
+            "",
+        );
         let err = validate(&c).unwrap_err();
         assert!(err.contains("OpenRouter"), "{err}");
     }
@@ -420,8 +420,9 @@ mod tests {
     #[test]
     fn every_offered_backend_parses_back() {
         for (tag, _, _) in smithy_editor::PROVIDERS {
-            let parsed = ProviderChoice::parse(tag)
-                .unwrap_or_else(|| panic!("dialog offers `{tag}` which ProviderChoice cannot parse"));
+            let parsed = ProviderChoice::parse(tag).unwrap_or_else(|| {
+                panic!("dialog offers `{tag}` which ProviderChoice cannot parse")
+            });
             assert_eq!(parsed.as_str(), tag);
         }
         assert_eq!(
@@ -445,7 +446,10 @@ mod tests {
     fn each_backend_has_its_own_key_slot() {
         let openrouter = ProviderChoice::OpenRouter.key_names().unwrap();
         let deepseek = ProviderChoice::DeepSeek.key_names().unwrap();
-        assert_ne!(openrouter.0, deepseek.0, "credential-store accounts collide");
+        assert_ne!(
+            openrouter.0, deepseek.0,
+            "credential-store accounts collide"
+        );
         assert_ne!(openrouter.1, deepseek.1, "environment variables collide");
         assert!(ProviderChoice::LmStudio.key_names().is_none());
     }

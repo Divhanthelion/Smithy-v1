@@ -77,6 +77,11 @@ impl ServerAvailability {
     }
 }
 
+/// Languages whose servers we actually start. Detection still classifies other
+/// files for highlighting; those configs exist so `is_server_available` can
+/// report honestly, but we do not spawn them.
+const SPAWNED_LANGUAGES: &[&str] = &["rust"];
+
 /// Registry for managing multiple language server instances
 pub struct LspRegistry {
     /// Active clients mapped by server key
@@ -502,7 +507,6 @@ impl LspRegistry {
         }
         self.current_root = Some(workspace_root.to_path_buf());
 
-        // Try to spawn servers for languages with available servers
         let languages: Vec<_> = self.language_configs.keys().cloned().collect();
 
         // A spawn failure is *returned*, not just printed. It used to be
@@ -512,10 +516,15 @@ impl LspRegistry {
         // not watching a terminal.
         let mut failure = None;
         for language_id in languages {
+            if !SPAWNED_LANGUAGES.contains(&language_id.as_str()) {
+                continue;
+            }
             if self.is_server_available(&language_id) {
-                // Only spawn if the workspace seems to have files for this language
-                // For now, just check rust since that's our primary target
-                if language_id == "rust" && workspace_root.join("Cargo.toml").exists() {
+                let ready = match language_id.as_str() {
+                    "rust" => workspace_root.join("Cargo.toml").exists(),
+                    _ => false,
+                };
+                if ready {
                     if let Err(e) = self.get_or_spawn(&language_id, workspace_root).await {
                         eprintln!("Failed to spawn {} server: {}", language_id, e);
                         failure = failure.or(Some(e));

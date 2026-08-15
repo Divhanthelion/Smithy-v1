@@ -38,6 +38,8 @@ use floem::views::editor::Editor;
 use floem::views::text_editor;
 use floem::views::{canvas, Stack};
 
+use crate::aesthetic::Aesthetic;
+use crate::celestial::editor_pane_fill;
 use crate::design;
 use crate::squiggle::{self, VisualRow};
 use crate::syntax_styling::{color_for_severity, EditSpan, InlineDiagnostic, SyntaxStyling};
@@ -85,11 +87,33 @@ impl EditorHandle {
         if self.path.as_os_str().is_empty() {
             return Err("this buffer has no path to save to".into());
         }
+        if !self.path.is_absolute() {
+            return Err("this inspection buffer is not a file".into());
+        }
         let text = self.text();
         std::fs::write(&self.path, &text)
             .map_err(|e| format!("could not save {}: {e}", self.path.display()))?;
         self.saved.set(text);
         Ok(())
+    }
+
+    /// Replace the document in place. Used when re-clicking an inspection tab
+    /// that is already focused — rebuilding the pane would throw away the caret.
+    pub fn replace_content(&self, content: &str) {
+        if content == self.text() {
+            return;
+        }
+        let len = self.doc.text().len();
+        self.doc.edit_single(
+            floem::views::editor::core::selection::Selection::region(
+                0,
+                len,
+                CursorAffinity::Backward,
+            ),
+            content,
+            floem::views::editor::core::editor::EditType::Other,
+        );
+        self.saved.set(content.to_string());
     }
 
     /// Replace the buffer with what is on disk.
@@ -244,7 +268,11 @@ impl EditorHandle {
 /// expected to construct a fresh editor per file rather than swapping content
 /// into one — floem's document owns its undo history, and reusing a document
 /// across files would let you undo your way into the previous file's contents.
-pub fn code_editor(path: PathBuf, content: &str) -> (impl IntoView, EditorHandle) {
+pub fn code_editor(
+    path: PathBuf,
+    content: &str,
+    aesthetic: RwSignal<Aesthetic>,
+) -> (impl IntoView, EditorHandle) {
     let revision = RwSignal::new(0u64);
     let diagnostics = RwSignal::new(0u64);
 
@@ -269,13 +297,13 @@ pub fn code_editor(path: PathBuf, content: &str) -> (impl IntoView, EditorHandle
                 .scroll_beyond_last_line(true)
                 .cursor_surrounding_lines(3)
         })
-        .style(|s| {
+        .style(move |s| {
             s.width_full()
                 .height_full()
                 .font_family(design::MONO.to_string())
                 .font_size(13.0)
                 .color(design::FG)
-                .background(design::BG_BASE)
+                .background(editor_pane_fill(aesthetic.get()))
         });
 
     let doc = editor.doc();
@@ -634,7 +662,10 @@ pub fn external_change_bar(
 /// Crates and modules — not the agent context dump, and not the call graph.
 /// Showing the public API here made the pane look like a paste of `cargo doc`
 /// output; the navigable map (Benzi-style) is a separate piece of work.
-pub fn empty_editor_with_map(map: RwSignal<String>) -> impl IntoView {
+pub fn empty_editor_with_map(
+    map: RwSignal<String>,
+    aesthetic: RwSignal<Aesthetic>,
+) -> impl IntoView {
     // The outer container, not the stack, owns size and the opaque fill.
     //
     // Both children are `absolute`, so they contribute nothing to intrinsic
@@ -677,11 +708,11 @@ pub fn empty_editor_with_map(map: RwSignal<String>) -> impl IntoView {
         ))
         .style(|s| s.width_full().height_full()),
     )
-    .style(|s| {
+    .style(move |s| {
         s.width_full()
             .height_full()
             .min_height(0.0)
-            .background(design::BG_BASE)
+            .background(editor_pane_fill(aesthetic.get()))
     })
 }
 

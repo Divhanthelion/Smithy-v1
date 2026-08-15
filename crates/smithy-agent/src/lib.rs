@@ -43,18 +43,19 @@ pub mod catalogue;
 pub mod config;
 pub mod explore;
 pub mod limits;
+pub mod mcp;
 pub mod message;
 pub mod parse;
 pub mod persist;
 pub mod provider;
 pub mod providers;
 pub mod session;
+pub mod skill;
 pub mod symbol_tool;
 
 pub use catalogue::{ModelEntry, ModelTier};
 pub use config::{AgentConfig, Endpoint, ProviderChoice};
 pub use explore::Explore;
-pub use symbol_tool::SymbolLookup;
 pub use limits::{tool_result_warn_for_window, Budget, Limits, Stop};
 pub use message::{History, Message, Role};
 pub use parse::{parse, Action};
@@ -62,6 +63,11 @@ pub use persist::{transcript, SessionStore, TranscriptEntry};
 pub use provider::{Completion, CompletionRequest, Delta, Provider, ProviderError, Sampling};
 pub use providers::{create_provider_from_env, LmStudio, ModelInfo, OpenRouter};
 pub use session::{
-    ContextLedger, ContextSegment, Outcome, Session, SessionConfig, Stopper, TurnEvent, Usage,
-    CANCELLED,
+    with_project_context, ContextLedger, ContextSegment, Outcome, Session, SessionConfig, Stopper,
+    TurnEvent, Usage, CANCELLED,
 };
+pub use skill::{
+    list_skills, load_skill, mention_paths, parse_command, resolve_mentions, Command, SessionKind,
+    Skill, SkillMeta, ToolProfile,
+};
+pub use symbol_tool::SymbolLookup;

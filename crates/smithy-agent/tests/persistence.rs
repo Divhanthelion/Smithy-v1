@@ -58,14 +58,21 @@ fn session(f: &Fixture, script: Vec<Completion>) -> Session {
 fn resumed(f: &Fixture, stored: StoredSession, script: Vec<Completion>) -> Session {
     let sampling = stored.sampling.clone();
     let limits = stored.limits.clone();
-    Session::resume(
+    let kind = stored.kind;
+    let tools = stored.tools.clone();
+    let mut session = Session::resume(
         Arc::new(ScriptedProvider::new(script)),
         Arc::new(Registry::core()),
         f.ctx.clone(),
         stored.into_history(),
         sampling,
         limits,
-    )
+        kind,
+    );
+    if let Some(tools) = tools {
+        session.freeze_tools(tools);
+    }
+    session
 }
 
 fn snapshot(history: &History) -> Vec<String> {
@@ -77,14 +84,17 @@ fn snapshot(history: &History) -> Vec<String> {
 }
 
 fn store_from(f: &Fixture, id: &str, s: &Session) -> StoredSession {
-    StoredSession::from_history(
+    StoredSession::from_history_with_reasoning(
         id,
         &f.workspace_root,
         "test-model",
         s.history(),
         s.sampling(),
         s.limits(),
+        s.reasoning().to_vec(),
+        s.kind(),
     )
+    .with_tools(s.tools_schema().clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -327,6 +337,37 @@ async fn a_saved_session_records_its_schema_version() {
         parsed["version"],
         serde_json::json!(smithy_agent::persist::SCHEMA_VERSION)
     );
+}
+
+/// Resume must POST the stored tool JSON even if the live registry no longer
+/// has those names (an MCP server that is down).
+#[tokio::test]
+async fn resume_sends_stored_tools_even_if_the_live_registry_moved() {
+    let f = fixture();
+    let mut first = session(&f, vec![answer("one")]);
+    first.run_turn("hi", None).await.expect("turn");
+    let stored_tools = first.tools_schema().clone();
+    f.store
+        .save(&store_from(&f, "sess-1", &first))
+        .expect("save");
+
+    let stored = f.store.load("sess-1").expect("load");
+    let tools = stored.tools.clone().expect("tools were saved");
+    let mut registry = Registry::new().with(smithy_tools::tools::read::Read);
+    smithy_agent::mcp::stub_unavailable(&mut registry, &tools);
+    let mut second = Session::resume(
+        Arc::new(ScriptedProvider::new(vec![answer("two")])),
+        Arc::new(registry),
+        f.ctx.clone(),
+        stored.into_history(),
+        Sampling::default(),
+        Limits::default(),
+        smithy_agent::SessionKind::Coding,
+    );
+    second.freeze_tools(tools);
+    second.run_turn("again", None).await.expect("turn");
+    let body = second.last_request().expect("posted");
+    assert_eq!(&body["tools"], &stored_tools);
 }
 
 /// Sampling and limits travel with the session, so resuming reproduces the run

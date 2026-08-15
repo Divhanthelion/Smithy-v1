@@ -72,10 +72,7 @@ pub struct MemorySample {
 impl MemorySample {
     /// The menu-bar string, or empty when there is nothing worth saying.
     pub fn render(&self) -> String {
-        if self.own_bytes == 0
-            && self.analyzer_bytes == 0
-            && self.other_analyzer_bytes == 0
-        {
+        if self.own_bytes == 0 && self.analyzer_bytes == 0 && self.other_analyzer_bytes == 0 {
             return String::new();
         }
         let mut parts = Vec::new();
@@ -236,8 +233,10 @@ impl BalanceCache {
     }
 
     pub fn store(&self, balance: &smithy_agent::catalogue::Balance) {
-        self.cents
-            .store((balance.total * 100.0).round().max(0.0) as u64, Ordering::Relaxed);
+        self.cents.store(
+            (balance.total * 100.0).round().max(0.0) as u64,
+            Ordering::Relaxed,
+        );
         if let Ok(mut currency) = self.currency.lock() {
             *currency = balance.currency.clone();
         }
@@ -294,9 +293,8 @@ pub fn spend_now(
         model_label.split(' ').next().unwrap_or(&model).to_string()
     };
 
-    let session_cost = price_of(config.provider, &model).map(|(prompt, completion, cached)| {
-        usage.cost(prompt, completion, cached)
-    });
+    let session_cost = price_of(config.provider, &model)
+        .map(|(prompt, completion, cached)| usage.cost(prompt, completion, cached));
 
     Spend {
         usage,
@@ -311,10 +309,7 @@ pub fn spend_now(
 /// OpenRouter's prices are per-model and live, and fetching the whole catalogue
 /// on a five-second tick to price one model would be absurd — so an OpenRouter
 /// session shows tokens rather than a number that might be wrong.
-fn price_of(
-    provider: smithy_agent::ProviderChoice,
-    model: &str,
-) -> Option<(f64, f64, f64)> {
+fn price_of(provider: smithy_agent::ProviderChoice, model: &str) -> Option<(f64, f64, f64)> {
     match provider {
         smithy_agent::ProviderChoice::DeepSeek => {
             let (prompt, completion) = smithy_agent::providers::deepseek::pricing_for(model)?;
@@ -350,14 +345,11 @@ pub fn spawn_balance_poller(agent: crate::app_state::AgentState, data_dir: std::
                 .flatten();
 
                 if let Some(key) = key {
-                    match smithy_agent::catalogue::deepseek_balance(
-                        &config.deepseek.base_url,
-                        &key,
-                    )
-                    .await
+                    if let Ok(balance) =
+                        smithy_agent::catalogue::deepseek_balance(&config.deepseek.base_url, &key)
+                            .await
                     {
-                        Ok(balance) => cache.store(&balance),
-                        Err(_) => {} // unknown is rendered as nothing
+                        cache.store(&balance);
                     }
                 }
             } else {
@@ -416,7 +408,11 @@ mod tests {
             analyzer_count: 3,
             ..Default::default()
         };
-        assert!(sample.render().contains("rust-analyzer ×3"), "{}", sample.render());
+        assert!(
+            sample.render().contains("rust-analyzer ×3"),
+            "{}",
+            sample.render()
+        );
         assert!(sample.is_heavy());
     }
 

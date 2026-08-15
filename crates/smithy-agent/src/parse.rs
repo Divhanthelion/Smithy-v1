@@ -43,7 +43,7 @@ pub fn parse(c: &Completion) -> Action {
 
     // 2. Fallback: scrape the content field.
     let content = repair_unclosed_think(&c.content);
-    if content.contains("<tool_call>") || content.contains("<function=") {
+    if looks_like_structural_tool_call(&content) {
         match scrape_xml(&content) {
             Ok(calls) if !calls.is_empty() => return Action::Calls(calls),
             Ok(_) => {
@@ -97,7 +97,9 @@ fn scrape_xml(content: &str) -> Result<Vec<ToolCall>, String> {
     let mut calls = Vec::new();
 
     // (a) Hermes JSON blocks inside <tool_call>…</tool_call>.
-    for inner in blocks_between(content, "<tool_call>", "</tool_call>") {
+    // String-aware so a write whose content contains the literal `</tool_call>`
+    // is not split in the middle of the JSON.
+    for inner in blocks_between_respecting_strings(content, "<tool_call>", "</tool_call>") {
         let trimmed = inner.trim();
         if trimmed.starts_with('{') {
             let v: Value = serde_json::from_str(trimmed)
@@ -134,6 +136,24 @@ fn scrape_xml(content: &str) -> Result<Vec<ToolCall>, String> {
     }
 
     Ok(calls)
+}
+
+/// True only when the content is shaped like a call, not when the model
+/// mentions the tags in prose. A sentence that says "use `<tool_call>`" used
+/// to burn `max_parse_retries` completions on a non-problem.
+fn looks_like_structural_tool_call(content: &str) -> bool {
+    if content.contains("<function=") {
+        return true;
+    }
+    let mut rest = content;
+    while let Some(i) = rest.find("<tool_call>") {
+        let after = rest[i + "<tool_call>".len()..].trim_start();
+        if after.starts_with('{') {
+            return true;
+        }
+        rest = &rest[i + "<tool_call>".len()..];
+    }
+    false
 }
 
 fn scrape_function_tags(content: &str) -> Result<Vec<ToolCall>, String> {
@@ -174,13 +194,15 @@ fn scrape_function_tags(content: &str) -> Result<Vec<ToolCall>, String> {
     Ok(calls)
 }
 
-/// Collect the inner text of every `open…close` pair (non-nested).
-fn blocks_between<'a>(s: &'a str, open: &str, close: &str) -> Vec<&'a str> {
+/// Collect the inner text of every `open…close` pair, ignoring a `close` that
+/// sits inside a JSON string. Needed for a `write` whose content contains the
+/// literal closer of the wrapper tag.
+fn blocks_between_respecting_strings<'a>(s: &'a str, open: &str, close: &str) -> Vec<&'a str> {
     let mut out = Vec::new();
     let mut rest = s;
     while let Some(i) = rest.find(open) {
         let after = &rest[i + open.len()..];
-        match after.find(close) {
+        match find_close_outside_strings(after, close) {
             Some(j) => {
                 out.push(&after[..j]);
                 rest = &after[j + close.len()..];
@@ -189,6 +211,38 @@ fn blocks_between<'a>(s: &'a str, open: &str, close: &str) -> Vec<&'a str> {
         }
     }
     out
+}
+
+fn find_close_outside_strings(s: &str, close: &str) -> Option<usize> {
+    let close_bytes = close.as_bytes();
+    let bytes = s.as_bytes();
+    let mut in_string = false;
+    let mut escape = false;
+    let mut i = 0;
+    while i + close_bytes.len() <= bytes.len() {
+        let c = bytes[i];
+        if in_string {
+            if escape {
+                escape = false;
+            } else if c == b'\\' {
+                escape = true;
+            } else if c == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'"' {
+            in_string = true;
+            i += 1;
+            continue;
+        }
+        if bytes[i..].starts_with(close_bytes) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Like `blocks_between` but the open tag is `<parameter=KEY>` — returns (key, value).
@@ -322,6 +376,38 @@ mod tests {
         match parse(&c) {
             Action::Malformed(e) => assert!(e.contains("not valid JSON")),
             other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    /// A sentence that names the tag is an answer, not a failed call. Treating
+    /// it as malformed burned retries on a non-problem.
+    #[test]
+    fn prose_that_mentions_the_tag_is_still_an_answer() {
+        let c = completion(
+            "I will emit a <tool_call> when I actually need a tool. For now, here is the plan.",
+        );
+        match parse(&c) {
+            Action::Done(t) => assert!(t.contains("here is the plan")),
+            other => panic!("prose mention must not be a failed call, got {other:?}"),
+        }
+    }
+
+    /// A write whose content contains the wrapper's closer used to split the
+    /// JSON in the middle and fail to parse, or parse a truncated argument.
+    #[test]
+    fn a_write_whose_content_contains_the_closer_still_scrapes() {
+        let inner = r#"{"name":"write","arguments":{"path":"a.rs","content":"fn x() { /* </tool_call> */ }"}}"#;
+        let c = completion(&format!("<tool_call>{inner}</tool_call>"));
+        match parse(&c) {
+            Action::Calls(v) => {
+                assert_eq!(v[0].name, "write");
+                assert!(
+                    v[0].arguments.contains("</tool_call>"),
+                    "the closer inside the file must survive: {}",
+                    v[0].arguments
+                );
+            }
+            other => panic!("expected Calls, got {other:?}"),
         }
     }
 }

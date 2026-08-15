@@ -192,12 +192,7 @@ impl Tool for Explore {
         config.limits = self.limits();
         config.sampling = self.sampling.clone();
 
-        let mut session = Session::new(
-            self.provider.clone(),
-            self.registry.clone(),
-            ctx,
-            config,
-        );
+        let mut session = Session::new(self.provider.clone(), self.registry.clone(), ctx, config);
 
         let task = match arg_str_opt(args, "context").map(str::trim) {
             Some(c) if !c.is_empty() => {
@@ -279,7 +274,8 @@ mod tests {
     #[test]
     fn the_sub_agent_cannot_write_edit_or_run_commands() {
         let tmp = tempfile::tempdir().unwrap();
-        let names = explore_in(tmp.path()).registry.names();
+        let explore = explore_in(tmp.path());
+        let names = explore.registry.names();
         for forbidden in ["write", "edit", "bash"] {
             assert!(
                 !names.contains(&forbidden),
@@ -292,14 +288,16 @@ mod tests {
     #[test]
     fn the_sub_agent_cannot_call_explore() {
         let tmp = tempfile::tempdir().unwrap();
-        let names = explore_in(tmp.path()).registry.names();
+        let explore = explore_in(tmp.path());
+        let names = explore.registry.names();
         assert!(!names.contains(&"explore"), "{names:?}");
     }
 
     #[test]
     fn the_sub_agent_can_search_read_and_fetch() {
         let tmp = tempfile::tempdir().unwrap();
-        let names = explore_in(tmp.path()).registry.names();
+        let explore = explore_in(tmp.path());
+        let names = explore.registry.names();
         for expected in ["read", "ls", "glob", "grep", "web_fetch"] {
             assert!(names.contains(&expected), "{names:?}");
         }

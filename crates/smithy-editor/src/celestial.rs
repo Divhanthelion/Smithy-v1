@@ -111,6 +111,20 @@ pub fn shown_darkness(actual: f64) -> f64 {
     FLOOR + actual.clamp(0.0, 1.0) * (1.0 - FLOOR)
 }
 
+/// The pane fill. Forged is transparent so the sky painted underneath is the
+/// ground; Flat keeps the opaque work surface.
+///
+/// An opaque `BG_BASE` on the editor was hiding the entire catalogue: the
+/// backdrop drew stars, then the pane filled over them. The contrast tests in
+/// this file exist because text is supposed to sit *on* the sky, not on a
+/// second ground that erases it.
+pub fn editor_pane_fill(aesthetic: Aesthetic) -> Color {
+    match aesthetic {
+        Aesthetic::Flat => crate::design::BG_BASE,
+        Aesthetic::Forged => Color::TRANSPARENT,
+    }
+}
+
 /// A star's radius in pixels, from its apparent magnitude.
 ///
 /// Magnitude is logarithmic and runs *backwards* — smaller is brighter — so
@@ -139,6 +153,15 @@ pub fn star_geometry(magnitude: f32, darkness: f64, pane_scale: f64) -> (f64, f3
         return (MIN_STAR_RADIUS, alpha);
     }
     (wanted, alpha)
+}
+
+/// How many stars would actually be inked at this darkness, after the
+/// alpha floor that skips discs nothing can see.
+pub fn painted_star_count(sky: &SkyState, pane_scale: f64) -> usize {
+    sky.stars
+        .iter()
+        .filter(|s| star_geometry(s.magnitude, sky.darkness, pane_scale).1 >= 0.015)
+        .count()
 }
 
 /// The discs a star is built from: each one's radius as a multiple of the
@@ -304,11 +327,7 @@ pub fn sky_backdrop(
         // Nothing about a backdrop can be seen from inside the process, and
         // every way it fails looks identical: a blank pane.
         if std::env::var("SMITHY_SKY_DEBUG").is_ok_and(|v| v != "0") {
-            let painted = sky
-                .stars
-                .iter()
-                .filter(|s| star_geometry(s.magnitude, sky.darkness, 1.0).1 >= 0.015)
-                .count();
+            let painted = painted_star_count(&sky, 1.0);
             eprintln!(
                 "sky: {w:.0}x{h:.0} phase {:?} darkness {:.2} (shown {:.2}) | {} up, {painted} painted | ground {:?}",
                 sky.phase,
@@ -400,6 +419,13 @@ fn draw_moon(cx: &mut floem::context::PaintCx, w: f64, h: f64, sky: &SkyState) {
 /// The default place, until a setting exists for it.
 pub const DEFAULT_LOCATION: Location = SAN_FRANCISCO;
 
+/// Observer used by the backdrop and the frame sun.
+///
+/// Same source so the two cannot disagree about whether it is day.
+pub fn current_location() -> Location {
+    Location::from_env()
+}
+
 /// Sunrise and sunset today, as hours since local midnight.
 ///
 /// Computed at [`DEFAULT_LOCATION`] itself — the same place the backdrop's
@@ -412,7 +438,7 @@ pub const DEFAULT_LOCATION: Location = SAN_FRANCISCO;
 /// left.
 pub fn todays_sun(unix_seconds: f64) -> (f64, f64) {
     let jd = smithy_sky::time::julian_date_from_unix(unix_seconds);
-    let location = DEFAULT_LOCATION;
+    let location = current_location();
 
     match smithy_sky::sun::sunrise_sunset(jd, location) {
         Some((rise, set)) => {
@@ -847,5 +873,28 @@ mod tests {
             "{FRAME_SUN_RADIUS:.1}px against a {:.0}px header is a bauble, not a presence",
             crate::forged::HEADER_HEIGHT
         );
+    }
+
+    /// The layer that actually failed: an opaque editor fill painted over the
+    /// catalogue. Stars-above-horizon was already tested in smithy-sky and
+    /// did not catch this.
+    #[test]
+    fn forged_lets_the_sky_show_through_the_editor_pane() {
+        assert_eq!(editor_pane_fill(Aesthetic::Forged), Color::TRANSPARENT);
+        assert_eq!(editor_pane_fill(Aesthetic::Flat), crate::design::BG_BASE);
+    }
+
+    #[test]
+    fn a_night_sky_paints_stars_above_the_detection_floor() {
+        let sky = SkyState::at(
+            SAN_FRANCISCO,
+            smithy_sky::time::julian_date(2024, 2, 3, 6, 0, 0.0),
+        );
+        let painted = painted_star_count(&sky, 1.0);
+        assert!(
+            painted > 50,
+            "a February night painted {painted} stars; the field is empty"
+        );
+        assert_eq!(sky.phase, smithy_sky::Phase::Night);
     }
 }

@@ -34,7 +34,7 @@ impl OpenRouter {
             .timeout(REQUEST_TIMEOUT)
             .build()
             .map_err(|e| ProviderError::Other(format!("could not build HTTP client: {e}")))?;
-        
+
         let api_key = api_key.into();
         let base_url = base_url.into().trim_end_matches('/').to_string();
         let model = model.into();
@@ -62,8 +62,7 @@ impl OpenRouter {
 
         if api_key.trim().is_empty() {
             return Err(ProviderError::Other(
-                "OPENROUTER_API_KEY environment variable is empty."
-                    .to_string(),
+                "OPENROUTER_API_KEY environment variable is empty.".to_string(),
             ));
         }
 
@@ -223,6 +222,7 @@ impl Provider for OpenRouter {
             .header("HTTP-Referer", "https://github.com/finalsmithy")
             .header("X-Title", "Smithy")
             .json(&self.build_body(&request))
+            .timeout(request.http_timeout(REQUEST_TIMEOUT))
             .send()
             .await
             .map_err(|e| ProviderError::Unreachable {
@@ -262,6 +262,10 @@ impl Provider for OpenRouter {
         out.tool_calls = build_tool_calls(partials);
         Ok(out)
     }
+
+    fn build_body(&self, request: &CompletionRequest<'_>) -> Value {
+        OpenRouter::build_body(self, request)
+    }
 }
 
 fn truncate(s: &str, max_bytes: usize) -> String {
@@ -295,7 +299,10 @@ mod tests {
         let p = OpenRouter::from_env().unwrap();
         assert_eq!(p.name(), "openrouter");
         assert_eq!(p.model(), "openai/gpt-4o");
-        assert_eq!(p.chat_url(), "https://custom.openrouter/v1/chat/completions");
+        assert_eq!(
+            p.chat_url(),
+            "https://custom.openrouter/v1/chat/completions"
+        );
 
         std::env::remove_var("OPENROUTER_API_KEY");
         std::env::remove_var("OPENROUTER_MODEL");

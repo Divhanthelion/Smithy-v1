@@ -112,6 +112,15 @@ impl ContextUsageSnapshot {
     }
 }
 
+/// A row in the `/` picker. Kept here so the editor crate does not depend on
+/// the agent crate; the app maps `SkillMeta` onto this.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillPick {
+    pub name: String,
+    pub description: String,
+    pub argument_hint: String,
+}
+
 /// Everything the panel renders from.
 #[derive(Clone, Copy)]
 pub struct AgentPanelState {
@@ -130,6 +139,18 @@ pub struct AgentPanelState {
     /// Hard ceiling, derived from the loaded model's context window.
     pub context_limit: RwSignal<i64>,
     pub model_label: RwSignal<String>,
+    /// Why the last turn ended early, pinned next to the budget bar so a
+    /// ceiling (`time limit reached (3600s)` and friends) is not buried in a
+    /// long transcript. Cleared when the next turn starts.
+    pub last_stop: RwSignal<Option<String>>,
+    /// Coding / Research / Grill — shown in the header.
+    pub session_kind: RwSignal<String>,
+    /// Segment text for inspection, stashed with the ledger (not rebuilt on paint).
+    pub inspect_segments: RwSignal<Vec<(String, String)>>,
+    /// Pretty-printed last provider request body.
+    pub last_request: RwSignal<Option<String>>,
+    /// Skills for the `/` picker.
+    pub skills: RwSignal<Vec<SkillPick>>,
     /// What the model was told about the project, e.g.
     /// "layout, dependencies, modules, public API · ~6000 tokens".
     pub context_label: RwSignal<String>,
@@ -176,6 +197,11 @@ impl AgentPanelState {
             context_tokens: RwSignal::new(0),
             context_limit: RwSignal::new(110_000),
             model_label: RwSignal::new("connecting…".to_string()),
+            last_stop: RwSignal::new(None),
+            session_kind: RwSignal::new("Coding".into()),
+            inspect_segments: RwSignal::new(Vec::new()),
+            last_request: RwSignal::new(None),
+            skills: RwSignal::new(Vec::new()),
             context_label: RwSignal::new(String::new()),
             context_usage: RwSignal::new(None),
             connected: RwSignal::new(false),
@@ -255,6 +281,9 @@ impl AgentPanelState {
         self.streaming_reasoning.set(String::new());
         self.context_tokens.set(0);
         self.context_usage.set(None);
+        self.last_stop.set(None);
+        self.inspect_segments.set(Vec::new());
+        self.last_request.set(None);
     }
 }
 
@@ -338,6 +367,7 @@ pub fn budget_color(fraction: f64) -> Color {
 // Views
 // ============================================================================
 
+#[allow(clippy::too_many_arguments)]
 pub fn agent_panel(
     state: AgentPanelState,
     on_send: std::rc::Rc<dyn Fn(String)>,
@@ -350,6 +380,8 @@ pub fn agent_panel(
     on_settings: impl Fn() + 'static,
     // Forget the conversation — the model's history, not just this view of it.
     on_clear_context: impl Fn() + 'static,
+    // Open a ledger segment or the last request as a scratch buffer.
+    on_inspect: std::rc::Rc<dyn Fn(String, String)>,
     // How the microphone's shortcut is written, for the hint beside it.
     hotkey: String,
 ) -> impl IntoView {
@@ -375,7 +407,7 @@ pub fn agent_panel(
                     .min_width(0.0)
             }),
         live_activity(state),
-        budget_bar(state),
+        budget_bar(state, on_inspect),
         attachment_row(state),
         composer(state, on_send, on_stop, on_voice, hotkey),
     ))
@@ -427,6 +459,16 @@ pub fn agent_panel(
         state.drop_active.set(false);
         state.attach(&event.paths);
     })
+    .on_event(floem::event::listener::KeyDown, move |_, ev| {
+        if state.drop_active.get_untracked()
+            && ev.key == floem::prelude::Key::Named(floem::prelude::NamedKey::Escape)
+        {
+            state.drop_active.set(false);
+            floem::event::EventPropagation::Stop
+        } else {
+            floem::event::EventPropagation::Continue
+        }
+    })
     .style(|s| s.width_full().height_full().min_width(0.0))
 }
 
@@ -455,6 +497,12 @@ fn header(
                 .color(catppuccin::TEXT)
                 .font_size(13.0)
                 .font_bold()
+                .margin_right(8.0)
+        }),
+        Label::derived(move || state.session_kind.get()).style(|s| {
+            nowrap(s)
+                .color(catppuccin::LAVENDER)
+                .font_size(11.0)
                 .margin_right(8.0)
         }),
         // Connection dot: green when the endpoint preflighted, red when not.
@@ -1154,6 +1202,13 @@ fn drop_overlay(state: AgentPanelState) -> impl IntoView {
                 .border_color(catppuccin::LAVENDER)
                 .border_radius(4.0)
                 .z_index(50)
+                // File-drag events are target-phase only — they do not bubble.
+                // An overlay that accepts hits steals Drop and Leave from the
+                // stack that owns them, so the outline stays up forever. A
+                // screenshot dragged from the macOS thumbnail is the usual way
+                // this shows up: Enter lights the overlay, then nothing else
+                // reaches the handler.
+                .pointer_events_none()
         } else {
             s.display(floem::taffy::Display::None)
         }
@@ -1161,15 +1216,137 @@ fn drop_overlay(state: AgentPanelState) -> impl IntoView {
 }
 
 
+#[derive(Clone)]
+struct LedgerLine {
+    key: String,
+    label: String,
+    inspectable: bool,
+}
+
+fn ledger_lines(state: AgentPanelState) -> Vec<LedgerLine> {
+    let Some(usage) = state.context_usage.get() else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    for row in &usage.rows {
+        if row.tokens <= 0 && row.name != "Conversation" {
+            continue;
+        }
+        let tag = if row.frozen { "fixed" } else { "live" };
+        lines.push(LedgerLine {
+            key: row.name.clone(),
+            label: format!(
+                "{} {} · {}",
+                format_tokens(row.tokens),
+                row.name.to_ascii_lowercase(),
+                tag
+            ),
+            inspectable: true,
+        });
+    }
+    let pending = crate::attachment::total_tokens(&state.attachments.get()) as i64;
+    if pending > 0 {
+        lines.push(LedgerLine {
+            key: "attachments".into(),
+            label: format!("{} attachments · pending", format_tokens(pending)),
+            inspectable: false,
+        });
+    }
+    if usage.reasoning_tokens > 0 {
+        lines.push(LedgerLine {
+            key: "reasoning".into(),
+            label: format!(
+                "{} reasoning · generated, not sent",
+                format_tokens(usage.reasoning_tokens)
+            ),
+            inspectable: false,
+        });
+    }
+    if state.last_request.get().is_some() {
+        lines.push(LedgerLine {
+            key: "Last request".into(),
+            label: "last request · posted".into(),
+            inspectable: true,
+        });
+    }
+    lines
+}
+
+fn inspect_filename(segment: &str) -> String {
+    match segment {
+        "System prompt" => "system-prompt.md".into(),
+        "Project context" => "project-context.md".into(),
+        "Tool schemas" => "tool-schemas.json".into(),
+        "Conversation" => "conversation.md".into(),
+        "Last request" => "last-request.json".into(),
+        other => format!("{other}.md"),
+    }
+}
+
+fn ledger_row(
+    state: AgentPanelState,
+    line: LedgerLine,
+    on_inspect: std::rc::Rc<dyn Fn(String, String)>,
+) -> impl IntoView {
+    let inspectable = line.inspectable;
+    let key = line.key.clone();
+    Label::derived(move || line.label.clone())
+        .on_event_stop(floem::event::listener::Click, move |_, _| {
+            if !inspectable {
+                return;
+            }
+            let body = if key == "Last request" {
+                state.last_request.get_untracked().unwrap_or_default()
+            } else {
+                state
+                    .inspect_segments
+                    .get_untracked()
+                    .into_iter()
+                    .find(|(n, _)| n == &key)
+                    .map(|(_, t)| t)
+                    .unwrap_or_else(|| "(empty)".into())
+            };
+            on_inspect(inspect_filename(&key), body);
+        })
+        .style(move |s| {
+            s.color(catppuccin::SURFACE2)
+                .font_size(10.0)
+                .line_height(1.35)
+                .apply_if(inspectable, |s| {
+                    s.cursor(floem::style::CursorStyle::Pointer)
+                        .hover(|s| s.color(catppuccin::TEXT))
+                })
+        })
+}
+
 /// Context usage: bar + per-segment attribution.
 ///
 /// Prefill cost grows superlinearly with context, so this is the readout that
 /// explains a slow turn. Rows come from a stashed snapshot — never rebuilt
 /// here from Session state.
-fn budget_bar(state: AgentPanelState) -> impl IntoView {
+fn budget_bar(
+    state: AgentPanelState,
+    on_inspect: std::rc::Rc<dyn Fn(String, String)>,
+) -> impl IntoView {
     let fraction = move || context_fraction(state.context_tokens.get(), state.context_limit.get());
 
     Stack::vertical((
+        Label::derived(move || {
+            state
+                .last_stop
+                .get()
+                .map(|r| format!("Turn stopped: {r}"))
+                .unwrap_or_default()
+        })
+        .style(move |s| {
+            s.color(catppuccin::PEACH)
+                .font_size(11.0)
+                .padding_horiz(12.0)
+                .padding_top(6.0)
+                .apply_if(state.last_stop.get().is_none(), |s| {
+                    s.display(floem::taffy::Display::None)
+                })
+        }),
         Stack::horizontal((
             Label::derived(move || {
                 let used = state.context_tokens.get();
@@ -1237,47 +1414,20 @@ fn budget_bar(state: AgentPanelState) -> impl IntoView {
                 .margin_horiz(12.0)
                 .background(catppuccin::SURFACE0)
         }),
-        // Segment rows. Frozen (system / project / tools) vs live (conversation).
-        // Pending attachments come from the panel signal — they are not in the
+        // Segment rows. Click a row to open that segment's text. Frozen
+        // (system / project / tools) vs live (conversation). Pending
+        // attachments come from the panel signal — they are not in the
         // session ledger until the next send (audit §4.3).
-        Label::derived(move || {
-            let Some(usage) = state.context_usage.get() else {
-                return String::new();
-            };
-            let mut lines = Vec::new();
-            for row in &usage.rows {
-                if row.tokens <= 0 && row.name != "Conversation" {
-                    continue;
-                }
-                let tag = if row.frozen { "fixed" } else { "live" };
-                lines.push(format!(
-                    "{} {} · {}",
-                    format_tokens(row.tokens),
-                    row.name.to_ascii_lowercase(),
-                    tag
-                ));
-            }
-            let pending = crate::attachment::total_tokens(&state.attachments.get()) as i64;
-            if pending > 0 {
-                lines.push(format!(
-                    "{} attachments · pending",
-                    format_tokens(pending)
-                ));
-            }
-            if usage.reasoning_tokens > 0 {
-                lines.push(format!(
-                    "{} reasoning · generated, not sent",
-                    format_tokens(usage.reasoning_tokens)
-                ));
-            }
-            lines.join("\n")
-        })
+        dyn_stack(
+            move || ledger_lines(state),
+            |line| line.key.clone(),
+            move |line| ledger_row(state, line, on_inspect.clone()),
+        )
         .style(move |s| {
-            s.color(catppuccin::SURFACE2)
-                .font_size(10.0)
+            s.flex_col()
+                .width_full()
                 .padding_horiz(12.0)
                 .padding_top(4.0)
-                .line_height(1.35)
                 .apply_if(state.context_usage.get().is_none(), |s| {
                     s.display(floem::taffy::Display::None)
                 })
@@ -1449,6 +1599,61 @@ fn microphone(
     .style(|s| s.items_center().position(floem::taffy::Position::Relative))
 }
 
+fn matching_skills(state: AgentPanelState) -> Vec<SkillPick> {
+    let input = state.input.get();
+    let Some(rest) = input.strip_prefix('/') else {
+        return Vec::new();
+    };
+    if rest.contains(char::is_whitespace) {
+        return Vec::new();
+    }
+    state
+        .skills
+        .get()
+        .into_iter()
+        .filter(|s| s.name.starts_with(rest))
+        .collect()
+}
+
+fn skill_picker(state: AgentPanelState) -> impl IntoView {
+    dyn_stack(
+        move || matching_skills(state),
+        |s| s.name.clone(),
+        move |skill| {
+            let name = skill.name.clone();
+            let hint = if skill.argument_hint.is_empty() {
+                skill.description.clone()
+            } else {
+                format!("{} — {}", skill.description, skill.argument_hint)
+            };
+            Label::derived(move || format!("/{}  {hint}", skill.name))
+                .on_event_stop(floem::event::listener::Click, move |_, _| {
+                    state.input.set(format!("/{name} "));
+                })
+                .style(|s| {
+                    s.color(catppuccin::TEXT)
+                        .font_size(12.0)
+                        .padding_horiz(10.0)
+                        .padding_vert(5.0)
+                        .cursor(floem::style::CursorStyle::Pointer)
+                        .hover(|s| s.background(catppuccin::SURFACE0))
+                })
+        },
+    )
+    .style(move |s| {
+        s.flex_col()
+            .width_full()
+            .margin_bottom(6.0)
+            .border(1.0)
+            .border_color(catppuccin::SURFACE0)
+            .border_radius(6.0)
+            .background(catppuccin::BASE)
+            .apply_if(matching_skills(state).is_empty(), |s| {
+                s.display(floem::taffy::Display::None)
+            })
+    })
+}
+
 fn composer(
     state: AgentPanelState,
     on_send: std::rc::Rc<dyn Fn(String)>,
@@ -1473,8 +1678,9 @@ fn composer(
     let send_on_enter = send.clone();
 
     Stack::vertical((
+        skill_picker(state),
         TextInput::new(state.input)
-            .placeholder("Ask the agent to do something…")
+            .placeholder("Ask the agent, or / for a command…")
             .on_event_stop(floem::event::listener::KeyDown, move |_, ev| {
                 if ev.key == floem::prelude::Key::Named(floem::prelude::NamedKey::Enter)
                     && !ev.modifiers.contains(floem::prelude::Modifiers::SHIFT)

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use tokio::sync::mpsc;
 
-use super::{LspCompletion, LspDiagnostic, LspHover, LspRegistry, SharedLspRegistry};
+use super::{LspDiagnostic, LspHover, LspRegistry, SharedLspRegistry};
 
 /// Events sent from the editor to the LSP manager
 #[derive(Debug, Clone)]
@@ -33,13 +33,6 @@ pub enum LspRequest {
     FileClosed { path: PathBuf },
     /// Request hover information
     Hover {
-        path: PathBuf,
-        line: u32,
-        character: u32,
-        request_id: u64,
-    },
-    /// Request completions
-    Completion {
         path: PathBuf,
         line: u32,
         character: u32,
@@ -73,11 +66,6 @@ pub enum LspResponse {
     Hover {
         request_id: u64,
         result: Option<LspHover>,
-    },
-    /// Completion response
-    Completion {
-        request_id: u64,
-        items: Vec<LspCompletion>,
     },
     /// Go to definition response
     GotoDefinition {
@@ -290,35 +278,6 @@ impl LspManager {
                     let _ = response_tx.send(LspResponse::Hover { request_id, result });
                 });
             }
-            LspRequest::Completion {
-                path,
-                line,
-                character,
-                request_id,
-            } => {
-                self.runtime.spawn(async move {
-                    let language_id = language_from_path(&path);
-                    let reg = registry.read().await;
-
-                    let items = if let Some(client) = reg.current_client_for(&language_id) {
-                        let uri = path_to_uri(&path);
-                        match client.completion(&uri, line, character).await {
-                            Ok(completions) => completions,
-                            Err(e) => {
-                                let _ = response_tx.send(LspResponse::Error {
-                                    request_id: Some(request_id),
-                                    message: format!("Completion request failed: {}", e),
-                                });
-                                return;
-                            }
-                        }
-                    } else {
-                        vec![]
-                    };
-
-                    let _ = response_tx.send(LspResponse::Completion { request_id, items });
-                });
-            }
             LspRequest::GotoDefinition {
                 path,
                 line,
@@ -482,20 +441,6 @@ impl LspHandle {
     pub fn hover(&self, path: PathBuf, line: u32, character: u32) -> u64 {
         let request_id = self.next_id();
         let _ = self.request_tx.send(LspRequest::Hover {
-            path,
-            line,
-            character,
-            request_id,
-        });
-        request_id
-    }
-
-    /// Request completions
-    ///
-    /// Returns a request ID that will be included in the response
-    pub fn completion(&self, path: PathBuf, line: u32, character: u32) -> u64 {
-        let request_id = self.next_id();
-        let _ = self.request_tx.send(LspRequest::Completion {
             path,
             line,
             character,

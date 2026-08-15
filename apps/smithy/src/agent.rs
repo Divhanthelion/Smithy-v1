@@ -20,7 +20,8 @@ use crossbeam_channel::Sender;
 use serde_json::Value;
 
 use smithy_agent::{
-    session::default_system_prompt, AgentConfig, Outcome, Session, SessionConfig, TurnEvent,
+    session::default_system_prompt, with_project_context, AgentConfig, Outcome, Session,
+    SessionConfig, SessionKind, Skill, TurnEvent,
 };
 use smithy_editor::{PendingChangeManager, PendingFileChange};
 use smithy_tools::{HookDecision, Registry, ToolCall, ToolCtx, ToolHook, Workspace};
@@ -42,7 +43,7 @@ impl ToolHook for ShellApprovalHook {
         "shell-approval"
     }
 
-    async fn before(&self, call: &ToolCall, args: &Value, _ctx: &ToolCtx) -> HookDecision {
+    async fn before(&self, call: &ToolCall, args: &Value, ctx: &ToolCtx) -> HookDecision {
         if call.name != "bash" {
             return HookDecision::Allow;
         }
@@ -60,6 +61,7 @@ impl ToolHook for ShellApprovalHook {
         if self.tx.send(request).is_err() {
             return HookDecision::Deny("the approval prompt is unavailable".into());
         }
+        let _hold = ctx.gate.hold();
         match orx.await {
             Ok(true) => HookDecision::Allow,
             Ok(false) => HookDecision::Deny(
@@ -95,9 +97,9 @@ impl ToolHook for ShellApprovalHook {
 /// arrives as this call's own result, which is appended like any other, and the
 /// prefix is untouched. What it buys is that the model is never guessing.
 ///
-/// The cost that is real: a turn blocked here counts against `max_seconds`, so
-/// walking away mid-review will eventually end the turn. That is visible and
-/// recoverable, unlike the failure it replaces.
+/// The cost that used to be real: a turn blocked here counted against
+/// `max_seconds`, so walking away mid-review ended the turn. The wait is now
+/// paused on the turn clock — a human reading a diff is not a runaway loop.
 pub struct WriteReviewHook {
     pub pending: Arc<Mutex<PendingChangeManager>>,
     pub notify: Sender<AgentUiEvent>,
@@ -184,7 +186,11 @@ impl ToolHook for WriteReviewHook {
         if let Ok(mut pending) = self.pending.lock() {
             pending.add(change.clone());
         }
-        if self.notify.send(AgentUiEvent::ReviewRequested(change)).is_err() {
+        if self
+            .notify
+            .send(AgentUiEvent::ReviewRequested(change))
+            .is_err()
+        {
             // Nobody is listening, so nobody can approve. Failing closed matches
             // shell approval: an unreviewable write must not become an
             // unreviewed one.
@@ -201,7 +207,8 @@ impl ToolHook for WriteReviewHook {
         // Suspend here. The whole point: the answer becomes this call's result,
         // so the model is told what happened at the moment it asks rather than
         // one turn later. See the type docs for the session this was written
-        // against.
+        // against. The turn clock pauses for the wait — Review is not a loop.
+        let _hold = ctx.gate.hold();
         match rx.await {
             Ok(outcome) if outcome.applied => HookDecision::Fulfilled(outcome.message),
             Ok(outcome) => HookDecision::Deny(outcome.message),
@@ -241,6 +248,9 @@ pub struct AgentHandle {
     /// Which layers of project context made it into the prompt, and how big it
     /// was — surfaced in the UI so a silently-degraded context is visible.
     pub context_summary: String,
+    /// MCP connect failures and skipped tools. Shown as Notices; the Session
+    /// still starts.
+    pub notices: Vec<String>,
 }
 
 /// Build a session grounded in `project`, with both gates installed.
@@ -257,11 +267,13 @@ pub async fn build_session(
     shell_approval: Sender<ShellApprovalRequest>,
     review: ReviewGate,
     resume_from: Option<smithy_agent::persist::StoredSession>,
+    skill: Option<Skill>,
 ) -> Result<AgentHandle, String> {
     // Provider key only. Brave used to be unlocked in the same hop, which meant
     // every launch asked for the keychain password twice — once per item. Brave
     // is deferred: we register `web_search` when a key is known to exist
     // (sidecar / env), and unlock it on the first search.
+    let provider_choice = config.provider;
     let provider = tokio::task::spawn_blocking(move || config.build_provider())
         .await
         .map_err(|e| format!("provider setup failed: {e}"))?
@@ -280,15 +292,23 @@ pub async fn build_session(
     let info = provider.probe_model().await.map_err(|e| e.to_string())?;
     provider.preflight().await.map_err(|e| e.to_string())?;
 
-    let (model_label, limits) = match &info {
-        Some(info) => (
-            format!("{} · {} {}", info.key, info.format, info.quantization),
-            info.suggested_limits(),
-        ),
+    let (model_label, mut limits) = match &info {
+        Some(info) => (info.label(), info.suggested_limits()),
         None => (
             provider.model().to_string(),
             smithy_agent::Limits::default(),
         ),
+    };
+    // A Command rebuilds; resume keeps the stored kind so the tool block matches
+    // the conversation. Default is coding.
+    let kind = skill
+        .as_ref()
+        .map(|s| s.meta.profile.kind())
+        .or_else(|| resume_from.as_ref().map(|s| s.kind))
+        .unwrap_or(SessionKind::Coding);
+    limits.max_seconds = match kind {
+        SessionKind::Research => 7_200,
+        _ => provider_choice.turn_seconds(),
     };
 
     // Extract the project description before opening the session: it goes into
@@ -334,28 +354,6 @@ pub async fn build_session(
     };
 
     let workspace = Workspace::open(&project.root)?;
-    let mut registry = Registry::core();
-
-    // Reading a URL needs nothing but a network, so it is always available.
-    registry.push(Box::new(smithy_tools::tools::web_fetch::WebFetch::new()));
-
-    // Searching needs a key, and a tool that is present but always fails is
-    // worse than one that is absent: the model spends a call finding out. The
-    // tool block still cannot change *within* a session — see `Registry::core`
-    // on prefix caching — because this is decided once, here, at construction.
-    //
-    // Presence is decided without unlocking; the key itself is resolved on the
-    // first call so launch only prompts for the provider key.
-    if brave_configured {
-        registry.push(Box::new(smithy_tools::tools::web_search::WebSearch::deferred(
-            || {
-                smithy_agent::config::api_key(
-                    smithy_agent::config::BRAVE_KEY,
-                    "BRAVE_API_KEY",
-                )
-            },
-        )));
-    }
 
     // The symbol index. Built on a worker because it parses every Rust file in
     // the project with tree-sitter — a hundred milliseconds for a mid-sized
@@ -373,57 +371,50 @@ pub async fn build_session(
     .await
     .map_err(|e| format!("symbol index failed: {e}"))?;
 
-    if !symbol_index.is_empty() {
-        registry.push(Box::new(smithy_agent::SymbolLookup::new(
-            symbol_index.clone(),
-        )));
-    }
-
-    // The research sub-agent, on the same provider as the main loop. It gets its
-    // own copy of `web_search` rather than sharing one, because a `Tool` is
-    // owned by the registry it is pushed into and the sub-agent's registry is a
-    // deliberately different, read-only set.
-    registry.push(Box::new(smithy_agent::Explore::new(
+    let mut registry = assemble_registry(
+        kind,
         provider.clone(),
         &project.root,
-        if brave_configured {
-            vec![Box::new(smithy_tools::tools::web_search::WebSearch::deferred(
-                || {
-                    smithy_agent::config::api_key(
-                        smithy_agent::config::BRAVE_KEY,
-                        "BRAVE_API_KEY",
-                    )
-                },
-            )) as Box<dyn smithy_tools::Tool>]
-        } else {
-            Vec::new()
-        },
-    )));
-
-    registry.add_hook(Box::new(WriteReviewHook {
-        pending: review.pending,
-        notify: events.clone(),
-        responders: review.responders,
-        auto_approve: review.auto_approve,
-    }));
-    registry.add_hook(Box::new(ShellApprovalHook { tx: shell_approval }));
-
-    let project_chars = context
-        .as_ref()
-        .map(|c| c.rendered.len())
-        .unwrap_or(0);
-    let prompt = default_system_prompt(
-        workspace.root(),
-        &registry.names(),
-        context.as_ref().map(|c| c.rendered.as_str()),
+        brave_configured,
+        symbol_index,
+        events.clone(),
+        shell_approval,
+        review,
     );
+
+    let mcp = smithy_agent::mcp::attach_mcp(&project.root, &smithy_agent::mcp::RmcpConnector).await;
+    let mut notices = mcp.notices;
+    let already: Vec<String> = registry.names().into_iter().map(str::to_string).collect();
+    for tool in mcp.tools {
+        if already.iter().any(|n| n == tool.name()) {
+            notices.push(format!(
+                "MCP tool `{}` skipped: collides with a core tool.",
+                tool.name()
+            ));
+            continue;
+        }
+        registry.push(tool);
+    }
+    if let Some(stored) = resume_from.as_ref() {
+        if let Some(tools) = stored.tools.as_ref() {
+            smithy_agent::mcp::stub_unavailable(&mut registry, tools);
+        }
+    }
+
+    let project_chars = context.as_ref().map(|c| c.rendered.len()).unwrap_or(0);
+    let map = context.as_ref().map(|c| c.rendered.as_str());
+    let prompt = match &skill {
+        Some(skill) => with_project_context(skill.system_prompt(workspace.root()), map),
+        None => default_system_prompt(workspace.root(), &registry.names(), map),
+    };
     // Joiner boilerplate between base and project counts as system, not
     // project — so base = total − project chars rather than a second render.
     let system_base_chars = prompt.len().saturating_sub(project_chars);
     let ctx = Arc::new(ToolCtx::new(workspace));
 
-    let mut config =
-        SessionConfig::new(prompt).with_segments(system_base_chars, project_chars);
+    let mut config = SessionConfig::new(prompt)
+        .with_segments(system_base_chars, project_chars)
+        .with_kind(kind);
     config.limits = limits.clone();
 
     // What the model was told about the project. A resumed session carries the
@@ -461,6 +452,8 @@ pub async fn build_session(
             // Carried across the resume so a session's traces accumulate rather
             // than restarting from empty every time the editor is reopened.
             let stored_reasoning = stored.reasoning.clone();
+            let stored_kind = stored.kind;
+            let stored_tools = stored.tools.clone();
             let history = stored.into_history();
             let entries = smithy_agent::transcript(&history);
             let effective_limits = match &info {
@@ -474,7 +467,11 @@ pub async fn build_session(
                 history,
                 sampling,
                 effective_limits.clone(),
+                stored_kind,
             );
+            if let Some(tools) = stored_tools {
+                session.freeze_tools(tools);
+            }
             session.restore_reasoning(stored_reasoning);
             (session, entries, Some(id), effective_limits)
         }
@@ -494,7 +491,91 @@ pub async fn build_session(
         model_label,
         context_limit,
         context_summary,
+        notices,
     })
+}
+
+fn brave_search(research: bool) -> smithy_tools::tools::web_search::WebSearch {
+    let search = smithy_tools::tools::web_search::WebSearch::deferred(|| {
+        smithy_agent::config::api_key(smithy_agent::config::BRAVE_KEY, "BRAVE_API_KEY")
+    });
+    if research {
+        search.for_research()
+    } else {
+        search
+    }
+}
+
+/// Tool block for this Session kind. Frozen for the Session, like today's core.
+#[allow(clippy::too_many_arguments)]
+fn assemble_registry(
+    kind: SessionKind,
+    provider: Arc<dyn smithy_agent::Provider>,
+    project_root: &std::path::Path,
+    brave_configured: bool,
+    symbol_index: Arc<smithy_project::symbols::SymbolIndex>,
+    events: Sender<AgentUiEvent>,
+    shell_approval: Sender<ShellApprovalRequest>,
+    review: ReviewGate,
+) -> Registry {
+    let mut registry = match kind {
+        SessionKind::Coding => Registry::core(),
+        SessionKind::Research => Registry::new()
+            .with(smithy_tools::tools::read::Read)
+            .with(smithy_tools::tools::write::Write)
+            .with(smithy_tools::tools::ls::Ls)
+            .with(smithy_tools::tools::glob::Glob)
+            .with(smithy_tools::tools::grep::Grep)
+            .with(smithy_tools::tools::todo::TodoTool),
+        SessionKind::Grill => Registry::new()
+            .with(smithy_tools::tools::read::Read)
+            .with(smithy_tools::tools::ls::Ls)
+            .with(smithy_tools::tools::glob::Glob)
+            .with(smithy_tools::tools::grep::Grep),
+    };
+
+    // Reading a URL needs nothing but a network, so it is always available.
+    registry.push(Box::new(smithy_tools::tools::web_fetch::WebFetch::new()));
+
+    // Searching needs a key, and a tool that is present but always fails is
+    // worse than one that is absent: the model spends a call finding out. The
+    // tool block still cannot change *within* a session — see `Registry::core`
+    // on prefix caching — because this is decided once, here, at construction.
+    if brave_configured {
+        registry.push(Box::new(brave_search(kind == SessionKind::Research)));
+    }
+
+    if kind != SessionKind::Research && !symbol_index.is_empty() {
+        registry.push(Box::new(smithy_agent::SymbolLookup::new(symbol_index)));
+    }
+
+    // Explore is the bounded repo-question tool. Research is a different kind
+    // and must not reuse it; Grill uses it for facts.
+    if kind != SessionKind::Research {
+        registry.push(Box::new(smithy_agent::Explore::new(
+            provider,
+            project_root,
+            if brave_configured {
+                vec![Box::new(brave_search(false)) as Box<dyn smithy_tools::Tool>]
+            } else {
+                Vec::new()
+            },
+        )));
+    }
+
+    if kind != SessionKind::Grill {
+        registry.add_hook(Box::new(WriteReviewHook {
+            pending: review.pending,
+            notify: events,
+            responders: review.responders,
+            auto_approve: review.auto_approve,
+        }));
+    }
+    if kind == SessionKind::Coding {
+        registry.add_hook(Box::new(ShellApprovalHook { tx: shell_approval }));
+    }
+
+    registry
 }
 
 /// Run one turn, forwarding progress to the UI as it happens.
@@ -510,7 +591,8 @@ pub async fn run_turn(session: &mut Session, task: String, events: Sender<AgentU
     // would be the CallGraph::staleness landmine at 60 Hz.
     let ledger = session.ledger();
     let snapshot = smithy_editor::ContextUsageSnapshot::from_ledger(
-        &ledger.segments
+        &ledger
+            .segments
             .iter()
             .map(|s| smithy_editor::ContextUsageRow {
                 name: s.name.to_string(),
@@ -527,6 +609,8 @@ pub async fn run_turn(session: &mut Session, task: String, events: Sender<AgentU
     let _ = events.send(AgentUiEvent::ContextUsage {
         prompt_tokens: session.last_prompt_tokens(),
         snapshot,
+        inspect_segments: session.inspect_segments(),
+        last_request: session.last_request_json(),
     });
     let final_event = match result {
         Ok(Outcome::Answer(answer)) => AgentUiEvent::Answered(answer),
@@ -690,6 +774,82 @@ mod tests {
                  queued in one project must be abandoned before another is opened"
             );
         }
+    }
+
+    /// Accepted hunks are the bytes that land. This is the write path the modal
+    /// uses: `content_with_accepted_hunks` then `apply_change`.
+    #[test]
+    fn accepted_hunks_are_the_bytes_that_land_on_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("notes.txt"), "alpha\nbravo\ncharlie\n").unwrap();
+        let change = PendingFileChange::new(
+            "c1",
+            "notes.txt",
+            "alpha\nbravo\ncharlie\n".into(),
+            "alpha\nBETA\ncharlie\n".into(),
+        );
+        let statuses = vec![smithy_editor::ChangeStatus::Accepted; change.diff.hunks.len()];
+        let content = smithy_editor::content_with_accepted_hunks(&change.diff, &statuses);
+        apply_change(dir.path(), "notes.txt", &content).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("notes.txt")).unwrap(),
+            "alpha\nBETA\ncharlie\n"
+        );
+    }
+
+    #[test]
+    fn a_rejected_review_leaves_the_file_byte_identical() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let original = "alpha\nbravo\ncharlie\n";
+        std::fs::write(dir.path().join("notes.txt"), original).unwrap();
+        let change = PendingFileChange::new(
+            "c1",
+            "notes.txt",
+            original.into(),
+            "alpha\nBETA\ncharlie\n".into(),
+        );
+        let statuses = vec![smithy_editor::ChangeStatus::Rejected; change.diff.hunks.len()];
+        let content = smithy_editor::content_with_accepted_hunks(&change.diff, &statuses);
+        apply_change(dir.path(), "notes.txt", &content).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("notes.txt")).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn a_partial_review_writes_only_the_accepted_hunks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let original: String = (0..40).map(|i| format!("line{i}\n")).collect();
+        std::fs::write(dir.path().join("notes.txt"), &original).unwrap();
+        let mut new_lines: Vec<String> = (0..40).map(|i| format!("line{i}\n")).collect();
+        new_lines[3] = "EARLY\n".into();
+        new_lines[34] = "LATE\n".into();
+        let new: String = new_lines.concat();
+        let change = PendingFileChange::new("c1", "notes.txt", original.clone(), new);
+        assert!(
+            change.diff.hunks.len() >= 2,
+            "the fixture must be two separate hunks, got {}",
+            change.diff.hunks.len()
+        );
+        let mut statuses = vec![smithy_editor::ChangeStatus::Rejected; change.diff.hunks.len()];
+        statuses[0] = smithy_editor::ChangeStatus::Accepted;
+        let content = smithy_editor::content_with_accepted_hunks(&change.diff, &statuses);
+        apply_change(dir.path(), "notes.txt", &content).unwrap();
+        let on_disk = std::fs::read_to_string(dir.path().join("notes.txt")).unwrap();
+        assert_ne!(on_disk, original, "the accepted hunk must have landed");
+        assert_ne!(
+            on_disk, change.diff.new_content,
+            "the rejected hunk must not have landed"
+        );
+        assert!(
+            on_disk.contains("EARLY\n"),
+            "first hunk accepted: {on_disk:?}"
+        );
+        assert!(
+            on_disk.contains("line34\n") && !on_disk.contains("LATE\n"),
+            "second hunk rejected: {on_disk:?}"
+        );
     }
 
     /// **Reviews are resolved by id, not by path.**

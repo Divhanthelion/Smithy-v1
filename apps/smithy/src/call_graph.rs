@@ -468,69 +468,66 @@ fn layout(
         layer: Layer::Focus,
     });
 
-    let place_wrapped = |items: &[(u32, u32)],
-                         y0: f64,
-                         downward: bool,
-                         layer: Layer,
-                         out: &mut Vec<LaidOut>| {
-        if items.is_empty() {
-            return;
-        }
-        let step = if downward { ROW_STEP } else { -ROW_STEP };
-        let mut row: Vec<(u32, u32, f64)> = Vec::new();
-        let mut row_w = 0.0;
-        let mut y = y0;
-
-        let flush = |row: &mut Vec<(u32, u32, f64)>, y: f64, out: &mut Vec<LaidOut>| {
-            if row.is_empty() {
+    let place_wrapped =
+        |items: &[(u32, u32)], y0: f64, downward: bool, layer: Layer, out: &mut Vec<LaidOut>| {
+            if items.is_empty() {
                 return;
             }
-            let total: f64 = row.iter().map(|(_, _, w)| *w).sum::<f64>()
-                + COL_GAP * (row.len().saturating_sub(1)) as f64;
-            let mut x = -total / 2.0;
-            for &(idx, sites, w) in row.iter() {
+            let step = if downward { ROW_STEP } else { -ROW_STEP };
+            let mut row: Vec<(u32, u32, f64)> = Vec::new();
+            let mut row_w = 0.0;
+            let mut y = y0;
+
+            let flush = |row: &mut Vec<(u32, u32, f64)>, y: f64, out: &mut Vec<LaidOut>| {
+                if row.is_empty() {
+                    return;
+                }
+                let total: f64 = row.iter().map(|(_, _, w)| *w).sum::<f64>()
+                    + COL_GAP * (row.len().saturating_sub(1)) as f64;
+                let mut x = -total / 2.0;
+                for &(idx, sites, w) in row.iter() {
+                    let n = &graph.nodes[idx as usize];
+                    let label = display_label(n, focus_node);
+                    out.push(LaidOut {
+                        index: idx,
+                        label,
+                        location: short_location(n),
+                        x,
+                        y,
+                        w,
+                        h: NODE_H,
+                        stale: graph.node_is_stale(n, stale),
+                        sites,
+                        layer,
+                    });
+                    x += w + COL_GAP;
+                }
+                row.clear();
+            };
+
+            for &(idx, sites) in items {
                 let n = &graph.nodes[idx as usize];
                 let label = display_label(n, focus_node);
-                out.push(LaidOut {
-                    index: idx,
-                    label,
-                    location: short_location(n),
-                    x,
-                    y,
-                    w,
-                    h: NODE_H,
-                    stale: graph.node_is_stale(n, stale),
-                    sites,
-                    layer,
-                });
-                x += w + COL_GAP;
+                let w = label_width(&label, &short_location(n));
+                let next = if row.is_empty() {
+                    w
+                } else {
+                    row_w + COL_GAP + w
+                };
+                if !row.is_empty() && next > max_w {
+                    flush(&mut row, y, out);
+                    row_w = 0.0;
+                    y += step;
+                }
+                row.push((idx, sites, w));
+                row_w = if row.len() == 1 {
+                    w
+                } else {
+                    row_w + COL_GAP + w
+                };
             }
-            row.clear();
+            flush(&mut row, y, out);
         };
-
-        for &(idx, sites) in items {
-            let n = &graph.nodes[idx as usize];
-            let label = display_label(n, focus_node);
-            let w = label_width(&label, &short_location(n));
-            let next = if row.is_empty() {
-                w
-            } else {
-                row_w + COL_GAP + w
-            };
-            if !row.is_empty() && next > max_w {
-                flush(&mut row, y, out);
-                row_w = 0.0;
-                y += step;
-            }
-            row.push((idx, sites, w));
-            row_w = if row.len() == 1 {
-                w
-            } else {
-                row_w + COL_GAP + w
-            };
-        }
-        flush(&mut row, y, out);
-    };
 
     // How tall did a wrapped band grow? Used to offset hop-2 away from hop-1.
     let band_depth = |items: &[(u32, u32)]| -> f64 {
@@ -557,13 +554,7 @@ fn layout(
     let callee_depth = band_depth(&callees_v);
     let caller_depth = band_depth(&callers_v);
 
-    place_wrapped(
-        &callers_v,
-        -BAND_GAP,
-        false,
-        Layer::Caller,
-        &mut out,
-    );
+    place_wrapped(&callers_v, -BAND_GAP, false, Layer::Caller, &mut out);
     place_wrapped(
         &hop2_c,
         -(BAND_GAP * 2.0 + caller_depth),
@@ -601,6 +592,7 @@ fn fit_camera(nodes: &[LaidOut], pane_w: f64, pane_h: f64) -> ((f64, f64), f64) 
     fit_bounds(min_x, max_x, min_y, max_y, pane_w, pane_h, 0.55, 1.35)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn fit_bounds(
     min_x: f64,
     max_x: f64,
@@ -664,9 +656,6 @@ struct OverviewChip {
     w: f64,
     h: f64,
     stale: bool,
-    /// Index into the clusters vec — used by tests / future hull highlighting.
-    #[allow(dead_code)]
-    cluster: usize,
 }
 
 fn file_basename(path: &str) -> String {
@@ -723,8 +712,7 @@ fn pick_overview_columns(n_files: usize, grid_w: f64) -> usize {
     if n_files == 0 {
         return 1;
     }
-    let max_by_width =
-        ((grid_w + OV_CLUSTER_GAP) / (OV_MIN_COL + OV_CLUSTER_GAP)).floor() as usize;
+    let max_by_width = ((grid_w + OV_CLUSTER_GAP) / (OV_MIN_COL + OV_CLUSTER_GAP)).floor() as usize;
     max_by_width.clamp(1, n_files).min(12)
 }
 
@@ -737,8 +725,7 @@ fn overview_layout(
     stale: &Staleness,
     grid_w: f64,
 ) -> (Vec<ClusterBox>, Vec<OverviewChip>) {
-    let mut by_file: std::collections::BTreeMap<&str, Vec<u32>> =
-        std::collections::BTreeMap::new();
+    let mut by_file: std::collections::BTreeMap<&str, Vec<u32>> = std::collections::BTreeMap::new();
     for (i, n) in graph.nodes.iter().enumerate() {
         by_file.entry(n.file.as_str()).or_default().push(i as u32);
     }
@@ -821,7 +808,6 @@ fn overview_layout(
 
     for (mi, m) in measured.iter().enumerate() {
         let (cx, cy) = placed_at[mi];
-        let cluster_idx = clusters.len();
         clusters.push(ClusterBox {
             title: m.title.clone(),
             x: cx,
@@ -854,7 +840,6 @@ fn overview_layout(
                 w,
                 h: OV_CHIP_H,
                 stale: graph.node_is_stale(n, stale),
-                cluster: cluster_idx,
             });
             x += w + OV_COL_GAP;
             row_w = if row_w == 0.0 {
@@ -892,11 +877,7 @@ fn overview_layout(
     (clusters, chips)
 }
 
-fn fit_overview(
-    clusters: &[ClusterBox],
-    pane_w: f64,
-    pane_h: f64,
-) -> ((f64, f64), f64) {
+fn fit_overview(clusters: &[ClusterBox], pane_w: f64, pane_h: f64) -> ((f64, f64), f64) {
     if clusters.is_empty() {
         return ((0.0, 0.0), 1.0);
     }
@@ -929,13 +910,7 @@ pub fn call_graph_view(
         toolbar(ui, on_build),
         nav_bar(ui),
         dyn_container(
-            move || {
-                (
-                    ui.graph.get().is_some(),
-                    ui.building.get(),
-                    ui.mode.get(),
-                )
-            },
+            move || (ui.graph.get().is_some(), ui.building.get(), ui.mode.get()),
             move |(has, building, mode)| {
                 if building && !has {
                     message_pane(
@@ -1334,10 +1309,7 @@ fn overview_pane(ui: CallGraphUi) -> impl IntoView {
         let (pan, zoom) = fit_overview(&clusters, pw, ph);
         let cur = ui.pan.get_untracked();
         let cz = ui.zoom.get_untracked();
-        if (cur.0 - pan.0).abs() > 0.5
-            || (cur.1 - pan.1).abs() > 0.5
-            || (cz - zoom).abs() > 0.01
-        {
+        if (cur.0 - pan.0).abs() > 0.5 || (cur.1 - pan.1).abs() > 0.5 || (cz - zoom).abs() > 0.01 {
             ui.pan.set(pan);
             ui.zoom.set(zoom);
         }
@@ -1420,7 +1392,13 @@ fn overview_pane(ui: CallGraphUi) -> impl IntoView {
             cx.stroke(&Line::new(a, b), color, &Stroke::new(thickness));
         }
     })
-    .style(|s| s.absolute().inset(0.0).width_full().height_full().pointer_events_none());
+    .style(|s| {
+        s.absolute()
+            .inset(0.0)
+            .width_full()
+            .height_full()
+            .pointer_events_none()
+    });
 
     let chips_layer = dyn_container(
         move || {
@@ -1438,8 +1416,7 @@ fn overview_pane(ui: CallGraphUi) -> impl IntoView {
             };
             let stale = ui.stale.get_untracked();
             let (pw, ph) = ui.size.get_untracked();
-            let (clusters, chips) =
-                overview_layout(&graph, &stale, overview_grid_width(pw));
+            let (clusters, chips) = overview_layout(&graph, &stale, overview_grid_width(pw));
             let (pan_x, pan_y) = ui.pan.get_untracked();
             let zoom = ui.zoom.get_untracked().clamp(0.2, 2.5);
             let ox = pw / 2.0 + pan_x;
@@ -1581,10 +1558,7 @@ fn focus_pane(
         let (pan, zoom) = fit_camera(&nodes, pw, ph);
         let cur = ui.pan.get_untracked();
         let cz = ui.zoom.get_untracked();
-        if (cur.0 - pan.0).abs() > 0.5
-            || (cur.1 - pan.1).abs() > 0.5
-            || (cz - zoom).abs() > 0.01
-        {
+        if (cur.0 - pan.0).abs() > 0.5 || (cur.1 - pan.1).abs() > 0.5 || (cz - zoom).abs() > 0.01 {
             ui.pan.set(pan);
             ui.zoom.set(zoom);
         }
@@ -1640,10 +1614,18 @@ fn focus_pane(
             let bus_y = if toward_down {
                 (focus_pt.y + centers.iter().map(|p| p.y).fold(f64::INFINITY, f64::min)) / 2.0
             } else {
-                (focus_pt.y + centers.iter().map(|p| p.y).fold(f64::NEG_INFINITY, f64::max)) / 2.0
+                (focus_pt.y
+                    + centers
+                        .iter()
+                        .map(|p| p.y)
+                        .fold(f64::NEG_INFINITY, f64::max))
+                    / 2.0
             };
             let min_x = centers.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
-            let max_x = centers.iter().map(|p| p.x).fold(f64::NEG_INFINITY, f64::max);
+            let max_x = centers
+                .iter()
+                .map(|p| p.x)
+                .fold(f64::NEG_INFINITY, f64::max);
 
             let spine = Stroke::new(1.25 * zoom);
             let color = design::BORDER.with_alpha(0.75);
@@ -1678,7 +1660,13 @@ fn focus_pane(
         draw_bus(Layer::Caller, f_top, false);
         draw_bus(Layer::Callee, f_bot, true);
     })
-    .style(|s| s.absolute().inset(0.0).width_full().height_full().pointer_events_none());
+    .style(|s| {
+        s.absolute()
+            .inset(0.0)
+            .width_full()
+            .height_full()
+            .pointer_events_none()
+    });
 
     let nodes_layer = dyn_container(
         move || {
@@ -1752,8 +1740,7 @@ fn focus_pane(
                     Stack::vertical((name, loc))
                         .on_event_stop(floem::event::listener::Click, move |_, _| {
                             let now = std::time::Instant::now();
-                            let double =
-                                now.duration_since(last.get_untracked()).as_millis() < 400;
+                            let double = now.duration_since(last.get_untracked()).as_millis() < 400;
                             last.set(now);
                             if double {
                                 let root = project_root.get_untracked();
@@ -2045,10 +2032,19 @@ mod tests {
         for c in &chips {
             assert!(seen.insert(c.index), "duplicate chip {}", c.index);
         }
-        // Cross-file edge 0→1: endpoints in different clusters
-        let c0 = chips.iter().find(|c| c.index == 0).unwrap().cluster;
-        let c1 = chips.iter().find(|c| c.index == 1).unwrap().cluster;
-        assert_ne!(c0, c1);
+        // Cross-file edge 0→1: endpoints in different file clusters.
+        let chip0 = chips.iter().find(|c| c.index == 0).unwrap();
+        let chip1 = chips.iter().find(|c| c.index == 1).unwrap();
+        let cluster_of = |chip: &OverviewChip| {
+            clusters.iter().position(|cl| {
+                chip.x >= cl.x && chip.x <= cl.x + cl.w && chip.y >= cl.y && chip.y <= cl.y + cl.h
+            })
+        };
+        assert_ne!(
+            cluster_of(chip0),
+            cluster_of(chip1),
+            "nodes in different files must land in different clusters"
+        );
     }
 
     #[test]

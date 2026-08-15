@@ -48,7 +48,9 @@ fn usage() {
 
 /// `~/.local/share/smithy/projects`.
 fn projects_root() -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
     home.join(".local/share/smithy/projects")
 }
 
@@ -91,10 +93,7 @@ fn list(filter: Option<&str>) {
     }
     rows.sort_by(|a, b| b.0.cmp(&a.0));
 
-    println!(
-        "{:<38} {:>5} {:>10}  {}",
-        "PROJECT", "MSGS", "REASONING", "FILE"
-    );
+    println!("{:<38} {:>5} {:>10}  FILE", "PROJECT", "MSGS", "REASONING");
     for (_, project, path, messages, reasoning) in rows {
         let project = if project.chars().count() > 36 {
             format!("{}…", project.chars().take(35).collect::<String>())
@@ -140,7 +139,11 @@ fn show(path: &Path, with_reasoning: bool) {
         // Reasoning is keyed by how many messages existed when it was emitted,
         // so it slots in ahead of the assistant message it produced.
         if with_reasoning {
-            for entry in session.reasoning.iter().filter(|r| r.after_message == index) {
+            for entry in session
+                .reasoning
+                .iter()
+                .filter(|r| r.after_message == index)
+            {
                 println!("  ╭─ reasoning (step {})", entry.step);
                 for line in entry.text.lines() {
                     println!("  │ {line}");
@@ -186,8 +189,15 @@ fn markdown(path: &Path) {
     );
 
     for (index, message) in session.messages.iter().enumerate() {
-        for entry in session.reasoning.iter().filter(|r| r.after_message == index) {
-            println!("<details><summary>Reasoning — step {}</summary>\n", entry.step);
+        for entry in session
+            .reasoning
+            .iter()
+            .filter(|r| r.after_message == index)
+        {
+            println!(
+                "<details><summary>Reasoning — step {}</summary>\n",
+                entry.step
+            );
             println!("```\n{}\n```\n", entry.text.trim());
             println!("</details>\n");
         }
@@ -199,11 +209,7 @@ fn markdown(path: &Path) {
                     println!("### Assistant\n\n{}\n", message.content);
                 }
                 for call in &message.tool_calls {
-                    println!(
-                        "- `{}` — `{}`",
-                        call.name,
-                        one_line(&call.arguments, 200)
-                    );
+                    println!("- `{}` — `{}`", call.name, one_line(&call.arguments, 200));
                 }
                 if !message.tool_calls.is_empty() {
                     println!();

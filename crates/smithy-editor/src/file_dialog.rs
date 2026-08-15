@@ -14,26 +14,17 @@
 
 use rfd::AsyncFileDialog;
 
-/// Ask the user for a directory.
-///
-/// Blocking — call it from the UI thread in response to a click, which is the
-/// only place a modal native dialog makes sense anyway.
-pub fn pick_folder() -> Option<std::path::PathBuf> {
-    rfd::FileDialog::new()
-        .set_title("Open Project")
-        .pick_folder()
-}
-
 /// Ask the user for a directory, without blocking the caller.
 ///
-/// The blocking [`pick_folder`] runs a nested native event loop. From a
-/// *keyboard* event handler on macOS that re-enters AppKit while it is still
-/// dispatching the key, and winit aborts with "tried to handle event while
-/// another event is currently being handled". (A click handler survives it,
-/// which is why the File menu item works and the shortcut did not.)
+/// `rfd`'s blocking `FileDialog::pick_folder` runs a nested native event loop
+/// (`NSOpenPanel.runModal()` on macOS). Calling it from a winit event handler
+/// — click or key — re-enters AppKit while winit still holds the current
+/// event, and winit aborts with "tried to handle event while another event is
+/// currently being handled".
 ///
-/// `AsyncFileDialog` posts the dialog to the platform's run loop and yields,
-/// so the event handler can return before the modal opens.
+/// `AsyncFileDialog` presents a sheet (`beginSheetModalForWindow`) instead.
+/// Construct it off the UI thread (a tokio spawn is enough) so the event
+/// handler can return before the panel is attached.
 pub async fn pick_folder_async() -> Option<std::path::PathBuf> {
     AsyncFileDialog::new()
         .set_title("Open Project")

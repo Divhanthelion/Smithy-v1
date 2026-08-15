@@ -98,6 +98,9 @@ toml = "1.1"
 # URL. Without it the `web_search` tool would have to build that string by hand,
 # which is a correctness problem the moment somebody searches for `C++ &&`.
 reqwest = { version = "0.13", features = ["json", "stream", "query"] }
+# Already in the tree via reqwest. Direct because `web_fetch` parses hosts and
+# joins redirect Locations itself now that automatic following is off.
+url = "2"
 
 # --- Secrets ---
 # API keys live in the OS credential store, never in the settings file. The
@@ -150,7 +153,6 @@ libc = "0.2"
 
 # --- LSP ---
 lsp-types = "0.97"
-async-lsp = { version = "0.2", features = ["tokio"] }
 
 # --- URIs ---
 # Already in the tree transitively (reqwest). Direct because LSP file URIs must

@@ -52,6 +52,25 @@ impl BufferManager {
         id
     }
 
+    /// Open a scratch buffer, or replace the text if that virtual path is
+    /// already open. Paths are not canonicalized — they are not files.
+    pub fn open_scratch(&mut self, path: PathBuf, text: &str) -> BufferId {
+        if let Some(&existing_id) = self.path_to_buffer.get(&path) {
+            if let Some(buffer) = self.buffers.get(&existing_id) {
+                buffer.borrow_mut().replace_text(text);
+                return existing_id;
+            }
+            self.path_to_buffer.remove(&path);
+        }
+
+        let buffer = Buffer::scratch(path.clone(), text);
+        let id = buffer.id();
+        self.path_to_buffer.insert(path, id);
+        self.buffers.insert(id, Rc::new(RefCell::new(buffer)));
+        self.order.push(id);
+        id
+    }
+
     /// Open a file and create a buffer for it
     pub fn open_file(&mut self, path: &Path) -> Result<BufferId, BufferError> {
         // Canonicalize the path for consistent lookup
@@ -167,11 +186,6 @@ impl BufferManager {
         self.buffers.len()
     }
 
-    /// Check if a buffer has unsaved changes
-    pub fn is_buffer_dirty(&self, id: BufferId) -> bool {
-        self.buffers.get(&id).is_some_and(|b| b.borrow().is_dirty())
-    }
-
     /// Get a buffer ID by file path
     pub fn get_buffer_by_path(&self, path: &Path) -> Option<BufferId> {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
@@ -203,7 +217,6 @@ mod tests {
 
         assert_eq!(manager.buffer_count(), 1);
         assert!(manager.get_buffer(id).is_some());
-        assert!(!manager.is_buffer_dirty(id));
     }
 
     #[test]
@@ -297,6 +310,20 @@ mod tests {
         assert!(ids.contains(&id3));
     }
 
+    #[test]
+    fn reopening_a_scratch_replaces_the_text_in_the_same_buffer() {
+        let mut manager = BufferManager::new();
+        let path = PathBuf::from("inspect/system-prompt.md");
+        let first = manager.open_scratch(path.clone(), "one");
+        let second = manager.open_scratch(path, "two");
+        assert_eq!(first, second);
+        assert_eq!(manager.buffer_count(), 1);
+        assert_eq!(
+            manager.get_buffer(first).unwrap().borrow().text().to_string(),
+            "two"
+        );
+    }
+
     #[tokio::test]
     async fn opening_the_same_file_twice_reuses_one_buffer() {
         use std::io::Write;
@@ -317,7 +344,6 @@ mod tests {
 
         let buffer = manager.get_buffer(id).unwrap();
         assert_eq!(buffer.borrow().text().to_string(), "Test content");
-        assert!(!buffer.borrow().is_dirty());
 
         // Opening same file again should return same buffer
         let id2 = manager.open_file(&temp_path).unwrap();

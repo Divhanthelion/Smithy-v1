@@ -46,7 +46,6 @@ pub struct Buffer {
     id: BufferId,
     text: Rope,
     path: Option<PathBuf>,
-    dirty: bool,
     language_id: Option<String>,
 }
 
@@ -57,7 +56,6 @@ impl Buffer {
             id: BufferId::new(),
             text: Rope::new(),
             path: None,
-            dirty: false,
             language_id: None,
         }
     }
@@ -69,7 +67,6 @@ impl Buffer {
             id: BufferId::new(),
             text: Rope::from_str(text),
             path: None,
-            dirty: false,
             language_id: None,
         }
     }
@@ -84,12 +81,6 @@ impl Buffer {
         &self.text
     }
 
-    /// Check if the buffer has unsaved changes
-    pub fn is_dirty(&self) -> bool {
-        self.dirty
-    }
-
-    /// Get the number of characters in the buffer
     pub fn char_count(&self) -> usize {
         self.text.len_chars()
     }
@@ -104,6 +95,23 @@ impl Buffer {
         self.language_id.as_deref()
     }
 
+    /// A named buffer that is not a file. Inspection uses this so clicking a
+    /// ledger row does not create a Project file or start LSP.
+    pub fn scratch(path: PathBuf, text: &str) -> Self {
+        let language_id = language_from_path(&path);
+        Self {
+            id: BufferId::new(),
+            text: Rope::from_str(text),
+            path: Some(path),
+            language_id,
+        }
+    }
+
+    /// Replace the text. Used when re-clicking an inspection tab.
+    pub fn replace_text(&mut self, text: &str) {
+        self.text = Rope::from_str(text);
+    }
+
     /// Load a buffer from a file
     ///
     /// # Arguments
@@ -115,33 +123,12 @@ impl Buffer {
     pub fn from_file(path: &Path) -> Result<Self, BufferError> {
         let text = Self::read_rope_from_path(path)?;
 
-        // Detect language from file extension
-        let language_id = path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| match ext {
-                "rs" => "rust",
-                "py" => "python",
-                "js" => "javascript",
-                "ts" => "typescript",
-                "c" => "c",
-                "cpp" | "cc" | "cxx" => "cpp",
-                "h" | "hpp" => "cpp",
-                "go" => "go",
-                "java" => "java",
-                "md" => "markdown",
-                "toml" => "toml",
-                "json" => "json",
-                "yaml" | "yml" => "yaml",
-                _ => ext,
-            })
-            .map(String::from);
+        let language_id = language_from_path(path);
 
         Ok(Self {
             id: BufferId::new(),
             text,
             path: Some(path.to_path_buf()),
-            dirty: false,
             language_id,
         })
     }
@@ -152,7 +139,6 @@ impl Buffer {
             let path_clone = path.clone();
             let text = Self::read_rope_from_path(&path_clone)?;
             self.text = text;
-            self.dirty = false;
             Ok(())
         } else {
             Err(BufferError::NoFilePath)
@@ -189,6 +175,28 @@ impl Default for Buffer {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn language_from_path(path: &Path) -> Option<String> {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| match ext {
+            "rs" => "rust",
+            "py" => "python",
+            "js" => "javascript",
+            "ts" => "typescript",
+            "c" => "c",
+            "cpp" | "cc" | "cxx" => "cpp",
+            "h" | "hpp" => "cpp",
+            "go" => "go",
+            "java" => "java",
+            "md" => "markdown",
+            "toml" => "toml",
+            "json" => "json",
+            "yaml" | "yml" => "yaml",
+            _ => ext,
+        })
+        .map(String::from)
 }
 
 #[cfg(test)]

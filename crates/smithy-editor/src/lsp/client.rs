@@ -20,7 +20,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::timeout;
 
 use super::transport::LspTransport;
-use super::types::{LspCompletion, LspDiagnostic, LspHover, PositionEncoding};
+use super::types::{LspDiagnostic, LspHover, PositionEncoding};
 
 /// Convert a file path to a URI string
 fn path_to_uri(path: &Path) -> Result<Uri, LspError> {
@@ -86,32 +86,6 @@ pub struct LspClientConfig {
     /// which for rust-analyzer is expensive — see
     /// `super::registry::rust_initialization_options`.
     pub initialization_options: Option<serde_json::Value>,
-}
-
-impl LspClientConfig {
-    /// Create config for TypeScript language server
-    pub fn typescript(root_path: impl Into<PathBuf>) -> Self {
-        Self {
-            command: "typescript-language-server".to_string(),
-            args: vec!["--stdio".to_string()],
-            root_path: root_path.into(),
-            request_timeout: Duration::from_secs(30),
-            language_id: "typescript".to_string(),
-            initialization_options: None,
-        }
-    }
-
-    /// Create config for Python language server (pylsp)
-    pub fn python(root_path: impl Into<PathBuf>) -> Self {
-        Self {
-            command: "pylsp".to_string(),
-            args: vec![],
-            root_path: root_path.into(),
-            request_timeout: Duration::from_secs(30),
-            language_id: "python".to_string(),
-            initialization_options: None,
-        }
-    }
 }
 
 /// Pending request tracker
@@ -520,39 +494,6 @@ impl LspClient {
 
         let result: Option<Hover> = self.request("textDocument/hover", params).await?;
         Ok(result.map(LspHover::from))
-    }
-
-    /// Request completions at a position
-    pub async fn completion(
-        &self,
-        uri: &str,
-        line: u32,
-        character: u32,
-    ) -> Result<Vec<LspCompletion>, LspError> {
-        self.ensure_initialized().await?;
-
-        let params = CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: parse_uri(uri)?,
-                },
-                position: Position { line, character },
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        };
-
-        let result: Option<CompletionResponse> =
-            self.request("textDocument/completion", params).await?;
-
-        let items = match result {
-            Some(CompletionResponse::Array(items)) => items,
-            Some(CompletionResponse::List(list)) => list.items,
-            None => vec![],
-        };
-
-        Ok(items.into_iter().map(LspCompletion::from).collect())
     }
 
     /// Request go to definition
