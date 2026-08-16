@@ -91,7 +91,7 @@ fn list(filter: Option<&str>) {
         eprintln!("no sessions found under {}", root.display());
         return;
     }
-    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    rows.sort_by_key(|row| std::cmp::Reverse(row.0));
 
     println!("{:<38} {:>5} {:>10}  FILE", "PROJECT", "MSGS", "REASONING");
     for (_, project, path, messages, reasoning) in rows {

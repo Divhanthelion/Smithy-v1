@@ -170,7 +170,7 @@ pub fn crates(root: &Path) -> Result<Vec<Crate>, String> {
     // Deterministic order: same tree in, same bytes out. `cargo metadata` does
     // not promise a stable package order, and an unstable order here would
     // change the system prompt between runs and cost a cold prefill.
-    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out.sort_by_key(|c| c.name.clone());
     Ok(out)
 }
 

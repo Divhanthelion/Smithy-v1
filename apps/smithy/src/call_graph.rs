@@ -1233,7 +1233,7 @@ fn jump_hits(graph: &CallGraph, query: &str) -> Vec<(u32, String)> {
             hits.push((i as u32, format!("{}  {}", qual, short_location(n))));
         }
     }
-    hits.sort_by(|a, b| a.1.cmp(&b.1));
+    hits.sort_by_key(|h| h.1.clone());
     hits.truncate(12);
     hits
 }

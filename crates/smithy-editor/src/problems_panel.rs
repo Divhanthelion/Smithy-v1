@@ -180,7 +180,7 @@ impl DiagnosticsState {
             entries.retain(|(f, _)| f != &file);
             if !rows.is_empty() {
                 entries.push((file, rows));
-                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                entries.sort_by_key(|(path, _)| path.clone());
             }
         });
     }
@@ -722,7 +722,7 @@ mod tests {
             .map(|r| severity_rank(r.severity))
             .collect();
         let mut sorted = ranks.clone();
-        sorted.sort_by(|a, b| b.cmp(a));
+        sorted.sort_by_key(|&rank| std::cmp::Reverse(rank));
         assert_eq!(ranks, sorted);
     }
 

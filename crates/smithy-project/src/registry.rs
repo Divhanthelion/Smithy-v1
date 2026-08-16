@@ -77,7 +77,7 @@ impl ProjectRegistry {
         let mut list: Vec<RecentProject> = serde_json::from_str(&text).unwrap_or_default();
         // A project deleted on disk should not keep appearing in the menu.
         list.retain(|p| p.root.is_dir());
-        list.sort_by(|a, b| b.last_opened.cmp(&a.last_opened));
+        list.sort_by_key(|p| std::cmp::Reverse(p.last_opened));
         list
     }
 
