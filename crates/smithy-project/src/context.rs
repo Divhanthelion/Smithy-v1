@@ -232,9 +232,7 @@ fn outline_rust(project: &Project) -> String {
         );
     }
     out.push_str(&render_modules(&crates));
-    out.push_str(
-        "\n— project outline —\nCall map: Agent → Build Call Graph (~10 s, ~2 GB).",
-    );
+    out.push_str("\n— project outline —\nCall map: Agent → Build Call Graph (~10 s, ~2 GB).");
     out
 }
 
@@ -421,9 +419,10 @@ fn format_api_line(item: &rust::ApiItem, use_doc: bool) -> String {
         format!("{}::", item.module)
     };
     if use_doc {
-        if let (Some(name), Some(doc)) =
-            (rust::api_item_name(&item.signature), item.doc_line.as_deref())
-        {
+        if let (Some(name), Some(doc)) = (
+            rust::api_item_name(&item.signature),
+            item.doc_line.as_deref(),
+        ) {
             return format!("  {prefix}{name} — {doc}\n");
         }
     }
@@ -968,15 +967,8 @@ pub fn peripheral() {}
         }
 
         let project = crate::Project::discover(tmp.path()).unwrap();
-        let ranked = project.context_with_graph(
-            ContextBudget { max_chars: 2_000 },
-            Some(&graph),
-        );
-        let api = ranked
-            .rendered
-            .split("## Public API")
-            .nth(1)
-            .unwrap_or("");
+        let ranked = project.context_with_graph(ContextBudget { max_chars: 2_000 }, Some(&graph));
+        let api = ranked.rendered.split("## Public API").nth(1).unwrap_or("");
         assert!(
             api.find("extract").unwrap() < api.find("peripheral").unwrap(),
             "higher fan-in must sort first:\n{api}"

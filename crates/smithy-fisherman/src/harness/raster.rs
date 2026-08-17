@@ -32,12 +32,7 @@ fn to_ts(path: &BezPath) -> Option<tiny_skia::Path> {
             PathEl::QuadTo(a, b) => pb.quad_to(a.x as f32, a.y as f32, b.x as f32, b.y as f32),
             PathEl::CurveTo(a, b, c) => {
                 pb.cubic_to(
-                    a.x as f32,
-                    a.y as f32,
-                    b.x as f32,
-                    b.y as f32,
-                    c.x as f32,
-                    c.y as f32,
+                    a.x as f32, a.y as f32, b.x as f32, b.y as f32, c.x as f32, c.y as f32,
                 );
             }
             PathEl::ClosePath => pb.close(),
@@ -223,7 +218,10 @@ impl PixmapInk {
                 let sy = src_y + row;
                 let dx = dst_x + col;
                 let dy = dst_y + row;
-                if sx >= src.width() || sy >= src.height() || dx >= self.width() || dy >= self.height()
+                if sx >= src.width()
+                    || sy >= src.height()
+                    || dx >= self.width()
+                    || dy >= self.height()
                 {
                     continue;
                 }
@@ -246,13 +244,8 @@ impl PixmapInk {
         };
         let paint = Self::mask_paint(part);
         if let Some(stroke) = stroke {
-            self.mask.stroke_path(
-                path,
-                &paint,
-                stroke,
-                tiny_skia::Transform::default(),
-                None,
-            );
+            self.mask
+                .stroke_path(path, &paint, stroke, tiny_skia::Transform::default(), None);
         } else {
             self.mask.fill_path(
                 path,

@@ -899,12 +899,7 @@ pub fn face_for(
     }
 }
 
-fn draw_figure(
-    ink: &mut impl Ink,
-    pose: &Pose,
-    at: &impl Fn(Point) -> Point,
-    scale: f64,
-) {
+fn draw_figure(ink: &mut impl Ink, pose: &Pose, at: &impl Fn(Point) -> Point, scale: f64) {
     ink.begin(Part::Figure);
     let edge = (scale * 0.035).max(0.5);
     for path in figure_paths(pose) {
@@ -1003,7 +998,10 @@ fn draw_fire(
 
     // The hearth glow first, under everything: bare flames on cold metal read
     // as a decal, and it is the light on the ground that says *fire*.
-    ink.fill(&shape_path(&Ellipse::new(base, (scale * 0.30, scale * 0.09), 0.0)), FIRE_BODY.with_alpha(0.22 * strength as f32));
+    ink.fill(
+        &shape_path(&Ellipse::new(base, (scale * 0.30, scale * 0.09), 0.0)),
+        FIRE_BODY.with_alpha(0.22 * strength as f32),
+    );
 
     for (index, colour, spread) in [
         (0usize, FIRE_DEEP, 1.0),
@@ -1031,10 +1029,13 @@ fn draw_fire(
     for spark in 0..3 {
         let p = ((frame as f64 / 18.0) + f64::from(spark) * 0.37).fract();
         let wander = (f64::from(spark) - 1.0) * scale * 0.05 + p * scale * 0.03;
-        ink.fill(&shape_path(&Circle::new(
+        ink.fill(
+            &shape_path(&Circle::new(
                 Point::new(base.x + wander, base.y - height * (0.5 + p * 0.9)),
                 (scale * 0.018).max(0.4),
-            )), FIRE_CORE.with_alpha((1.0 - p) as f32 * 0.8 * strength as f32));
+            )),
+            FIRE_CORE.with_alpha((1.0 - p) as f32 * 0.8 * strength as f32),
+        );
     }
 }
 
@@ -1069,14 +1070,20 @@ fn draw_props(
             // The mug, and steam off it — the cheapest possible "this is hot".
             let mug = at(Point::new(pose.hand.x, pose.hand.y));
             ink.begin(Part::Props);
-            ink.fill(&shape_path(&Circle::new(mug, scale * 0.055)), PAGE.with_alpha(0.9));
+            ink.fill(
+                &shape_path(&Circle::new(mug, scale * 0.055)),
+                PAGE.with_alpha(0.9),
+            );
             ink.begin(Part::Smoke);
             for puff in 0..2 {
                 let p = ((frame as f64 / 26.0) + f64::from(puff) * 0.5).fract();
-                ink.fill(&shape_path(&Circle::new(
+                ink.fill(
+                    &shape_path(&Circle::new(
                         Point::new(mug.x + p * scale * 0.05, mug.y - p * scale * 0.30),
                         (scale * 0.022).max(0.5),
-                    )), SMOKE.with_alpha((1.0 - p) as f32 * 0.48));
+                    )),
+                    SMOKE.with_alpha((1.0 - p) as f32 * 0.48),
+                );
             }
         }
         Doing::Smoking => {
@@ -1089,14 +1096,20 @@ fn draw_props(
             cigarette.line_to(tip);
             ink.begin(Part::Props);
             ink.stroke(&cigarette, PAGE.with_alpha(0.9), (scale * 0.018).max(0.6));
-            ink.fill(&shape_path(&Circle::new(tip, (scale * 0.028).max(0.7))), FIRE_CORE.with_alpha(0.9));
+            ink.fill(
+                &shape_path(&Circle::new(tip, (scale * 0.028).max(0.7))),
+                FIRE_CORE.with_alpha(0.9),
+            );
             ink.begin(Part::Smoke);
             for puff in 0..3 {
                 let p = ((frame as f64 / 22.0) + f64::from(puff) * 0.33).fract();
-                ink.fill(&shape_path(&Circle::new(
+                ink.fill(
+                    &shape_path(&Circle::new(
                         Point::new(tip.x + p * scale * 0.12, tip.y - p * scale * 0.45),
                         (scale * 0.03).max(0.6) * (1.0 + p * 1.6),
-                    )), SMOKE.with_alpha((1.0 - p) as f32 * 0.44));
+                    )),
+                    SMOKE.with_alpha((1.0 - p) as f32 * 0.44),
+                );
             }
         }
         Doing::Gardening => {
@@ -1141,7 +1154,11 @@ fn draw_plank(
         hand.y + scale * 0.02,
     );
     ink.fill(&shape_path(&board), HUT_WALL);
-    ink.stroke(&shape_path(&board), RIM.with_alpha(0.6), (scale * 0.02).max(0.5));
+    ink.stroke(
+        &shape_path(&board),
+        RIM.with_alpha(0.6),
+        (scale * 0.02).max(0.5),
+    );
 }
 
 /// A small fish, `size` of full.
@@ -1380,18 +1397,21 @@ fn draw_hut(
         // it is what "he just got home" looks like from across the room.
         // Gated on the lamp stage: a door that glows before the lamp is
         // installed is the two cues contradicting each other.
-        let spill = if lamp {
-            door_glow(lit, door_open)
-        } else {
-            0.0
-        };
+        let spill = if lamp { door_glow(lit, door_open) } else { 0.0 };
         if spill > 0.01 {
-            ink.fill(&shape_path(&Rect::new(x0, top, x1, base)), LAMP.with_alpha(spill as f32));
+            ink.fill(
+                &shape_path(&Rect::new(x0, top, x1, base)),
+                LAMP.with_alpha(spill as f32),
+            );
         }
         let panel = x1 - (x1 - x0) * door_open;
         if panel > x0 {
             ink.fill(&shape_path(&Rect::new(x0, top, panel, base)), HUT_ROOF);
-            ink.stroke(&shape_path(&Rect::new(x0, top, panel, base)), RIM.with_alpha(0.45), edge * 0.6);
+            ink.stroke(
+                &shape_path(&Rect::new(x0, top, panel, base)),
+                RIM.with_alpha(0.45),
+                edge * 0.6,
+            );
         }
     }
 
@@ -1424,18 +1444,28 @@ fn draw_window(
     if lit < 0.02 {
         // Dark glass still reads as glass — a hole in the wall would not.
         ink.fill(&shape_path(&pane), Color::from_rgb8(11, 13, 18));
-        ink.stroke(&shape_path(&pane), RIM.with_alpha(0.30), (h * 0.02).max(0.4));
+        ink.stroke(
+            &shape_path(&pane),
+            RIM.with_alpha(0.30),
+            (h * 0.02).max(0.4),
+        );
         return;
     }
 
     // The spill first, under the pane: light does not stop at the frame.
-    ink.fill(&shape_path(&Rect::new(
+    ink.fill(
+        &shape_path(&Rect::new(
             pane.x0 - h * 0.10,
             pane.y0 - h * 0.10,
             pane.x1 + h * 0.10,
             pane.y1 + h * 0.10,
-        )), LAMP_DEEP.with_alpha(0.16 * lit as f32));
-    ink.fill(&shape_path(&pane), LAMP.with_alpha((0.55 + 0.4 * lit) as f32));
+        )),
+        LAMP_DEEP.with_alpha(0.16 * lit as f32),
+    );
+    ink.fill(
+        &shape_path(&pane),
+        LAMP.with_alpha((0.55 + 0.4 * lit) as f32),
+    );
 
     // Him, inside — a shape on the glass, occupying its lower half so he reads
     // as sitting at a table rather than floating.
@@ -1446,26 +1476,38 @@ fn draw_window(
     // while he is getting up: a man at his table is not a man swinging his
     // legs out of bed.
     if block.place == Place::Hut
-        && !matches!(block.doing, Doing::Sleeping | Doing::Walking | Doing::Waking)
+        && !matches!(
+            block.doing,
+            Doing::Sleeping | Doing::Walking | Doing::Waking
+        )
     {
         let cx0 = pane.x0 + pane.width() * 0.55;
         let head = pane.y0 + pane.height() * 0.34;
-        ink.fill(&shape_path(&Circle::new(Point::new(cx0, head), pane.height() * 0.15)), HUT_ROOF);
+        ink.fill(
+            &shape_path(&Circle::new(Point::new(cx0, head), pane.height() * 0.15)),
+            HUT_ROOF,
+        );
         // Shoulders, and whatever is in front of him.
-        ink.fill(&shape_path(&Rect::new(
+        ink.fill(
+            &shape_path(&Rect::new(
                 cx0 - pane.width() * 0.22,
                 head + pane.height() * 0.12,
                 cx0 + pane.width() * 0.20,
                 pane.y1,
-            )), HUT_ROOF);
+            )),
+            HUT_ROOF,
+        );
         if block.doing == Doing::Reading {
             // The book, edge-on and catching the lamp.
-            ink.fill(&shape_path(&Rect::new(
+            ink.fill(
+                &shape_path(&Rect::new(
                     cx0 - pane.width() * 0.44,
                     head + pane.height() * 0.22,
                     cx0 - pane.width() * 0.16,
                     head + pane.height() * 0.52,
-                )), PAGE.with_alpha(0.85));
+                )),
+                PAGE.with_alpha(0.85),
+            );
         }
     }
 
@@ -1475,16 +1517,14 @@ fn draw_window(
     bar.move_to(Point::new(mid, pane.y0));
     bar.line_to(Point::new(mid, pane.y1));
     ink.stroke(&bar, HUT_ROOF, (h * 0.03).max(0.6));
-    ink.stroke(&shape_path(&pane), RIM.with_alpha(0.55), (h * 0.025).max(0.5));
+    ink.stroke(
+        &shape_path(&pane),
+        RIM.with_alpha(0.55),
+        (h * 0.025).max(0.5),
+    );
 }
 
-fn draw_chimney_smoke(
-    ink: &mut impl Ink,
-    hut: &HutGeometry,
-    strength: f64,
-    frame: u64,
-    h: f64,
-) {
+fn draw_chimney_smoke(ink: &mut impl Ink, hut: &HutGeometry, strength: f64, frame: u64, h: f64) {
     if strength < 0.05 {
         return;
     }
@@ -1500,10 +1540,13 @@ fn draw_chimney_smoke(
         // Drifting as it climbs, and widening — smoke that went straight up in
         // a column would read as a chimney diagram.
         let drift = phase * phase * h * 0.30;
-        ink.fill(&shape_path(&Circle::new(
+        ink.fill(
+            &shape_path(&Circle::new(
                 Point::new(mouth.x + drift, mouth.y - rise),
                 (h * 0.05).max(0.7) * (0.6 + phase * 1.9),
-            )), SMOKE.with_alpha((1.0 - phase) as f32 * 0.36 * strength as f32));
+            )),
+            SMOKE.with_alpha((1.0 - phase) as f32 * 0.36 * strength as f32),
+        );
     }
 }
 
@@ -1727,7 +1770,13 @@ mod tests {
     fn a_plank_trip_does_not_inherit_the_previous_trips_facing() {
         // Just after the first trip boundary: outbound (left), must face left.
         let completion = 1.0 / BUILD_TRIPS + 0.001;
-        let face = face_for(Place::Garden, Place::Garden, Doing::Walking, 0.0, completion);
+        let face = face_for(
+            Place::Garden,
+            Place::Garden,
+            Doing::Walking,
+            0.0,
+            completion,
+        );
         assert_eq!(
             face, -1.0,
             "at completion {completion:.4} (start of trip 1) he faced {face} — \

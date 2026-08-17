@@ -106,8 +106,8 @@ pub fn compare_or_bless(out_dir: &Path) -> Result<(), String> {
 }
 
 fn load_png(path: &Path) -> Result<PixmapInk, String> {
-    let pm = tiny_skia::Pixmap::load_png(path)
-        .map_err(|e| format!("load {}: {e}", path.display()))?;
+    let pm =
+        tiny_skia::Pixmap::load_png(path).map_err(|e| format!("load {}: {e}", path.display()))?;
     Ok(PixmapInk::from_pixmap(pm))
 }
 

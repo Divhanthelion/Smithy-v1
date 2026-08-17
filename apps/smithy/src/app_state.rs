@@ -72,6 +72,14 @@ pub enum AgentUiEvent {
     Answered(String),
     Stopped(String),
     Failed(String),
+    /// Compact replaced live History with a summary. Same Session id.
+    Compacted {
+        summary: String,
+        inspect_segments: Vec<(String, String)>,
+        prompt_tokens: i64,
+    },
+    /// Disk session list changed (save, delete, compact archive).
+    SessionsChanged,
     /// Stashed once per completion — never computed on the paint path.
     ContextUsage {
         prompt_tokens: i64,
@@ -163,6 +171,8 @@ pub struct AppSignals {
     pub terminal_visible: RwSignal<bool>,
     pub agent_visible: RwSignal<bool>,
     pub sidebar_visible: RwSignal<bool>,
+    /// Files explorer vs conversation History in the left rail.
+    pub sidebar_tab: RwSignal<smithy_editor::SidebarTab>,
     pub editor_version: RwSignal<u64>,
     /// Bumped whenever the language server has said something. Carries no
     /// payload — read [`AppSignals::lsp_inbox`] for that.
@@ -342,11 +352,14 @@ pub struct AgentState {
     pub sessions: Rc<RefCell<Option<smithy_agent::SessionStore>>>,
     /// The id of the session currently being appended to.
     pub session_id: Rc<RefCell<String>>,
-    /// Kind of the live Session. Compared on `/name` to decide whether to rebuild.
-    pub session_kind: RwSignal<smithy_agent::SessionKind>,
-    /// First user message waiting for a Session rebuilt by a Command.
+    /// Last Skill injected into this conversation. Compared on `/name` so a
+    /// repeat does not dump the body again. Does not change the frozen tools.
+    pub session_skill: RwSignal<Option<String>>,
+    /// Stored Sessions for the History tab.
+    pub session_list: RwSignal<Vec<smithy_editor::SessionListRow>>,
+    /// First user message waiting after a Session rebuild (New session).
     pub pending_task: Rc<RefCell<Option<String>>>,
-    /// Skill used to build the next Session. Taken by [`spawn_session`].
+    /// Skill used only when a Session is actually rebuilt. Commands no longer set this.
     pub pending_skill: Rc<RefCell<Option<smithy_agent::Skill>>>,
     /// The file explorer, so switching project can re-root it.
     pub file_browser: Rc<RefCell<FileBrowserState>>,
@@ -470,6 +483,7 @@ pub fn init_state() -> (AppState, AppSignals, AgentState) {
         terminal_visible: RwSignal::new(false),
         agent_visible: RwSignal::new(true),
         sidebar_visible: RwSignal::new(true),
+        sidebar_tab: RwSignal::new(smithy_editor::SidebarTab::Files),
         editor_version: RwSignal::new(0),
         lsp_tick,
         lsp_inbox,
@@ -534,7 +548,8 @@ pub fn init_state() -> (AppState, AppSignals, AgentState) {
         registry: Rc::new(registry),
         sessions: Rc::new(RefCell::new(sessions)),
         session_id: Rc::new(RefCell::new(new_session_id())),
-        session_kind: RwSignal::new(smithy_agent::SessionKind::Coding),
+        session_skill: RwSignal::new(None),
+        session_list: RwSignal::new(Vec::new()),
         pending_task: Rc::new(RefCell::new(None)),
         pending_skill: Rc::new(RefCell::new(None)),
         file_browser: file_browser_state.clone(),
@@ -591,11 +606,13 @@ pub fn connect_agent(agent: &AgentState) {
             sessions.into_iter().next()
         });
     spawn_session(agent, resume_from);
+    refresh_session_list(agent);
 }
 
 fn refresh_skills(agent: &AgentState) {
+    smithy_agent::install_bundled_user_skills();
     let root = agent.project.borrow().root.clone();
-    let picks = smithy_agent::list_skills(&root)
+    let mut picks: Vec<smithy_editor::SkillPick> = smithy_agent::harness_commands()
         .into_iter()
         .map(|m| smithy_editor::SkillPick {
             name: m.name,
@@ -603,7 +620,30 @@ fn refresh_skills(agent: &AgentState) {
             argument_hint: m.argument_hint,
         })
         .collect();
+    for m in smithy_agent::list_skills(&root) {
+        if picks.iter().any(|p| p.name == m.name) {
+            continue;
+        }
+        picks.push(smithy_editor::SkillPick {
+            name: m.name,
+            description: m.description,
+            argument_hint: m.argument_hint,
+        });
+    }
     agent.panel.skills.set(picks);
+}
+
+/// Reload the `/` picker when it opens, so a Skill added since connect appears
+/// without a reconnect.
+fn setup_skill_picker_effect(agent: AgentState) {
+    let scanning = std::cell::Cell::new(false);
+    floem::reactive::Effect::new(move |_| {
+        let open = agent.panel.input.get().starts_with('/');
+        if open && !scanning.get() {
+            refresh_skills(&agent);
+        }
+        scanning.set(open);
+    });
 }
 
 /// Throw away everything the model remembers and start again.
@@ -651,9 +691,10 @@ pub fn clear_context(agent: &AgentState) {
 
     *agent.pending_skill.borrow_mut() = None;
     *agent.pending_task.borrow_mut() = None;
-    agent.session_kind.set(smithy_agent::SessionKind::Coding);
+    agent.session_skill.set(None);
     *agent.session_id.borrow_mut() = new_session_id();
     spawn_session(agent, None);
+    refresh_session_list(agent);
 }
 
 /// Build a session in the background and hand it to the UI.
@@ -697,7 +738,7 @@ fn spawn_session(agent: &AgentState, resume_from: Option<smithy_agent::persist::
                 let context_summary = handle.context_summary.clone();
                 let restored = handle.restored.clone();
                 let resumed_id = handle.session_id.clone();
-                let session_kind = handle.session.kind().label().to_string();
+                let session_kind = handle.session.skill().unwrap_or("Coding").to_string();
                 let inspect_segments = handle.session.inspect_segments();
                 let notices = handle.notices.clone();
                 // Take the stop handle before the session disappears behind the
@@ -734,6 +775,15 @@ pub fn submit_task(agent: &AgentState, task: String) {
 }
 
 fn handle_command(agent: &AgentState, typed: String, cmd: smithy_agent::Command) {
+    if cmd.name == "compact" {
+        begin_compact(agent, typed, cmd.rest);
+        return;
+    }
+    if cmd.name == "handoff" {
+        begin_handoff(agent, typed, cmd);
+        return;
+    }
+
     let root = agent.project.borrow().root.clone();
     let Some(skill) = smithy_agent::load_skill(&root, &cmd.name) else {
         agent.panel.push(smithy_editor::AgentEntry::User(typed));
@@ -749,29 +799,158 @@ fn handle_command(agent: &AgentState, typed: String, cmd: smithy_agent::Command)
         agent.panel.attach(&mentions);
     }
 
-    let wanted = skill.meta.profile.kind();
-    let current = agent.session_kind.get_untracked();
-    if current == wanted {
+    let wanted = skill.meta.name.clone();
+    let current = agent.session_skill.get_untracked();
+    if current.as_deref() == Some(wanted.as_str()) {
         if cmd.rest.is_empty() {
             agent.panel.push(smithy_editor::AgentEntry::Notice(format!(
-                "Already a {} session. Type a question, or New session to leave.",
-                wanted.label()
+                "Skill `{wanted}` is already in this conversation. Type a question."
             )));
             return;
         }
-        send_user_task(agent, cmd.rest);
+        if !agent.panel.connected.get_untracked() {
+            agent.panel.push(smithy_editor::AgentEntry::User(typed));
+            *agent.pending_task.borrow_mut() = Some(cmd.rest);
+            return;
+        }
+        send_turn(agent, typed, cmd.rest, None);
         return;
     }
 
-    *agent.pending_task.borrow_mut() = if cmd.rest.is_empty() {
-        None
+    agent.session_skill.set(Some(wanted.clone()));
+    agent.panel.session_kind.set(wanted.clone());
+    agent.panel.push(smithy_editor::AgentEntry::Notice(format!(
+        "Invoked skill `{wanted}`."
+    )));
+    let model = if cmd.rest.is_empty() {
+        skill.injection()
     } else {
-        Some(cmd.rest)
+        format!("{}\n\n{}", skill.injection(), cmd.rest)
     };
-    begin_skill_session(agent, skill);
+    if !agent.panel.connected.get_untracked() {
+        // The panel already shows what they typed; Ready dispatches `model`
+        // without pushing a second bubble (that would dump the skill body).
+        agent.panel.push(smithy_editor::AgentEntry::User(typed));
+        *agent.pending_task.borrow_mut() = Some(model);
+        return;
+    }
+    send_turn(agent, typed, model, Some(wanted));
 }
 
-fn begin_skill_session(agent: &AgentState, skill: smithy_agent::Skill) {
+fn begin_handoff(agent: &AgentState, typed: String, cmd: smithy_agent::Command) {
+    let root = agent.project.borrow().root.clone();
+    let mentions = smithy_agent::resolve_mentions(&smithy_agent::mention_paths(&cmd.rest), &root);
+    if !mentions.is_empty() {
+        agent.panel.attach(&mentions);
+    }
+    let model = match smithy_agent::load_skill(&root, "handoff") {
+        Some(skill) => {
+            if cmd.rest.is_empty() {
+                skill.injection()
+            } else {
+                format!("{}\n\n{}", skill.injection(), cmd.rest)
+            }
+        }
+        None => smithy_agent::handoff_injection(&cmd.rest),
+    };
+    send_turn(agent, typed, model, None);
+}
+
+fn begin_compact(agent: &AgentState, typed: String, focus: String) {
+    if !agent.panel.connected.get_untracked() {
+        agent.panel.push(smithy_editor::AgentEntry::Notice(
+            "Not connected. Wait for the Session, then `/compact`.".into(),
+        ));
+        return;
+    }
+    if agent.panel.busy.get_untracked() {
+        agent.panel.push(smithy_editor::AgentEntry::Notice(
+            "A turn is running. Stop it or wait, then `/compact`.".into(),
+        ));
+        return;
+    }
+    agent.panel.push(smithy_editor::AgentEntry::User(typed));
+    agent.panel.busy.set(true);
+    agent.panel.last_stop.set(None);
+    agent.panel.streaming_answer.set(String::new());
+    agent.panel.streaming_reasoning.set(String::new());
+
+    let slot = agent.session.clone();
+    let tx = agent.tx.clone();
+    let store_root = agent
+        .sessions
+        .borrow()
+        .as_ref()
+        .map(|s| s.root().to_path_buf());
+    let id = agent.session_id.borrow().clone();
+    let project_root = agent.project.borrow().root.clone();
+    let model = agent.panel.model_label.get_untracked();
+
+    tokio_runtime().spawn(async move {
+        let mut guard = slot.lock().await;
+        let Some(session) = guard.as_mut() else {
+            let _ = tx.send(AgentUiEvent::Unavailable(
+                "not connected to LM Studio yet".into(),
+            ));
+            return;
+        };
+        if let Some(root) = store_root {
+            if let Ok(store) = smithy_agent::SessionStore::new(root) {
+                let stored = smithy_agent::persist::StoredSession::from_history_with_reasoning(
+                    id.clone(),
+                    &project_root,
+                    &model,
+                    session.history(),
+                    session.sampling(),
+                    session.limits(),
+                    session.reasoning().to_vec(),
+                    session.skill().map(str::to_string),
+                )
+                .with_tools(session.tools_schema().clone());
+                let _ = store.save(&stored);
+                let _ = store.archive_full(&id);
+            }
+        }
+        let sink_tx = tx.clone();
+        let sink = move |ev: smithy_agent::TurnEvent| {
+            let _ = sink_tx.send(AgentUiEvent::Turn(ev));
+        };
+        match session.compact(&focus, Some(&sink)).await {
+            Ok(summary) => {
+                let inspect_segments = session.inspect_segments();
+                let prompt_tokens = session.last_prompt_tokens();
+                let _ = tx.send(AgentUiEvent::Compacted {
+                    summary,
+                    inspect_segments,
+                    prompt_tokens,
+                });
+            }
+            Err(e) => {
+                let _ = tx.send(AgentUiEvent::Failed(e.to_string()));
+            }
+        }
+    });
+}
+
+/// Resume a stored Session by id. Same path as launch auto-resume.
+pub fn resume_session(agent: &AgentState, id: &str) {
+    if agent.session_id.borrow().as_str() == id && agent.panel.connected.get_untracked() {
+        return;
+    }
+    let stored = match agent
+        .sessions
+        .borrow()
+        .as_ref()
+        .and_then(|store| store.load(id).ok())
+    {
+        Some(s) => s,
+        None => {
+            agent.panel.push(smithy_editor::AgentEntry::Notice(format!(
+                "Could not load session `{id}`."
+            )));
+            return;
+        }
+    };
     if let Ok(stopper) = agent.stopper.lock() {
         if let Some(stopper) = stopper.as_ref() {
             stopper.stop();
@@ -782,21 +961,98 @@ fn begin_skill_session(agent: &AgentState, skill: smithy_agent::Skill) {
     agent.panel.model_label.set("connecting…".into());
     agent.panel.connected.set(false);
     agent.review.outcomes.borrow_mut().clear();
-    agent.session_kind.set(skill.meta.profile.kind());
-    *agent.session_id.borrow_mut() = new_session_id();
-    *agent.pending_skill.borrow_mut() = Some(skill);
-    spawn_session(agent, None);
+    *agent.pending_skill.borrow_mut() = None;
+    *agent.pending_task.borrow_mut() = None;
+    spawn_session(agent, Some(stored));
+}
+
+pub fn delete_stored_session(agent: &AgentState, id: &str) {
+    let was_active = agent.session_id.borrow().as_str() == id;
+    if let Some(store) = agent.sessions.borrow().as_ref() {
+        if let Err(e) = store.delete(id) {
+            agent.panel.push(smithy_editor::AgentEntry::Notice(format!(
+                "Could not delete: {e}"
+            )));
+            return;
+        }
+    }
+    if was_active {
+        clear_context(agent);
+    } else {
+        refresh_session_list(agent);
+    }
+}
+
+pub fn session_log_path(agent: &AgentState, id: &str) -> Option<std::path::PathBuf> {
+    agent
+        .sessions
+        .borrow()
+        .as_ref()
+        .map(|store| store.log_path(id))
+}
+
+pub fn refresh_session_list(agent: &AgentState) {
+    let active = agent.session_id.borrow().clone();
+    let rows = agent
+        .sessions
+        .borrow()
+        .as_ref()
+        .and_then(|store| store.list().ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| s.messages.len() > 1)
+        .map(|s| {
+            let skill = s.skill_name();
+            smithy_editor::SessionListRow {
+                active: s.id == active,
+                id: s.id,
+                title: if s.title.is_empty() {
+                    "(untitled)".into()
+                } else {
+                    s.title
+                },
+                when: relative_ago(s.updated_at),
+                model: s.model,
+                skill,
+            }
+        })
+        .collect();
+    agent.session_list.set(rows);
+}
+
+fn relative_ago(unix: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(unix);
+    let d = now.saturating_sub(unix);
+    if d < 45 {
+        "just now".into()
+    } else if d < 90 {
+        "1m ago".into()
+    } else if d < 3600 {
+        format!("{}m ago", d / 60)
+    } else if d < 86400 {
+        format!("{}h ago", d / 3600)
+    } else {
+        format!("{}d ago", d / 86400)
+    }
 }
 
 fn send_user_task(agent: &AgentState, task: String) {
+    send_turn(agent, task.clone(), task, None);
+}
+
+fn send_turn(agent: &AgentState, display: String, model: String, record_skill: Option<String>) {
     // The panel shows what the user typed. The model additionally receives any
     // review outcomes it has not been told about — those are IDE bookkeeping,
     // not something the user said, so they are not echoed into the transcript.
     // The panel already recorded each decision as a Notice when it was made.
-    agent
-        .panel
-        .push(smithy_editor::AgentEntry::User(task.clone()));
+    agent.panel.push(smithy_editor::AgentEntry::User(display));
+    dispatch_turn(agent, model, record_skill);
+}
 
+fn dispatch_turn(agent: &AgentState, model: String, record_skill: Option<String>) {
     // Attached files go to the model but not into the bubble: a transcript in
     // which every message is preceded by three hundred lines of source is a
     // transcript you cannot read. What *is* recorded is that they were sent, as
@@ -830,7 +1086,8 @@ fn send_user_task(agent: &AgentState, task: String) {
     // already has them in history.
     agent.panel.clear_attachments();
 
-    let task = crate::agent::prepend_review_outcomes(&mut agent.review.outcomes.borrow_mut(), task);
+    let task =
+        crate::agent::prepend_review_outcomes(&mut agent.review.outcomes.borrow_mut(), model);
 
     let slot = agent.session.clone();
     let tx = agent.tx.clone();
@@ -859,7 +1116,12 @@ fn send_user_task(agent: &AgentState, task: String) {
 
         let mut guard = slot.lock().await;
         match guard.as_mut() {
-            Some(session) => crate::agent::run_turn(session, task, tx).await,
+            Some(session) => {
+                if let Some(name) = record_skill {
+                    session.set_skill(Some(name));
+                }
+                crate::agent::run_turn(session, task, tx).await
+            }
             None => {
                 let _ = tx.send(AgentUiEvent::Unavailable(
                     "not connected to LM Studio yet".into(),
@@ -875,7 +1137,7 @@ fn send_user_task(agent: &AgentState, task: String) {
 /// Separate from the modal itself because a request can arrive while one is
 /// already on screen: the modal advances when answered, and this covers the case
 /// where the queue was empty at that moment and filled afterwards.
-/// Mirror the panel's auto-approve toggle into the flag the write hook reads.
+/// Mirror the panel's YOLO toggle into the flag the write and shell hooks read.
 ///
 /// Two representations of one setting, because they live on different threads:
 /// the toggle is a floem signal on the UI thread, and the hook runs on the tokio
@@ -905,6 +1167,7 @@ pub fn setup_shell_approval_effect(agent: AgentState) {
 }
 
 pub fn setup_agent_effect(agent: AgentState) {
+    setup_skill_picker_effect(agent.clone());
     let panel = agent.panel;
     let tick = agent.tick;
     let inbox = agent.inbox.clone();
@@ -936,7 +1199,7 @@ pub fn setup_agent_effect(agent: AgentState) {
                             panel.push(to_entry(entry));
                         }
                         panel.push(smithy_editor::AgentEntry::Notice(
-                            "Resumed this project's last conversation.".into(),
+                            "Resumed this conversation.".into(),
                         ));
                     }
                     // Always say so in the transcript. The header label changes
@@ -949,27 +1212,33 @@ pub fn setup_agent_effect(agent: AgentState) {
                         panel.push(smithy_editor::AgentEntry::Notice(notice));
                     }
                     panel.model_label.set(model_label);
-                    panel.session_kind.set(session_kind.clone());
                     panel.inspect_segments.set(inspect_segments);
                     panel.last_request.set(None);
                     panel.context_limit.set(context_limit);
                     panel.context_label.set(context_summary);
                     panel.connected.set(true);
-                    let kind = match session_kind.as_str() {
-                        "Research" => smithy_agent::SessionKind::Research,
-                        "Grill" => smithy_agent::SessionKind::Grill,
-                        _ => smithy_agent::SessionKind::Coding,
-                    };
-                    for_save.session_kind.set(kind);
+                    let stamped = for_save.session_skill.get_untracked();
+                    let skill = stamped.clone().or_else(|| {
+                        if session_kind == "Coding" {
+                            None
+                        } else {
+                            Some(session_kind.clone())
+                        }
+                    });
+                    for_save.session_skill.set(skill.clone());
+                    panel
+                        .session_kind
+                        .set(skill.clone().unwrap_or_else(|| session_kind.clone()));
                     if let Some(task) = for_save.pending_task.borrow_mut().take() {
                         if !task.is_empty() {
-                            send_user_task(&for_save, task);
+                            dispatch_turn(&for_save, task, skill);
                         } else {
                             panel.push(smithy_editor::AgentEntry::Notice(format!(
                                 "{session_kind} session. Ask a question."
                             )));
                         }
                     }
+                    refresh_session_list(&for_save);
                 }
                 AgentUiEvent::Unavailable(reason) => {
                     panel.connected.set(false);
@@ -1007,6 +1276,26 @@ pub fn setup_agent_effect(agent: AgentState) {
                     panel.streaming_reasoning.set(String::new());
                     panel.push(smithy_editor::AgentEntry::Error(error));
                     panel.busy.set(false);
+                }
+                AgentUiEvent::Compacted {
+                    summary,
+                    inspect_segments,
+                    prompt_tokens,
+                } => {
+                    panel.streaming_answer.set(String::new());
+                    panel.streaming_reasoning.set(String::new());
+                    panel.clear();
+                    panel.push(smithy_editor::AgentEntry::Notice(
+                        "Compacted this Session. The model will be sent the summary; the previous turns are in the log.".into(),
+                    ));
+                    panel.push(smithy_editor::AgentEntry::User(summary));
+                    panel.inspect_segments.set(inspect_segments);
+                    panel.context_tokens.set(prompt_tokens);
+                    panel.busy.set(false);
+                    save_session(&for_save);
+                }
+                AgentUiEvent::SessionsChanged => {
+                    refresh_session_list(&for_save);
                 }
                 AgentUiEvent::ContextUsage {
                     prompt_tokens,
@@ -1050,6 +1339,7 @@ pub fn save_session(agent: &AgentState) {
     // stored session claimed to have been produced by nothing.
     let model = agent.panel.model_label.get_untracked();
     let slot = agent.session.clone();
+    let tx = agent.tx.clone();
 
     tokio_runtime().spawn(async move {
         let guard = slot.lock().await;
@@ -1065,7 +1355,7 @@ pub fn save_session(agent: &AgentState) {
             session.sampling(),
             session.limits(),
             session.reasoning().to_vec(),
-            session.kind(),
+            session.skill().map(str::to_string),
         )
         .with_tools(session.tools_schema().clone());
         drop(guard);
@@ -1074,6 +1364,8 @@ pub fn save_session(agent: &AgentState) {
             Ok(store) => {
                 if let Err(e) = store.save(&stored) {
                     eprintln!("[session] could not save: {e}");
+                } else {
+                    let _ = tx.send(AgentUiEvent::SessionsChanged);
                 }
             }
             Err(e) => eprintln!("[session] store unavailable: {e}"),

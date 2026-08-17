@@ -67,7 +67,8 @@ pub use session::{
     TurnEvent, Usage, CANCELLED,
 };
 pub use skill::{
-    list_skills, load_skill, mention_paths, parse_command, resolve_mentions, Command, SessionKind,
-    Skill, SkillMeta, ToolProfile,
+    handoff_injection, harness_commands, install_bundled_user_skills, is_harness_command,
+    list_skills, load_skill, mention_paths, parse_command, resolve_mentions, Command, Skill,
+    SkillMeta,
 };
 pub use symbol_tool::SymbolLookup;

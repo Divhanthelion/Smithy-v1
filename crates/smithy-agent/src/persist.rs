@@ -31,7 +31,6 @@ use serde_json::Value;
 use crate::limits::Limits;
 use crate::message::{History, Message};
 use crate::provider::Sampling;
-use crate::skill::SessionKind;
 
 /// A stored session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,10 +65,15 @@ pub struct StoredSession {
     /// `#[serde(default)]` so every session written before this parses.
     #[serde(default)]
     pub reasoning: Vec<ReasoningEntry>,
-    /// Tool profile this conversation was built with. Default Coding so every
-    /// session written before kinds existed still resumes as a coding Session.
+    /// Last Skill invoked in this Session, if any. None means none yet.
+    ///
+    /// `#[serde(default)]` so sessions written before skills existed still load.
     #[serde(default)]
-    pub kind: SessionKind,
+    pub skill: Option<String>,
+    /// Written when Research and Grill were harness kinds. New saves leave this
+    /// as Coding; [`Self::skill_name`] still reads the old values.
+    #[serde(default)]
+    kind: LegacyKind,
     /// Frozen OpenAI `tools` array. Resume sends these bytes even if an MCP
     /// server is down; execute then errors for missing names. Absent on
     /// sessions written before this field existed — those recompute from the
@@ -93,6 +97,16 @@ pub struct ReasoningEntry {
 
 pub const SCHEMA_VERSION: u32 = 2;
 
+/// Sessions written when `/research` and `/grill-me` were Session kinds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum LegacyKind {
+    #[default]
+    Coding,
+    Research,
+    Grill,
+}
+
 impl StoredSession {
     pub fn from_history(
         id: impl Into<String>,
@@ -110,7 +124,7 @@ impl StoredSession {
             sampling,
             limits,
             Vec::new(),
-            SessionKind::Coding,
+            None,
         )
     }
 
@@ -124,7 +138,7 @@ impl StoredSession {
         sampling: &Sampling,
         limits: &Limits,
         reasoning: Vec<ReasoningEntry>,
-        kind: SessionKind,
+        skill: Option<String>,
     ) -> StoredSession {
         let now = unix_seconds();
         let messages = history.messages().to_vec();
@@ -140,8 +154,23 @@ impl StoredSession {
             limits: limits.clone(),
             messages,
             reasoning,
-            kind,
+            skill,
+            kind: LegacyKind::Coding,
             tools: None,
+        }
+    }
+
+    /// Last Skill invoked in this Session. Migrates files that only have `kind`.
+    pub fn skill_name(&self) -> Option<String> {
+        if let Some(name) = &self.skill {
+            if !name.is_empty() {
+                return Some(name.clone());
+            }
+        }
+        match self.kind {
+            LegacyKind::Research => Some("research".into()),
+            LegacyKind::Grill => Some("grill-me".into()),
+            LegacyKind::Coding => None,
         }
     }
 
@@ -217,6 +246,40 @@ impl SessionStore {
         self.root.join(format!("{id}.json"))
     }
 
+    /// Live Session file.
+    pub fn session_path(&self, id: &str) -> PathBuf {
+        self.path_for(id)
+    }
+
+    /// Full pre-compact log, if Compact archived one; otherwise the live file.
+    pub fn log_path(&self, id: &str) -> PathBuf {
+        let full = self.full_log_path(id);
+        if full.is_file() {
+            full
+        } else {
+            self.path_for(id)
+        }
+    }
+
+    fn full_log_path(&self, id: &str) -> PathBuf {
+        self.root.join(format!("{id}.full.json"))
+    }
+
+    /// Copy the live file to `{id}.full.json` once, so Compact can overwrite
+    /// the Session without destroying the only log.
+    pub fn archive_full(&self, id: &str) -> Result<(), String> {
+        let src = self.path_for(id);
+        if !src.is_file() {
+            return Ok(());
+        }
+        let dst = self.full_log_path(id);
+        if dst.is_file() {
+            return Ok(());
+        }
+        std::fs::copy(&src, &dst).map_err(|e| format!("cannot archive session {id}: {e}"))?;
+        Ok(())
+    }
+
     /// Write a session, preserving when it was first created.
     ///
     /// `created_at` comes from whatever is already on disk under this id, not
@@ -263,8 +326,15 @@ impl SessionStore {
     }
 
     pub fn delete(&self, id: &str) -> Result<(), String> {
-        std::fs::remove_file(self.path_for(id))
-            .map_err(|e| format!("cannot delete session {id}: {e}"))
+        let path = self.path_for(id);
+        if path.is_file() {
+            std::fs::remove_file(&path).map_err(|e| format!("cannot delete session {id}: {e}"))?;
+        }
+        let full = self.full_log_path(id);
+        if full.is_file() {
+            let _ = std::fs::remove_file(full);
+        }
+        Ok(())
     }
 
     /// Every stored session, most recently updated first.
@@ -275,7 +345,8 @@ impl SessionStore {
         let mut sessions = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !name.ends_with(".json") || name.ends_with(".full.json") || name.ends_with(".tmp") {
                 continue;
             }
             // A single corrupt file should not hide every other session.
@@ -435,6 +506,27 @@ mod tests {
     }
 
     #[test]
+    fn a_full_log_sidecar_is_not_listed_as_a_session() {
+        let (_t, store) = store();
+        store
+            .save(&StoredSession::from_history(
+                "s1",
+                Path::new("/tmp"),
+                "m",
+                &sample_history(),
+                &Sampling::default(),
+                &Limits::default(),
+            ))
+            .unwrap();
+        store.archive_full("s1").unwrap();
+        assert!(store.log_path("s1").file_name().unwrap() == "s1.full.json");
+        let ids: Vec<String> = store.list().unwrap().into_iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec!["s1"]);
+        store.archive_full("s1").unwrap();
+        assert_eq!(store.list().unwrap().len(), 1);
+    }
+
+    #[test]
     fn a_corrupt_file_does_not_hide_the_others() {
         let (_t, store) = store();
         let stored = StoredSession::from_history(
@@ -566,7 +658,7 @@ mod tests {
     }
 
     #[test]
-    fn session_kind_round_trips_instead_of_collapsing_to_coding() {
+    fn skill_name_round_trips_instead_of_collapsing_to_coding() {
         let (_t, store) = store();
         let stored = StoredSession::from_history_with_reasoning(
             "s1",
@@ -576,10 +668,38 @@ mod tests {
             &Sampling::default(),
             &Limits::default(),
             Vec::new(),
-            SessionKind::Research,
+            Some("research".into()),
         );
         store.save(&stored).unwrap();
-        assert_eq!(store.load("s1").unwrap().kind, SessionKind::Research);
+        assert_eq!(
+            store.load("s1").unwrap().skill_name().as_deref(),
+            Some("research")
+        );
+    }
+
+    #[test]
+    fn a_legacy_kind_field_still_names_the_skill() {
+        let (_t, store) = store();
+        let stored = StoredSession::from_history(
+            "s1",
+            Path::new("/tmp"),
+            "m",
+            &sample_history(),
+            &Sampling::default(),
+            &Limits::default(),
+        );
+        let mut value = serde_json::to_value(&stored).unwrap();
+        value.as_object_mut().unwrap().remove("skill");
+        value["kind"] = serde_json::json!("grill");
+        std::fs::write(
+            store.root().join("s1.json"),
+            serde_json::to_string(&value).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            store.load("s1").unwrap().skill_name().as_deref(),
+            Some("grill-me")
+        );
     }
 
     #[test]

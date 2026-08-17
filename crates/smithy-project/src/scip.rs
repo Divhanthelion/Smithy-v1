@@ -89,8 +89,8 @@ impl ScipIndex {
 
     /// Parse a `.scip` file.
     pub fn from_file(path: &std::path::Path) -> Result<ScipIndex, String> {
-        let bytes = std::fs::read(path)
-            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let bytes =
+            std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         ScipIndex::parse(&bytes)
     }
 
@@ -434,9 +434,9 @@ mod tests {
     #[test]
     fn malformed_input_terminates_rather_than_looping() {
         for junk in [
-            vec![0xff; 64],           // varints that never terminate
-            vec![0x0a, 0xff, 0xff],   // a length prefix past the end
-            vec![0x07],               // an unknown wire type
+            vec![0xff; 64],         // varints that never terminate
+            vec![0x0a, 0xff, 0xff], // a length prefix past the end
+            vec![0x07],             // an unknown wire type
             vec![],
         ] {
             let parsed = ScipIndex::parse(&junk).unwrap();
@@ -449,7 +449,10 @@ mod tests {
         let bytes = index(&[
             document(
                 "a.rs",
-                &[occurrence("crate/f().", 1, 0x1), occurrence("crate/g().", 2, 0)],
+                &[
+                    occurrence("crate/f().", 1, 0x1),
+                    occurrence("crate/g().", 2, 0),
+                ],
             ),
             document("b.rs", &[occurrence("crate/h().", 1, 0x8)]),
         ]);

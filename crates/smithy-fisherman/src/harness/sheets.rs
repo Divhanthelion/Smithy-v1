@@ -130,7 +130,8 @@ pub fn midnight_sheet(out_dir: &std::path::Path) {
     let start_hour = 21.0;
     let tiles = 25u32;
 
-    let mut crops: Vec<(String, PixmapInk, u32, u32, u32, u32)> = Vec::with_capacity(tiles as usize);
+    let mut crops: Vec<(String, PixmapInk, u32, u32, u32, u32)> =
+        Vec::with_capacity(tiles as usize);
     let mut cell_w = 1u32;
     let mut cell_h = 1u32;
 
@@ -169,12 +170,7 @@ pub fn midnight_sheet(out_dir: &std::path::Path) {
 
         let h = hours.floor() as u32;
         let m = ((hours.fract() * 60.0).round() as u32) % 60;
-        let label = format!(
-            "D{day} {} {:02}:{:02}",
-            doing_label(scene.doing),
-            h,
-            m
-        );
+        let label = format!("D{day} {} {:02}:{:02}", doing_label(scene.doing), h, m);
         crops.push((label, rendered, cx0, cy0, cw, ch));
     }
 
@@ -217,9 +213,21 @@ fn scene_tiles() -> &'static [(&'static str, Doing, Place, Place, f64)] {
     // old sheet missed: Waking, Exercising, Eating, Siesta, Smoking.
     &[
         ("WAKING", Doing::Waking, Place::Hut, Place::Hut, 0.45),
-        ("EXERCISING", Doing::Exercising, Place::Doorstep, Place::Hut, 0.5),
+        (
+            "EXERCISING",
+            Doing::Exercising,
+            Place::Doorstep,
+            Place::Hut,
+            0.5,
+        ),
         ("COFFEE", Doing::Coffee, Place::Doorstep, Place::Hut, 0.5),
-        ("GARDENING", Doing::Gardening, Place::Garden, Place::Doorstep, 0.5),
+        (
+            "GARDENING",
+            Doing::Gardening,
+            Place::Garden,
+            Place::Doorstep,
+            0.5,
+        ),
         ("FISHING", Doing::Fishing, Place::Perch, Place::Garden, 0.5),
         ("COOKING", Doing::Cooking, Place::Fire, Place::Perch, 0.5),
         ("EATING", Doing::Eating, Place::Doorstep, Place::Fire, 0.5),
@@ -227,7 +235,13 @@ fn scene_tiles() -> &'static [(&'static str, Doing, Place, Place, f64)] {
         ("WALKING", Doing::Walking, Place::Hut, Place::Garden, 0.5),
         ("READING", Doing::Reading, Place::Hut, Place::Doorstep, 0.5),
         ("SMOKING", Doing::Smoking, Place::Garden, Place::Garden, 0.5),
-        ("SLEEPING", Doing::Sleeping, Place::Hut, Place::Doorstep, 0.5),
+        (
+            "SLEEPING",
+            Doing::Sleeping,
+            Place::Hut,
+            Place::Doorstep,
+            0.5,
+        ),
     ]
 }
 
@@ -277,11 +291,7 @@ pub fn build_sheet(out_dir: &std::path::Path) {
     let tile_w = WIDTH as u32;
     let tile_h = height() as u32;
     let gap = 4u32;
-    let mut sheet = PixmapInk::new(
-        tile_w,
-        frames * (tile_h + gap) - gap,
-        STEEL_DEEP,
-    );
+    let mut sheet = PixmapInk::new(tile_w, frames * (tile_h + gap) - gap, STEEL_DEEP);
 
     for i in 0..frames {
         let completion = if i < trip_frames {
@@ -319,11 +329,7 @@ pub fn walk_sheet(out_dir: &std::path::Path) {
     let tile_w = (WIDTH * 0.45) as u32;
     let tile_h = height() as u32;
     let gap = 4u32;
-    let mut sheet = PixmapInk::new(
-        frames * (tile_w + gap) - gap,
-        tile_h,
-        STEEL_DEEP,
-    );
+    let mut sheet = PixmapInk::new(frames * (tile_w + gap) - gap, tile_h, STEEL_DEEP);
 
     for i in 0..frames {
         let progress = i as f64 / frames as f64;

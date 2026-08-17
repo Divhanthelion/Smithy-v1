@@ -53,7 +53,10 @@ fn main() {
                  attribute an edge to"
             ),
         }
-        eprintln!("({} functions indexed in that file)", index.spans_in(&file).len());
+        eprintln!(
+            "({} functions indexed in that file)",
+            index.spans_in(&file).len()
+        );
         return;
     }
 

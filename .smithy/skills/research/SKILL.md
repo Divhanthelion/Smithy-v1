@@ -2,12 +2,13 @@
 name: research
 description: Long adversarial research — pin, snowball, disconfirm, write a cited note. Use only when the user types /research.
 argument-hint: "The question to research"
-profile: research
+tools: [read, write, ls, glob, grep, todo, web_fetch, web_search]
+max-seconds: 7200
 ---
 
 # Research
 
-This is not a coding Session. You cannot `bash`, `edit`, or `explore`. Search, fetch, and read; then `write` one note. Sequential — one model, not a swarm.
+`web_search`, `web_fetch`, `read`, `ls`, `glob`, `grep`, `todo`, and `write` are generally suited to this task. Search, fetch, and read; then `write` one note. Sequential — one model, not a swarm.
 
 If they passed arguments, that is the question. If they gave a topic, restate it as a question in one sentence and wait for a yes or a correction. Do not start reading until the question is pinned.
 

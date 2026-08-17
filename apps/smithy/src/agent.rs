@@ -20,11 +20,12 @@ use crossbeam_channel::Sender;
 use serde_json::Value;
 
 use smithy_agent::{
-    session::default_system_prompt, with_project_context, AgentConfig, Outcome, Session,
-    SessionConfig, SessionKind, Skill, TurnEvent,
+    session::default_system_prompt, AgentConfig, Outcome, Session, SessionConfig, Skill, TurnEvent,
 };
 use smithy_editor::{PendingChangeManager, PendingFileChange};
-use smithy_tools::{HookDecision, Registry, ToolCall, ToolCtx, ToolHook, Workspace};
+use smithy_tools::{
+    command_leaves_project, HookDecision, Registry, ToolCall, ToolCtx, ToolHook, Workspace,
+};
 
 use crate::app_state::{AgentUiEvent, ReviewOutcome, ShellApprovalRequest};
 
@@ -33,8 +34,14 @@ use crate::app_state::{AgentUiEvent, ReviewOutcome, ShellApprovalRequest};
 /// The tool loop suspends on a oneshot until the modal answers. Failing closed
 /// on a dead channel matters — if the UI has gone away there is nobody to
 /// approve anything, and silently running the command would be the wrong call.
+///
+/// YOLO (`auto_approve`) lets commands that stay *down* in the Project through
+/// without a prompt. Anything that names a path up out of the Project, or over
+/// into a sibling, still asks. `edit` / `write` cannot leave the Workspace;
+/// `bash` can, which is why this gate still exists with YOLO on.
 pub struct ShellApprovalHook {
     pub tx: Sender<ShellApprovalRequest>,
+    pub auto_approve: Arc<AtomicBool>,
 }
 
 #[async_trait]
@@ -52,6 +59,12 @@ impl ToolHook for ShellApprovalHook {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
+
+        if self.auto_approve.load(Ordering::Relaxed)
+            && !command_leaves_project(&command, ctx.workspace.root())
+        {
+            return HookDecision::Allow;
+        }
 
         let (otx, orx) = tokio::sync::oneshot::channel();
         let request = ShellApprovalRequest {
@@ -105,7 +118,7 @@ pub struct WriteReviewHook {
     pub notify: Sender<AgentUiEvent>,
     /// Where the modal's answer comes back. Keyed by `tool_call_id`.
     pub responders: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<ReviewOutcome>>>>,
-    /// When set, the gate is off entirely and writes go straight to disk.
+    /// When set, YOLO is on: in-Project writes skip Review.
     pub auto_approve: Arc<AtomicBool>,
 }
 
@@ -269,10 +282,9 @@ pub async fn build_session(
     resume_from: Option<smithy_agent::persist::StoredSession>,
     skill: Option<Skill>,
 ) -> Result<AgentHandle, String> {
-    // Provider key only. Brave used to be unlocked in the same hop, which meant
-    // every launch asked for the keychain password twice — once per item. Brave
-    // is deferred: we register `web_search` when a key is known to exist
-    // (sidecar / env), and unlock it on the first search.
+    // Provider key only. Other stored keys (Brave, unused hosted backends) stay
+    // in the vault until something actually needs them. MCP `${NAME}` lookups
+    // do not probe the keychain for names the sidecar never recorded.
     let provider_choice = config.provider;
     let provider = tokio::task::spawn_blocking(move || config.build_provider())
         .await
@@ -299,17 +311,22 @@ pub async fn build_session(
             smithy_agent::Limits::default(),
         ),
     };
-    // A Command rebuilds; resume keeps the stored kind so the tool block matches
-    // the conversation. Default is coding.
-    let kind = skill
+    // A Command injects into the current turn; it does not rebuild. The stored
+    // name is a label so `/name` and the panel know what was last invoked.
+    // `tools` / `max-seconds` apply only when `skill` is passed in (a real
+    // rebuild — New session with a pending skill, or a future compact).
+    let session_skill = skill
         .as_ref()
-        .map(|s| s.meta.profile.kind())
-        .or_else(|| resume_from.as_ref().map(|s| s.kind))
-        .unwrap_or(SessionKind::Coding);
-    limits.max_seconds = match kind {
-        SessionKind::Research => 7_200,
-        _ => provider_choice.turn_seconds(),
-    };
+        .map(|s| s.meta.name.clone())
+        .or_else(|| resume_from.as_ref().and_then(|s| s.skill_name()));
+    limits.max_seconds = skill
+        .as_ref()
+        .and_then(|s| s.meta.max_seconds)
+        .unwrap_or_else(|| provider_choice.turn_seconds());
+    let unbounded_search = skill
+        .as_ref()
+        .and_then(|s| s.meta.tools.as_ref())
+        .is_some_and(|t| t.iter().any(|n| n == "web_search"));
 
     // Extract the project description before opening the session: it goes into
     // the system prompt, which is frozen once the session starts.
@@ -372,14 +389,11 @@ pub async fn build_session(
     .map_err(|e| format!("symbol index failed: {e}"))?;
 
     let mut registry = assemble_registry(
-        kind,
+        unbounded_search,
         provider.clone(),
         &project.root,
         brave_configured,
         symbol_index,
-        events.clone(),
-        shell_approval,
-        review,
     );
 
     let mcp = smithy_agent::mcp::attach_mcp(&project.root, &smithy_agent::mcp::RmcpConnector).await;
@@ -397,16 +411,20 @@ pub async fn build_session(
     }
     if let Some(stored) = resume_from.as_ref() {
         if let Some(tools) = stored.tools.as_ref() {
+            registry.retain_named(&openai_tool_names(tools));
             smithy_agent::mcp::stub_unavailable(&mut registry, tools);
         }
+    } else if let Some(allow) = skill.as_ref().and_then(|s| s.meta.tools.as_ref()) {
+        retain_skill_tools(&mut registry, allow, skill.as_ref(), &mut notices);
     }
+    install_session_hooks(&mut registry, events.clone(), shell_approval, review);
 
     let project_chars = context.as_ref().map(|c| c.rendered.len()).unwrap_or(0);
     let map = context.as_ref().map(|c| c.rendered.as_str());
-    let prompt = match &skill {
-        Some(skill) => with_project_context(skill.system_prompt(workspace.root()), map),
-        None => default_system_prompt(workspace.root(), &registry.names(), map),
-    };
+    let mut prompt = default_system_prompt(workspace.root(), &registry.names(), map);
+    if let Some(skill) = &skill {
+        prompt = format!("{prompt}\n\n{}", skill.injection());
+    }
     // Joiner boilerplate between base and project counts as system, not
     // project — so base = total − project chars rather than a second render.
     let system_base_chars = prompt.len().saturating_sub(project_chars);
@@ -414,7 +432,7 @@ pub async fn build_session(
 
     let mut config = SessionConfig::new(prompt)
         .with_segments(system_base_chars, project_chars)
-        .with_kind(kind);
+        .with_skill(session_skill.clone());
     config.limits = limits.clone();
 
     // What the model was told about the project. A resumed session carries the
@@ -452,7 +470,7 @@ pub async fn build_session(
             // Carried across the resume so a session's traces accumulate rather
             // than restarting from empty every time the editor is reopened.
             let stored_reasoning = stored.reasoning.clone();
-            let stored_kind = stored.kind;
+            let stored_skill = stored.skill_name();
             let stored_tools = stored.tools.clone();
             let history = stored.into_history();
             let entries = smithy_agent::transcript(&history);
@@ -467,7 +485,7 @@ pub async fn build_session(
                 history,
                 sampling,
                 effective_limits.clone(),
-                stored_kind,
+                stored_skill,
             );
             if let Some(tools) = stored_tools {
                 session.freeze_tools(tools);
@@ -506,33 +524,16 @@ fn brave_search(research: bool) -> smithy_tools::tools::web_search::WebSearch {
     }
 }
 
-/// Tool block for this Session kind. Frozen for the Session, like today's core.
-#[allow(clippy::too_many_arguments)]
+/// Coding tool block. A rebuilt Session may narrow it afterwards; MCP is attached by the
+/// caller. Frozen for the Session, like today's core.
 fn assemble_registry(
-    kind: SessionKind,
+    unbounded_search: bool,
     provider: Arc<dyn smithy_agent::Provider>,
     project_root: &std::path::Path,
     brave_configured: bool,
     symbol_index: Arc<smithy_project::symbols::SymbolIndex>,
-    events: Sender<AgentUiEvent>,
-    shell_approval: Sender<ShellApprovalRequest>,
-    review: ReviewGate,
 ) -> Registry {
-    let mut registry = match kind {
-        SessionKind::Coding => Registry::core(),
-        SessionKind::Research => Registry::new()
-            .with(smithy_tools::tools::read::Read)
-            .with(smithy_tools::tools::write::Write)
-            .with(smithy_tools::tools::ls::Ls)
-            .with(smithy_tools::tools::glob::Glob)
-            .with(smithy_tools::tools::grep::Grep)
-            .with(smithy_tools::tools::todo::TodoTool),
-        SessionKind::Grill => Registry::new()
-            .with(smithy_tools::tools::read::Read)
-            .with(smithy_tools::tools::ls::Ls)
-            .with(smithy_tools::tools::glob::Glob)
-            .with(smithy_tools::tools::grep::Grep),
-    };
+    let mut registry = Registry::core();
 
     // Reading a URL needs nothing but a network, so it is always available.
     registry.push(Box::new(smithy_tools::tools::web_fetch::WebFetch::new()));
@@ -542,40 +543,106 @@ fn assemble_registry(
     // tool block still cannot change *within* a session — see `Registry::core`
     // on prefix caching — because this is decided once, here, at construction.
     if brave_configured {
-        registry.push(Box::new(brave_search(kind == SessionKind::Research)));
+        registry.push(Box::new(brave_search(unbounded_search)));
     }
 
-    if kind != SessionKind::Research && !symbol_index.is_empty() {
+    if !symbol_index.is_empty() {
         registry.push(Box::new(smithy_agent::SymbolLookup::new(symbol_index)));
     }
 
-    // Explore is the bounded repo-question tool. Research is a different kind
-    // and must not reuse it; Grill uses it for facts.
-    if kind != SessionKind::Research {
-        registry.push(Box::new(smithy_agent::Explore::new(
-            provider,
-            project_root,
-            if brave_configured {
-                vec![Box::new(brave_search(false)) as Box<dyn smithy_tools::Tool>]
-            } else {
-                Vec::new()
-            },
-        )));
-    }
+    registry.push(Box::new(smithy_agent::Explore::new(
+        provider,
+        project_root,
+        if brave_configured {
+            vec![Box::new(brave_search(false)) as Box<dyn smithy_tools::Tool>]
+        } else {
+            Vec::new()
+        },
+    )));
 
-    if kind != SessionKind::Grill {
+    registry
+}
+
+fn openai_tool_names(tools: &Value) -> Vec<String> {
+    tools
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| {
+            t.pointer("/function/name")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+fn is_coding_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read"
+            | "write"
+            | "edit"
+            | "ls"
+            | "glob"
+            | "grep"
+            | "bash"
+            | "todo"
+            | "web_fetch"
+            | "web_search"
+            | "symbol"
+            | "explore"
+    )
+}
+
+fn retain_skill_tools(
+    registry: &mut Registry,
+    allow: &[String],
+    skill: Option<&Skill>,
+    notices: &mut Vec<String>,
+) {
+    let present: Vec<String> = registry.names().into_iter().map(str::to_string).collect();
+    if let Some(skill) = skill {
+        for asked in allow {
+            if !present.iter().any(|n| n == asked) {
+                notices.push(format!(
+                    "Skill `{}` asked for tool `{asked}` which is not available.",
+                    skill.meta.name
+                ));
+            }
+        }
+    }
+    let mut keep = allow.to_vec();
+    for n in &present {
+        if !is_coding_tool(n) {
+            keep.push(n.clone());
+        }
+    }
+    registry.retain_named(&keep);
+}
+
+fn install_session_hooks(
+    registry: &mut Registry,
+    events: Sender<AgentUiEvent>,
+    shell_approval: Sender<ShellApprovalRequest>,
+    review: ReviewGate,
+) {
+    let names = registry.names();
+    let review_writes = names.contains(&"write") || names.contains(&"edit");
+    let has_bash = names.contains(&"bash");
+    if review_writes {
         registry.add_hook(Box::new(WriteReviewHook {
             pending: review.pending,
             notify: events,
             responders: review.responders,
+            auto_approve: review.auto_approve.clone(),
+        }));
+    }
+    if has_bash {
+        registry.add_hook(Box::new(ShellApprovalHook {
+            tx: shell_approval,
             auto_approve: review.auto_approve,
         }));
     }
-    if kind == SessionKind::Coding {
-        registry.add_hook(Box::new(ShellApprovalHook { tx: shell_approval }));
-    }
-
-    registry
 }
 
 /// Run one turn, forwarding progress to the UI as it happens.
@@ -1437,8 +1504,12 @@ mod hook_tests {
 
     // ---- ShellApprovalHook ----------------------------------------------
 
-    /// Answer the next approval request from a real thread, so `before` can be
-    /// awaited on the test's single-threaded runtime without deadlocking.
+    fn shell_hook(tx: Sender<ShellApprovalRequest>, yolo: bool) -> ShellApprovalHook {
+        ShellApprovalHook {
+            tx,
+            auto_approve: Arc::new(AtomicBool::new(yolo)),
+        }
+    }
     fn answer_with(
         rx: crossbeam_channel::Receiver<ShellApprovalRequest>,
         answer: Option<bool>,
@@ -1461,7 +1532,7 @@ mod hook_tests {
     async fn a_tool_that_is_not_bash_is_not_gated() {
         let (_dir, ctx) = workspace();
         let (tx, _rx) = unbounded();
-        let hook = ShellApprovalHook { tx };
+        let hook = shell_hook(tx, false);
 
         let decision = hook
             .before(
@@ -1478,7 +1549,7 @@ mod hook_tests {
     async fn an_approved_command_is_allowed_and_the_prompt_shows_it() {
         let (_dir, ctx) = workspace();
         let (tx, rx) = unbounded();
-        let hook = ShellApprovalHook { tx };
+        let hook = shell_hook(tx, false);
         let responder = answer_with(rx, Some(true));
 
         let decision = hook
@@ -1503,7 +1574,7 @@ mod hook_tests {
     async fn a_declined_command_is_denied_with_a_reason_the_model_can_use() {
         let (_dir, ctx) = workspace();
         let (tx, rx) = unbounded();
-        let hook = ShellApprovalHook { tx };
+        let hook = shell_hook(tx, false);
         let _responder = answer_with(rx, Some(false));
 
         let decision = hook
@@ -1527,7 +1598,7 @@ mod hook_tests {
     async fn a_dismissed_prompt_denies_rather_than_running() {
         let (_dir, ctx) = workspace();
         let (tx, rx) = unbounded();
-        let hook = ShellApprovalHook { tx };
+        let hook = shell_hook(tx, false);
         let _responder = answer_with(rx, None);
 
         let decision = hook
@@ -1548,7 +1619,7 @@ mod hook_tests {
         let (_dir, ctx) = workspace();
         let (tx, rx) = unbounded();
         drop(rx); // the UI has gone away
-        let hook = ShellApprovalHook { tx };
+        let hook = shell_hook(tx, false);
 
         let decision = hook
             .before(
@@ -1571,7 +1642,7 @@ mod hook_tests {
     async fn a_bash_call_with_no_command_is_still_gated() {
         let (_dir, ctx) = workspace();
         let (tx, rx) = unbounded();
-        let hook = ShellApprovalHook { tx };
+        let hook = shell_hook(tx, false);
         let responder = answer_with(rx, Some(false));
 
         let decision = hook
@@ -1584,5 +1655,54 @@ mod hook_tests {
             "",
             "an empty command is shown as empty"
         );
+    }
+
+    /// YOLO is unsupervised *inside* the Project: cargo test, a write under
+    /// `src/`, a delete of `target` — none of those should raise a modal.
+    #[tokio::test]
+    async fn yolo_runs_in_project_commands_without_asking() {
+        let (_dir, ctx) = workspace();
+        let (tx, rx) = unbounded();
+        let hook = shell_hook(tx, true);
+
+        for command in ["cargo test", "ls src/main.rs", "rm -rf target"] {
+            let decision = hook
+                .before(
+                    &call("c1", "bash"),
+                    &serde_json::json!({ "command": command }),
+                    &ctx,
+                )
+                .await;
+            assert!(
+                matches!(decision, HookDecision::Allow),
+                "{command} should run under YOLO"
+            );
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "in-project bash must not raise a prompt under YOLO"
+        );
+    }
+
+    /// Up (`cd ..`) and over (`/etc/...`) still ask, even with YOLO on.
+    /// `edit` / `write` cannot do this; `bash` can.
+    #[tokio::test]
+    async fn yolo_still_asks_to_leave_the_project() {
+        let (_dir, ctx) = workspace();
+        let (tx, rx) = unbounded();
+        let hook = shell_hook(tx, true);
+        let responder = answer_with(rx, Some(false));
+
+        let decision = hook
+            .before(
+                &call("c1", "bash"),
+                &serde_json::json!({ "command": "cd .. && ls" }),
+                &ctx,
+            )
+            .await;
+
+        let reason = denial(&decision);
+        assert!(reason.contains("declined"), "{reason}");
+        assert_eq!(responder.join().unwrap(), "cd .. && ls");
     }
 }

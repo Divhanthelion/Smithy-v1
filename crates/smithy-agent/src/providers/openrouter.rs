@@ -6,12 +6,11 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures_util::StreamExt;
 use serde_json::{json, Value};
 
 use crate::provider::{Completion, CompletionRequest, Delta, Provider, ProviderError, Sampling};
 use crate::providers::lmstudio::ModelInfo;
-use crate::providers::sse::{apply_sse_line, build_tool_calls, PartialCall};
+use crate::providers::sse::consume_sse_stream;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(900);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -239,28 +238,7 @@ impl Provider for OpenRouter {
             });
         }
 
-        let mut out = Completion::default();
-        let mut partials: Vec<PartialCall> = Vec::new();
-        let mut buffer = String::new();
-        let mut stream = response.bytes_stream();
-
-        while let Some(chunk) = stream.next().await {
-            let chunk =
-                chunk.map_err(|e| ProviderError::BadResponse(format!("stream read error: {e}")))?;
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-            while let Some(newline) = buffer.find('\n') {
-                let line = buffer[..newline].trim().to_string();
-                buffer.drain(..=newline);
-                if apply_sse_line(&line, &mut out, &mut partials, on_delta) {
-                    buffer.clear();
-                    break;
-                }
-            }
-        }
-
-        out.tool_calls = build_tool_calls(partials);
-        Ok(out)
+        consume_sse_stream(response.bytes_stream(), on_delta).await
     }
 
     fn build_body(&self, request: &CompletionRequest<'_>) -> Value {

@@ -40,7 +40,8 @@ it went.
 refuses to let those reads and writes out — symlinks included. There is no
 string comparison to outwit. Shell is different: `bash` is a subprocess, not a
 capability, and it does not run until a shell-approval hook is installed.
-Environment names matching `*_API_KEY`, `*_TOKEN`, and `*_SECRET` are scrubbed
+With YOLO on, commands that stay down in the Project skip that prompt;
+`cd ..` and paths outside the Project still ask. Environment names matching `*_API_KEY`, `*_TOKEN`, and `*_SECRET` are scrubbed
 from the child; `cd ..` out of the project remains possible.
 
 **The call graph is resolved by the compiler.** Edges come from rust-analyzer
@@ -155,8 +156,9 @@ cargo run -p smithy-agent --example models -- openrouter
 ```
 
 API keys go to your OS credential store — Keychain on macOS — not to the settings
-file. The settings file holds the endpoint and model name only, and the dialog
-never displays a stored key back to you.
+file. They share one Keychain item, so opening the app asks for your login
+password at most once. The settings file holds the endpoint and model name only,
+and the dialog never displays a stored key back to you.
 
 Environment variables still work and are still read; they're just no longer the
 only way. Precedence is: the settings file wins if you've ever saved one, and the
@@ -217,6 +219,13 @@ the model still remembered everything. New Session throws away the history, the
 pending review bookkeeping, and rebuilds with a freshly extracted project
 context. The previous conversation stays on disk rather than being deleted.
 
+The left rail is **Files** or **History**. History lists this Project's stored
+Sessions; click one to resume it. The ☰ control opens the JSON log in the
+editor (after `/compact`, that is the pre-compact `.full.json` when present).
+**View → Session history** shows the History tab. `/compact` frees this
+Session's window with a summary; `/handoff` writes `HANDOFF.md` for a later
+Session and does not shrink this one.
+
 ### Knowing the code
 
 Two layers, deliberately separate.
@@ -268,17 +277,23 @@ yours. It can't write, edit, run commands, or call itself, and it stops after
 about a dozen tool calls and reports partially rather than grinding. That bound
 is deliberate — Explore is not Research.
 
-**`/research`** starts a Research Session: Brave search without the coding
-"two or three searches is enough" cap, fetch, read, and one `write` of a note
-at `docs/research/YYYY-MM-DD-<slug>.md` through Review. No `bash`, `edit`, or
-`explore`. Two hours on the clock. Sequential — one model.
+**`/research`** and **`/grill-me`** are Skills, not Session kinds. Smithy
+ships both; they show up in every Project. A Project or `~/.smithy/skills/`
+copy overrides the shipped one. Drop a `SKILL.md` in `.smithy/skills/<name>/`
+and type `/name`. The body is prefixed onto that user message; conversation
+history and the frozen tool list stay. Optional frontmatter: `tools` (allowlist;
+omit for the coding set), `include` (sibling files concatenated into the body),
+`max-seconds`. `tools` and `max-seconds` apply only if a Session is rebuilt.
+MCP tools still attach.
 
-**`/grill-me`** starts a Grill Session: an interview that asks the whole
-frontier as `❓ Qn` and waits. It can `read` / `explore` for facts. It cannot
-`write`, `edit`, or `bash`. When you confirm a shared understanding, start a
-coding Session to implement.
+The bundled research skill writes one note at `docs/research/YYYY-MM-DD-<slug>.md`
+through Review. It names search, fetch, read, and write as generally suited.
+Grill-me interviews as `❓ Qn` and waits; it names `read` / `explore` for facts.
+When you confirm a shared understanding, keep going in this Session or start a
+new one to implement.
 
-Type `/` in the composer for the picker. `@path` on a command becomes an
+Type `/` in the composer for the picker. **Tab** completes (`/c` → `/compact `);
+arrows move the highlight. `@path` on a command becomes an
 Attachment, same as drop. Click a budget-bar row (system prompt, map, tool
 JSON, conversation) or **last request** to see exactly what was sent.
 
@@ -292,8 +307,9 @@ for the Session, like the core set. Explore does not inherit MCP tools.
 
 Omitted `enabled` is off. `allowed_tools` is the server's names before prefixing;
 omit it for every tool `list_tools` returned, `[]` for none. Secrets in headers
-use `${NAME}` and resolve keychain-first (GitHub PAT account `github-pat`, env
-`GITHUB_PERSONAL_ACCESS_TOKEN`). A dead server is omitted with a Notice; the
+use `${NAME}` and resolve a stored key (GitHub PAT account `github-pat`) or the env
+(`GITHUB_PERSONAL_ACCESS_TOKEN`). The keychain is not probed for names that were
+never saved. A dead server is omitted with a Notice; the
 Session still starts.
 
 HTTP and stdio in v1. Sample row: [`docs/mcp.json.example`](docs/mcp.json.example).

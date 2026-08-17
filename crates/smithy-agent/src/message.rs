@@ -44,6 +44,15 @@ pub struct Message {
     /// For [`Role::Tool`]: the name of the tool that ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
+    /// Thinking-mode trace for this assistant message.
+    ///
+    /// DeepSeek V4 (and any endpoint that advertised `tools`) rejects the next
+    /// request with 400 unless this comes back on the same assistant message
+    /// that issued the tool calls. Empty for ordinary answers — those must not
+    /// grow the prefix. Shown live via [`crate::provider::Delta::Reasoning`];
+    /// this field is only the round-trip, not the Session's reasoning log.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reasoning: String,
 }
 
 impl Message {
@@ -54,6 +63,7 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: None,
             tool_name: None,
+            reasoning: String::new(),
         }
     }
 
@@ -76,6 +86,12 @@ impl Message {
         }
     }
 
+    /// Attach a thinking-mode trace. See [`Message::reasoning`].
+    pub fn with_reasoning(mut self, reasoning: impl Into<String>) -> Message {
+        self.reasoning = reasoning.into();
+        self
+    }
+
     /// A tool result, correlated to the call it answers.
     ///
     /// coda wrapped results in `<tool_response>` tags on a `user` message and
@@ -90,6 +106,7 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: Some(result.tool_call_id.clone()),
             tool_name: Some(result.name.clone()),
+            reasoning: String::new(),
         }
     }
 
@@ -113,6 +130,12 @@ impl Message {
                 .collect();
             m.insert("tool_calls".into(), Value::Array(calls));
         }
+        if !self.reasoning.is_empty() {
+            m.insert(
+                "reasoning_content".into(),
+                Value::String(self.reasoning.clone()),
+            );
+        }
         if let Some(id) = &self.tool_call_id {
             m.insert("tool_call_id".into(), Value::String(id.clone()));
         }
@@ -123,12 +146,12 @@ impl Message {
     }
 }
 
-/// The append-only conversation.
+/// The conversation this Session will send on the next completion.
 ///
-/// There is deliberately no `remove`, `truncate`, `insert`, or `get_mut`. If a
-/// compaction strategy is ever added it must append a summary and start a new
-/// session, never rewrite this one — rewriting re-prefills everything, so
-/// "saving context" by editing history costs more than it saves.
+/// Ordinary turns only [`Self::push`]. There is no `remove` / `truncate` /
+/// `insert` / `get_mut`: quietly editing an early turn would miss the prefix
+/// cache while pretending the old prefix was still there. [`Self::compacted`]
+/// is the explicit exception — Compact installs a new prefix on purpose.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct History {
     messages: Vec<Message>,
@@ -172,11 +195,19 @@ impl History {
 
     /// Restore a history from persisted messages.
     ///
-    /// Used only by [`crate::persist`]. The messages go back verbatim — this is
-    /// what lets a resumed session hit a warm prefix instead of paying a cold
-    /// prefill for a conversation the endpoint has already seen.
+    /// Used by [`crate::persist`] and by Compact. The messages go back verbatim.
     pub fn from_messages(messages: Vec<Message>) -> History {
         History { messages }
+    }
+
+    /// A new prefix: the same system prompt and one user message (the summary).
+    ///
+    /// Compact's job. The old turns are not in this History; persist may keep a
+    /// `.full.json` sidecar so the log is still on disk.
+    pub fn compacted(system_prompt: impl Into<String>, summary: impl Into<String>) -> History {
+        History {
+            messages: vec![Message::system(system_prompt), Message::user(summary)],
+        }
     }
 }
 
@@ -193,6 +224,14 @@ mod tests {
     }
 
     #[test]
+    fn compacted_history_is_system_plus_summary() {
+        let h = History::compacted("sys", "the summary");
+        assert_eq!(h.len(), 2);
+        assert_eq!(h.system_prompt(), Some("sys"));
+        assert_eq!(h.messages()[1].content, "the summary");
+    }
+
+    #[test]
     fn serializes_an_assistant_tool_call() {
         let mut h = History::new("sys");
         h.push(Message::assistant_with_calls(
@@ -204,6 +243,24 @@ mod tests {
         assert_eq!(call["id"], "call_1");
         assert_eq!(call["type"], "function");
         assert_eq!(call["function"]["name"], "read");
+        assert!(
+            api[1].get("reasoning_content").is_none(),
+            "an empty trace must not grow the prefix"
+        );
+    }
+
+    /// DeepSeek V4 returns 400 on the next request unless a tool-calling
+    /// assistant message carries the thinking that produced the calls.
+    #[test]
+    fn a_tool_call_round_trips_its_reasoning_trace() {
+        let msg = Message::assistant_with_calls(
+            "",
+            vec![ToolCall::new("call_1", "read", "{}")],
+        )
+        .with_reasoning("need the file first");
+        let api = msg.to_api();
+        assert_eq!(api["reasoning_content"], "need the file first");
+        assert_eq!(api["tool_calls"][0]["id"], "call_1");
     }
 
     /// The correlation coda lacked: a result names the call it answers.

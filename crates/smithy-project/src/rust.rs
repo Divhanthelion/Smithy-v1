@@ -663,13 +663,12 @@ pub fn extract() {}
     #[test]
     fn api_item_name_strips_generics_and_args() {
         assert_eq!(
-            api_item_name("pub fn extract(project: &Project, budget: ContextBudget) -> ProjectContext"),
+            api_item_name(
+                "pub fn extract(project: &Project, budget: ContextBudget) -> ProjectContext"
+            ),
             Some("extract")
         );
-        assert_eq!(
-            api_item_name("pub struct Config<T>"),
-            Some("Config")
-        );
+        assert_eq!(api_item_name("pub struct Config<T>"), Some("Config"));
     }
 
     #[test]

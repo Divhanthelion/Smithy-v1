@@ -11,7 +11,6 @@ use crate::limits::{Budget, Limits};
 use crate::message::{History, Message};
 use crate::parse::{parse, Action};
 use crate::provider::{Completion, CompletionRequest, Delta, Provider, ProviderError, Sampling};
-use crate::skill::SessionKind;
 
 /// How a user-turn ended.
 #[derive(Debug, Clone)]
@@ -58,7 +57,8 @@ pub struct SessionConfig {
     pub project_context_chars: usize,
     pub sampling: Sampling,
     pub limits: Limits,
-    pub kind: SessionKind,
+    /// Last Skill invoked in this Session, if any. Label only; tools stay frozen.
+    pub skill: Option<String>,
 }
 
 impl SessionConfig {
@@ -71,7 +71,7 @@ impl SessionConfig {
             project_context_chars: 0,
             sampling: Sampling::default(),
             limits: Limits::default(),
-            kind: SessionKind::Coding,
+            skill: None,
         }
     }
 
@@ -82,8 +82,8 @@ impl SessionConfig {
         self
     }
 
-    pub fn with_kind(mut self, kind: SessionKind) -> Self {
-        self.kind = kind;
+    pub fn with_skill(mut self, skill: Option<String>) -> Self {
+        self.skill = skill;
         self
     }
 }
@@ -127,7 +127,7 @@ pub struct Session {
     project_context_chars: usize,
     /// Last JSON body POSTed (or that would be POSTed). Inspection ground truth.
     last_request: Mutex<Option<Value>>,
-    kind: SessionKind,
+    skill: Option<String>,
     /// Every reasoning block the model has produced, in order.
     ///
     /// **Deliberately not in [`History`].** The endpoint does not replay
@@ -390,7 +390,7 @@ impl Session {
             system_base_chars: config.system_base_chars,
             project_context_chars: config.project_context_chars,
             last_request: Mutex::new(None),
-            kind: config.kind,
+            skill: config.skill,
             reasoning: Vec::new(),
         }
     }
@@ -408,7 +408,7 @@ impl Session {
         history: History,
         sampling: Sampling,
         limits: Limits,
-        kind: SessionKind,
+        skill: Option<String>,
     ) -> Session {
         let tools = registry.openai_schemas();
         let system_chars = history
@@ -432,7 +432,7 @@ impl Session {
             system_base_chars: system_chars,
             project_context_chars: 0,
             last_request: Mutex::new(None),
-            kind,
+            skill,
             reasoning: Vec::new(),
         }
     }
@@ -482,13 +482,80 @@ impl Session {
         &self.sampling
     }
 
-    pub fn kind(&self) -> SessionKind {
-        self.kind
+    pub fn skill(&self) -> Option<&str> {
+        self.skill.as_deref()
     }
 
-    pub fn with_kind(mut self, kind: SessionKind) -> Session {
-        self.kind = kind;
-        self
+    /// Record the last Skill injected into this conversation. Label only —
+    /// does not change the frozen tool JSON or the system prompt.
+    pub fn set_skill(&mut self, skill: Option<String>) {
+        self.skill = skill;
+    }
+
+    /// Compact this Session: ask the model for a summary, then replace History
+    /// with the system prompt plus that summary. Same Session id. The next
+    /// completion starts a new prefix — a cache miss by design.
+    ///
+    /// Tools are omitted on the summarization request so the model cannot spend
+    /// the compact Turn exploring. The frozen tool JSON is unchanged afterwards.
+    pub async fn compact(
+        &mut self,
+        focus: &str,
+        events: Option<&EventSink>,
+    ) -> Result<String, ProviderError> {
+        if self.history.len() <= 1 {
+            return Err(ProviderError::Other(
+                "nothing to compact — this Session has no turns yet".into(),
+            ));
+        }
+        let system = self.history.system_prompt().unwrap_or("").to_string();
+        let mut request_history = self.history.clone();
+        request_history.push(Message::user(compact_instruction(focus)));
+        let no_tools = Value::Array(Vec::new());
+        let remaining = Duration::from_secs(self.limits.max_seconds.max(1));
+        let request = CompletionRequest {
+            history: &request_history,
+            tools: &no_tools,
+            sampling: &self.sampling,
+            timeout: Some(remaining),
+        };
+        let body = self.provider.build_body(&request);
+        if let Ok(mut slot) = self.last_request.lock() {
+            *slot = Some(body);
+        }
+
+        let completion = match events {
+            Some(sink) => {
+                let forward = move |delta: Delta| match delta {
+                    Delta::Reasoning(t) => sink(TurnEvent::Reasoning(t)),
+                    Delta::Content(t) => sink(TurnEvent::Content(t)),
+                };
+                self.provider.complete(request, Some(&forward)).await?
+            }
+            None => self.provider.complete(request, None).await?,
+        };
+
+        self.last_prompt_tokens = completion.prompt_tokens;
+        self.last_cached_tokens = completion.cached_tokens;
+        let summary = completion.content.trim().to_string();
+        if summary.is_empty() {
+            return Err(ProviderError::Other(
+                "compact produced an empty summary".into(),
+            ));
+        }
+        let user = if focus.trim().is_empty() {
+            format!("# Compacted conversation\n\n{summary}")
+        } else {
+            format!(
+                "# Compacted conversation\n\nFocus: {}\n\n{summary}",
+                focus.trim()
+            )
+        };
+        self.history = History::compacted(system, user.clone());
+        self.reasoning.clear();
+        self.ledger_calibration = None;
+        self.rearm_cancel();
+        Ok(user)
     }
 
     /// What this session has cost so far, in tokens.
@@ -764,10 +831,10 @@ impl Session {
 
                 Action::Calls(calls) => {
                     consecutive_failures = 0;
-                    self.history.push(Message::assistant_with_calls(
-                        completion.content.clone(),
-                        calls.clone(),
-                    ));
+                    self.history.push(
+                        Message::assistant_with_calls(completion.content.clone(), calls.clone())
+                            .with_reasoning(completion.reasoning.clone()),
+                    );
                     for (i, call) in calls.iter().enumerate() {
                         // Checkpoint 3. The assistant message announcing these
                         // calls is already in the history, and a tool call
@@ -858,6 +925,20 @@ fn emit(events: Option<&EventSink>, event: TurnEvent) {
     }
 }
 
+fn compact_instruction(focus: &str) -> String {
+    let focus_line = if focus.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\nPay particular attention to: {}\n", focus.trim())
+    };
+    format!(
+        "Summarize this conversation so it can continue in the same Session. \
+The summary replaces the transcript the model will be sent next. \
+Keep decisions, file paths, what was already right, what is still open, and the next move. \
+Drop tool traces, retries, and abandoned dead ends. Write markdown. Do not call tools.{focus_line}"
+    )
+}
+
 fn conversation_text(history: &History) -> String {
     let mut out = String::new();
     for message in history.messages().iter().skip(1) {
@@ -936,8 +1017,7 @@ pub fn default_system_prompt(
     with_project_context(base, project_context)
 }
 
-/// Join a Map onto a base system prompt. Shared by coding and skill Sessions
-/// so the snapshot warning cannot drift.
+/// Join a Map onto a base system prompt so the snapshot warning cannot drift.
 pub fn with_project_context(base: String, project_context: Option<&str>) -> String {
     match project_context {
         Some(context) if !context.trim().is_empty() => format!(
@@ -1410,6 +1490,34 @@ mod tests {
             default_system_prompt(path, &tools, None)
         );
     }
+
+    #[tokio::test]
+    async fn compact_replaces_history_and_keeps_the_system_prompt() {
+        let (_t, mut s, provider) = harness(vec![
+            answer("we decided on rust"),
+            answer("## Already right\nRust. ## Next\nImplement compact."),
+        ]);
+        s.run_turn("should we use rust?", None).await.unwrap();
+        let system = s.history().system_prompt().unwrap().to_string();
+        let before = s.history().len();
+        assert!(before > 2, "turn should have appended messages");
+
+        let summary = s.compact("", None).await.unwrap();
+        assert_eq!(s.history().system_prompt(), Some(system.as_str()));
+        assert_eq!(s.history().len(), 2, "system + summary only");
+        assert!(summary.contains("Already right"));
+        assert_eq!(provider.call_count(), 2);
+        assert_eq!(s.history().messages()[1].role, crate::message::Role::User);
+    }
+
+    #[tokio::test]
+    async fn compact_refuses_an_empty_session() {
+        let (_t, mut s, provider) = harness(vec![answer("should not run")]);
+        let err = s.compact("", None).await.unwrap_err();
+        assert!(err.to_string().contains("nothing to compact"));
+        assert_eq!(provider.call_count(), 0);
+        assert_eq!(s.history().len(), 1);
+    }
 }
 
 #[cfg(test)]
@@ -1460,7 +1568,7 @@ mod prefix_invariant_tests {
     use super::*;
     use crate::provider::test_support::{answer, tool_call, ScriptedProvider};
     use crate::provider::Completion;
-    use smithy_tools::Workspace;
+    use smithy_tools::{Registry, Workspace};
 
     /// Serialize each message on its own, so the comparison is per-element.
     ///

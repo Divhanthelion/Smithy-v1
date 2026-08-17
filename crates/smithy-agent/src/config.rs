@@ -34,7 +34,8 @@
 //! Keychain access is *synchronous and can block*: the OS may put up an
 //! authorization prompt the first time a new binary reads an item. Every call
 //! here is therefore made from session construction, which already runs on a
-//! worker, and never from the UI thread.
+//! worker, and never from the UI thread. Secrets share one item, so that prompt
+//! happens at most once per process.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -374,8 +375,14 @@ impl AgentConfig {
 /// An empty value counts as absent. A key set to the empty string is a mistake
 /// every time, and reporting "no key" beats reporting an authentication failure.
 pub fn api_key(account: &str, env_var: &str) -> Option<String> {
-    if let Some(secret) = secrets::get(account) {
-        return Some(secret);
+    // Touch the keychain only when the sidecar says an item exists. Probing a
+    // missing account under service `smithy` still talks to Keychain Services,
+    // and on macOS that can authorize every other item filed there — four
+    // login-password dialogs to learn that a GitHub PAT was never saved.
+    if secrets::is_stored(account) {
+        if let Some(secret) = secrets::get(account) {
+            return Some(secret);
+        }
     }
     load_dotenv_if_present();
     std::env::var(env_var)
@@ -391,27 +398,46 @@ pub fn api_key(account: &str, env_var: &str) -> Option<String> {
 /// must leave you with a usable editor and a legible message — the same posture
 /// [`crate::providers`] takes toward an unreachable endpoint.
 ///
-/// ## Why a cache and a presence file
+/// ## Why a vault, a lock, and a presence file
 ///
-/// macOS prompts once **per keychain item** the first time a binary path reads
-/// it. Opening Settings used to call [`get`] three times (OpenRouter, DeepSeek,
-/// Brave) just to learn whether a key existed, and refreshing the model list
-/// called it again — so a single visit could ask for the login password three
-/// or four times. [`is_stored`] answers presence from a non-secret sidecar;
-/// [`get`] caches the value for the life of the process after the first
-/// successful read. `cargo install --force` still re-prompts once per item
-/// (new binary, new ACL), but never more than once per process after that.
+/// macOS authorizes once **per keychain item**. Four accounts were four login
+/// dialogs: the provider key, a GitHub PAT probe that was never stored, and
+/// concurrent readers (session + balance poller) stacking prompts for the same
+/// item before the first had cached. Searching for a missing account under
+/// service [`SERVICE`] can also authorize every other item filed there.
+///
+/// All secrets therefore live in one keychain item (`vault`). [`is_stored`]
+/// answers presence from a non-secret sidecar so Settings and MCP never probe.
+/// [`get`] takes a process-wide lock and will not call `get_password` a second
+/// time this process — a write or delete on the first read was four dialogs
+/// (vault, leftover item, vault write, leftover delete). Saving a key in
+/// Settings may still authorize a write. `cargo install --force` still
+/// re-prompts once (new binary, new ACL).
 pub mod secrets {
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
 
     use super::SERVICE;
 
-    /// Process-lifetime cache of secrets we have already unlocked.
-    fn cache() -> &'static Mutex<HashMap<String, String>> {
-        static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
-        CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+    /// Account name of the single keychain item that holds every Smithy secret.
+    const VAULT: &str = "vault";
+
+    #[derive(Default)]
+    struct Inner {
+        secrets: HashMap<String, String>,
+        /// A keychain read has already run this process. Another account is
+        /// another login dialog, so [`get`] will not touch the store again.
+        touched: bool,
+    }
+
+    fn state() -> &'static Mutex<Inner> {
+        static STATE: OnceLock<Mutex<Inner>> = OnceLock::new();
+        STATE.get_or_init(|| Mutex::new(Inner::default()))
+    }
+
+    fn lock() -> MutexGuard<'static, Inner> {
+        state().lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn presence_path() -> Option<PathBuf> {
@@ -455,74 +481,161 @@ pub mod secrets {
         write_presence(&map);
     }
 
+    fn sidecar_says(account: &str) -> bool {
+        read_presence().get(account).copied().unwrap_or(false)
+    }
+
+    fn read_item(account: &str) -> Option<String> {
+        let entry = keyring::Entry::new(SERVICE, account).ok()?;
+        let secret = entry.get_password().ok()?;
+        let secret = secret.trim().to_string();
+        if secret.is_empty() {
+            None
+        } else {
+            Some(secret)
+        }
+    }
+
+    fn delete_item(account: &str) -> Result<(), String> {
+        let entry = keyring::Entry::new(SERVICE, account)
+            .map_err(|e| format!("cannot reach the credential store: {e}"))?;
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(format!("cannot remove the key: {e}")),
+        }
+    }
+
+    fn persist_vault(secrets: &HashMap<String, String>) -> Result<(), String> {
+        let entry = keyring::Entry::new(SERVICE, VAULT)
+            .map_err(|e| format!("cannot reach the credential store: {e}"))?;
+        if secrets.is_empty() {
+            match entry.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => {}
+                Err(e) => return Err(format!("cannot clear the key vault: {e}")),
+            }
+            mark_present(VAULT, false);
+            return Ok(());
+        }
+        let json = serde_json::to_string(secrets)
+            .map_err(|e| format!("cannot encode the key vault: {e}"))?;
+        entry
+            .set_password(&json)
+            .map_err(|e| format!("cannot save the key: {e}"))?;
+        mark_present(VAULT, true);
+        Ok(())
+    }
+
+    fn ingest_vault_json(inner: &mut Inner, raw: &str) {
+        let Ok(map) = serde_json::from_str::<HashMap<String, String>>(raw) else {
+            return;
+        };
+        for (account, secret) in map {
+            let secret = secret.trim().to_string();
+            if secret.is_empty() || account == VAULT {
+                continue;
+            }
+            inner.secrets.entry(account.clone()).or_insert(secret);
+        }
+    }
+
+    /// At most one `get_password` per process. Writing or deleting here is what
+    /// turned a single DeepSeek unlock into four login dialogs (vault read,
+    /// legacy read, vault write, legacy delete).
+    fn unlock_once(inner: &mut Inner, want: &str) {
+        if inner.touched {
+            return;
+        }
+        inner.touched = true;
+        if sidecar_says(VAULT) {
+            if let Some(raw) = read_item(VAULT) {
+                ingest_vault_json(inner, &raw);
+            }
+            return;
+        }
+        if want != VAULT && sidecar_says(want) {
+            if let Some(secret) = read_item(want) {
+                inner.secrets.insert(want.to_string(), secret);
+            }
+        }
+    }
+
     /// Whether a key is stored — without unlocking the keychain.
     ///
     /// Backed by a sidecar written whenever a key is saved, cleared, or
     /// successfully read. The settings dialog uses this so opening it does not
     /// cost a password prompt.
     pub fn is_stored(account: &str) -> bool {
-        if cache().lock().ok().is_some_and(|c| c.contains_key(account)) {
+        if account == VAULT {
+            return false;
+        }
+        if sidecar_says(account) {
             return true;
         }
-        read_presence().get(account).copied().unwrap_or(false)
+        lock().secrets.contains_key(account)
     }
 
     /// Fetch a secret. `None` when it is unset, empty, or unreachable.
+    ///
+    /// Does not talk to the keychain unless this account (or the vault) is in
+    /// the presence sidecar. Callers that only want "is anything saved?" must
+    /// use [`is_stored`].
     pub fn get(account: &str) -> Option<String> {
-        if let Ok(cache) = cache().lock() {
-            if let Some(secret) = cache.get(account) {
-                return Some(secret.clone());
-            }
+        if account == VAULT {
+            return None;
         }
-
-        let entry = keyring::Entry::new(SERVICE, account).ok()?;
-        let secret = entry.get_password().ok()?;
-        let secret = secret.trim().to_string();
-        if secret.is_empty() {
-            mark_present(account, false);
-            None
-        } else {
-            if let Ok(mut cache) = cache().lock() {
-                cache.insert(account.to_string(), secret.clone());
-            }
-            mark_present(account, true);
-            Some(secret)
+        let mut inner = lock();
+        if let Some(secret) = inner.secrets.get(account) {
+            return Some(secret.clone());
         }
+        unlock_once(&mut inner, account);
+        inner.secrets.get(account).cloned()
     }
 
     /// Store a secret. An empty value deletes it instead, so that clearing the
     /// field in the settings dialog does what it looks like it does rather than
     /// filing an empty string that later reads back as a key.
     pub fn set(account: &str, secret: &str) -> Result<(), String> {
+        if account == VAULT {
+            return Err("that name is reserved for the key vault".into());
+        }
         if secret.trim().is_empty() {
             return clear(account);
         }
-        let entry = keyring::Entry::new(SERVICE, account)
-            .map_err(|e| format!("cannot reach the credential store: {e}"))?;
-        entry
-            .set_password(secret.trim())
-            .map_err(|e| format!("cannot save the key: {e}"))?;
-        if let Ok(mut cache) = cache().lock() {
-            cache.insert(account.to_string(), secret.trim().to_string());
-        }
+        let secret = secret.trim().to_string();
+        let mut inner = lock();
+        unlock_once(&mut inner, account);
+        inner.secrets.insert(account.to_string(), secret.clone());
         mark_present(account, true);
-        Ok(())
+        match persist_vault(&inner.secrets) {
+            Ok(()) => {
+                let _ = delete_item(account);
+                Ok(())
+            }
+            Err(_) => {
+                // Vault write failed; keep the old per-account item so the key
+                // they just typed is not only in this process's memory.
+                let entry = keyring::Entry::new(SERVICE, account)
+                    .map_err(|err| format!("cannot reach the credential store: {err}"))?;
+                entry
+                    .set_password(&secret)
+                    .map_err(|err| format!("cannot save the key: {err}"))?;
+                Ok(())
+            }
+        }
     }
 
     /// Remove a secret. Succeeds when there was nothing there.
     pub fn clear(account: &str) -> Result<(), String> {
-        let entry = keyring::Entry::new(SERVICE, account)
-            .map_err(|e| format!("cannot reach the credential store: {e}"))?;
-        match entry.delete_credential() {
-            Ok(()) => {}
-            Err(keyring::Error::NoEntry) => {}
-            Err(e) => return Err(format!("cannot remove the key: {e}")),
+        if account == VAULT {
+            return Ok(());
         }
-        if let Ok(mut cache) = cache().lock() {
-            cache.remove(account);
-        }
+        let mut inner = lock();
+        unlock_once(&mut inner, account);
+        inner.secrets.remove(account);
         mark_present(account, false);
-        Ok(())
+        let vault = persist_vault(&inner.secrets);
+        let legacy = delete_item(account);
+        vault.and(legacy)
     }
 
     /// Whether the credential store can be reached at all.
@@ -725,5 +838,21 @@ mod tests {
         let b = ProviderChoice::DeepSeek.key_names().unwrap();
         assert_ne!(a, b);
         assert!(ProviderChoice::LmStudio.key_names().is_none());
+    }
+
+    /// A missing sidecar must not send us to the keychain. Probing a name that
+    /// was never saved is what authorized every other `smithy` item at launch.
+    #[test]
+    fn a_key_absent_from_the_sidecar_is_read_from_the_environment() {
+        std::env::set_var("SMITHY_TEST_ABSENT_KEY", "from-env");
+        let value = api_key(
+            "smithy-test-account-that-is-not-in-the-sidecar",
+            "SMITHY_TEST_ABSENT_KEY",
+        );
+        std::env::remove_var("SMITHY_TEST_ABSENT_KEY");
+        assert_eq!(value.as_deref(), Some("from-env"));
+        assert!(!secrets::is_stored(
+            "smithy-test-account-that-is-not-in-the-sidecar"
+        ));
     }
 }

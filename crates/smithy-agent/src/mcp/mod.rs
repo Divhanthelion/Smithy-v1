@@ -133,7 +133,7 @@ fn overlay(into: &mut McpFile, path: &Path, notices: &mut Vec<String>) {
     }
 }
 
-/// `${NAME}` → keychain then env. GitHub's PAT uses the `github-pat` account.
+/// `${NAME}` → keychain (if the sidecar says it is stored) then env. GitHub's PAT uses the `github-pat` account.
 pub fn resolve_placeholder(raw: &str) -> Result<String, String> {
     let mut out = String::new();
     let mut rest = raw;

@@ -42,12 +42,7 @@ fn to_ts(path: &BezPath) -> Option<tiny_skia::Path> {
             PathEl::QuadTo(a, b) => pb.quad_to(a.x as f32, a.y as f32, b.x as f32, b.y as f32),
             PathEl::CurveTo(a, b, c) => {
                 pb.cubic_to(
-                    a.x as f32,
-                    a.y as f32,
-                    b.x as f32,
-                    b.y as f32,
-                    c.x as f32,
-                    c.y as f32,
+                    a.x as f32, a.y as f32, b.x as f32, b.y as f32, c.x as f32, c.y as f32,
                 );
             }
             PathEl::ClosePath => pb.close(),
@@ -296,9 +291,36 @@ fn scene_sheet(band: f64, name: &str) {
 
     // (label, doing, place, previous, progress, completion, frame, seconds)
     let tiles: &[(&str, Doing, Place, Place, f64, f64, u64, f64)] = &[
-        ("build 20%", Doing::Walking, Place::Garden, Place::Garden, 0.0, 0.20, 40, 8.0),
-        ("build 55%", Doing::Walking, Place::Garden, Place::Garden, 0.0, 0.55, 40, 8.0),
-        ("build 85%", Doing::Walking, Place::Garden, Place::Garden, 0.0, 0.85, 40, 8.0),
+        (
+            "build 20%",
+            Doing::Walking,
+            Place::Garden,
+            Place::Garden,
+            0.0,
+            0.20,
+            40,
+            8.0,
+        ),
+        (
+            "build 55%",
+            Doing::Walking,
+            Place::Garden,
+            Place::Garden,
+            0.0,
+            0.55,
+            40,
+            8.0,
+        ),
+        (
+            "build 85%",
+            Doing::Walking,
+            Place::Garden,
+            Place::Garden,
+            0.0,
+            0.85,
+            40,
+            8.0,
+        ),
         (
             "built, morning coffee on the doorstep",
             Doing::Coffee,
@@ -309,9 +331,36 @@ fn scene_sheet(band: f64, name: &str) {
             40,
             8.0,
         ),
-        ("gardening", Doing::Gardening, Place::Garden, Place::Doorstep, 0.5, 1.0, 40, 9.0),
-        ("fishing at the perch", Doing::Fishing, Place::Perch, Place::Garden, 0.5, 1.0, 40, 10.0),
-        ("cooking at the fire", Doing::Cooking, Place::Fire, Place::Perch, 0.5, 1.0, 40, 18.0),
+        (
+            "gardening",
+            Doing::Gardening,
+            Place::Garden,
+            Place::Doorstep,
+            0.5,
+            1.0,
+            40,
+            9.0,
+        ),
+        (
+            "fishing at the perch",
+            Doing::Fishing,
+            Place::Perch,
+            Place::Garden,
+            0.5,
+            1.0,
+            40,
+            10.0,
+        ),
+        (
+            "cooking at the fire",
+            Doing::Cooking,
+            Place::Fire,
+            Place::Perch,
+            0.5,
+            1.0,
+            40,
+            18.0,
+        ),
         (
             "walking home, door opening",
             Doing::Walking,
@@ -322,8 +371,26 @@ fn scene_sheet(band: f64, name: &str) {
             40,
             20.0,
         ),
-        ("reading by lamplight", Doing::Reading, Place::Hut, Place::Doorstep, 0.5, 1.0, 60, 22.0),
-        ("asleep, lamp out", Doing::Sleeping, Place::Hut, Place::Doorstep, 0.5, 1.0, 60, 23.5),
+        (
+            "reading by lamplight",
+            Doing::Reading,
+            Place::Hut,
+            Place::Doorstep,
+            0.5,
+            1.0,
+            60,
+            22.0,
+        ),
+        (
+            "asleep, lamp out",
+            Doing::Sleeping,
+            Place::Hut,
+            Place::Doorstep,
+            0.5,
+            1.0,
+            60,
+            23.5,
+        ),
     ];
 
     let mut sheet = PixmapInk::new(

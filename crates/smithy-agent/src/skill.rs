@@ -1,70 +1,17 @@
 //! Skills and Commands.
 //!
-//! A **Skill** is a `SKILL.md` on disk. A **Command** is the user typing `/name`
-//! in the composer. Skills run only then — never from ambient text.
+//! A **Skill** is a `SKILL.md` on disk: a context-injection macro. A **Command**
+//! is the user typing `/name` in the composer. Skills run only then — never
+//! from ambient text. There is no Session kind per skill. A Command injects the
+//! skill body into the current user turn; it does not rebuild the Session and
+//! does not compress history. Tools stay whatever this Session was born with.
 //!
 //! Lookup: Project `.smithy/skills/<name>/SKILL.md`, then
-//! `~/.smithy/skills/<name>/SKILL.md`. Editing a skill mid-Session does not
-//! hot-reload; a new Command (or New session) rebuilds.
+//! `~/.smithy/skills/<name>/SKILL.md`, then the `research` and `grill-me`
+//! procedures Smithy ships. Compact and Handoff are harness Commands, not
+//! Skills; they are listed in the `/` picker anyway.
 
 use std::path::{Path, PathBuf};
-
-use serde::{Deserialize, Serialize};
-
-/// How a Session is tooled and prompted.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SessionKind {
-    #[default]
-    Coding,
-    Research,
-    Grill,
-}
-
-impl SessionKind {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Coding => "Coding",
-            Self::Research => "Research",
-            Self::Grill => "Grill",
-        }
-    }
-
-    pub fn from_name(name: &str) -> Self {
-        match name {
-            "research" => Self::Research,
-            "grill-me" => Self::Grill,
-            _ => Self::Coding,
-        }
-    }
-}
-
-/// Tool set a Skill asks for. Frozen for the Session, like today's core.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ToolProfile {
-    #[default]
-    Coding,
-    Research,
-    Grill,
-}
-
-impl ToolProfile {
-    fn parse(s: &str) -> Self {
-        match s.trim() {
-            "research" => Self::Research,
-            "grill" | "grill-me" => Self::Grill,
-            _ => Self::Coding,
-        }
-    }
-
-    pub fn kind(self) -> SessionKind {
-        match self {
-            Self::Coding => SessionKind::Coding,
-            Self::Research => SessionKind::Research,
-            Self::Grill => SessionKind::Grill,
-        }
-    }
-}
 
 /// Picker row: enough to show `/name` without loading the body.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -72,10 +19,16 @@ pub struct SkillMeta {
     pub name: String,
     pub description: String,
     pub argument_hint: String,
-    pub profile: ToolProfile,
+    /// Allowlist of tool names. `None` means the coding defaults. Applied only
+    /// if a Session is rebuilt with this Skill; a Command does not rebuild.
+    pub tools: Option<Vec<String>>,
+    /// Sibling files concatenated into the body, relative to the skill dir.
+    pub include: Vec<String>,
+    /// Wall-clock override, in seconds. Same as `tools`: rebuild only.
+    pub max_seconds: Option<u64>,
 }
 
-/// A loaded Skill: frontmatter plus the procedure spliced into the system prompt.
+/// A loaded Skill: frontmatter plus the procedure injected into a user turn.
 #[derive(Clone, Debug)]
 pub struct Skill {
     pub meta: SkillMeta,
@@ -165,7 +118,8 @@ fn project_skills_dir(project: &Path) -> PathBuf {
     project.join(".smithy/skills")
 }
 
-/// Load `{name}/SKILL.md` from the Project, then the user directory.
+/// Load `{name}/SKILL.md` from the Project, then the user directory, then
+/// procedures Smithy ships (`research`, `grill-me`).
 pub fn load_skill(project: &Path, name: &str) -> Option<Skill> {
     if !is_skill_name(name) {
         return None;
@@ -174,21 +128,114 @@ pub fn load_skill(project: &Path, name: &str) -> Option<Skill> {
     if project_file.is_file() {
         return Skill::from_file(&project_file).ok();
     }
-    let user_file = user_skills_dir()?.join(name).join("SKILL.md");
-    if user_file.is_file() {
-        return Skill::from_file(&user_file).ok();
+    if let Some(user_file) = user_skills_dir().map(|d| d.join(name).join("SKILL.md")) {
+        if user_file.is_file() {
+            return Skill::from_file(&user_file).ok();
+        }
     }
-    None
+    bundled_skill(name)
 }
 
-/// Skills visible in the `/` picker. Project names override user names.
+/// Harness Commands that are not Skills. Shown in the `/` picker.
+pub fn harness_commands() -> Vec<SkillMeta> {
+    vec![
+        SkillMeta {
+            name: "compact".into(),
+            description: "Replace this Session's History with a lossy summary. Same conversation."
+                .into(),
+            argument_hint: "Optional focus for the summary".into(),
+            tools: None,
+            include: Vec::new(),
+            max_seconds: None,
+        },
+        SkillMeta {
+            name: "handoff".into(),
+            description: "Write a Project-owned note for a later Session. History stays.".into(),
+            argument_hint: "What the next Session is for".into(),
+            tools: None,
+            include: Vec::new(),
+            max_seconds: None,
+        },
+    ]
+}
+
+pub fn is_harness_command(name: &str) -> bool {
+    matches!(name, "compact" | "handoff")
+}
+
+/// Body injected for `/handoff`. A Project `handoff` Skill replaces this.
+pub fn handoff_injection(rest: &str) -> String {
+    let purpose = if rest.trim().is_empty() {
+        "Continue the work in this Project.".to_string()
+    } else {
+        rest.trim().to_string()
+    };
+    format!(
+        "# Handoff\n\n\
+Write a handoff the next Session can run from. This Session's History stays as it is — \
+do not summarize in-context to free tokens; that is `/compact`.\n\n\
+If they passed arguments, that is what the next Session is for: {purpose}\n\n\
+Update the Project's existing `HANDOFF.md` or `docs/HANDOFF.md` if either exists. \
+Otherwise `write` `HANDOFF.md` at the Project root. Review-gated — do not treat it as \
+landed until the tool result says so. Never write this to a temp directory. The Project owns memory.\n\n\
+```markdown\n\
+# Handoff\n\
+\n\
+**Next session:** {purpose}\n\
+\n\
+## Already right\n\
+Decisions that look like bugs. Do not \"fix\" these.\n\
+\n\
+## State\n\
+What is true now. Pointers to files, branches, commits — not pasted diffs.\n\
+\n\
+## Open\n\
+Unresolved decisions. Questions, not tasks, if they are still decisions.\n\
+\n\
+## Next\n\
+Ordered next moves for the stated session purpose.\n\
+```\n\n\
+Do not duplicate specs, plans, or research notes — reference them by path. Redact secrets. \
+Do not start the next Session's work here unless they ask."
+    )
+}
+
+/// Skills visible in the `/` picker. Project names override user names;
+/// both override the procedures Smithy ships.
 pub fn list_skills(project: &Path) -> Vec<SkillMeta> {
     let mut by_name: std::collections::BTreeMap<String, SkillMeta> = Default::default();
+    for skill in bundled_skills() {
+        by_name.insert(skill.meta.name.clone(), skill.meta);
+    }
     if let Some(user) = user_skills_dir() {
         scan_dir(&user, &mut by_name);
     }
     scan_dir(&project_skills_dir(project), &mut by_name);
     by_name.into_values().collect()
+}
+
+/// Write shipped Skills into `~/.smithy/skills/` when `SKILL.md` is missing.
+///
+/// Empty stub directories (a name with no file) used to hide `/research` and
+/// `/grill-me` in every Project that did not ship its own copy. Does not
+/// overwrite a file the user already has.
+pub fn install_bundled_user_skills() {
+    let Some(root) = user_skills_dir() else {
+        return;
+    };
+    for (name, files) in BUNDLED {
+        let dir = root.join(name);
+        if dir.join("SKILL.md").is_file() {
+            continue;
+        }
+        let _ = std::fs::create_dir_all(&dir);
+        for (filename, contents) in *files {
+            let path = dir.join(filename);
+            if !path.is_file() {
+                let _ = std::fs::write(path, contents);
+            }
+        }
+    }
 }
 
 fn scan_dir(root: &Path, into: &mut std::collections::BTreeMap<String, SkillMeta>) {
@@ -201,6 +248,79 @@ fn scan_dir(root: &Path, into: &mut std::collections::BTreeMap<String, SkillMeta
             into.insert(skill.meta.name.clone(), skill.meta);
         }
     }
+}
+
+/// Procedures Smithy ships. Paths are the repo copies; `include_str!` embeds
+/// them so `/research` and `/grill-me` work in a Project that has neither.
+const BUNDLED: &[(&str, &[(&str, &str)])] = &[
+    (
+        "research",
+        &[
+            (
+                "SKILL.md",
+                include_str!("../../../.smithy/skills/research/SKILL.md"),
+            ),
+            (
+                "snowball.md",
+                include_str!("../../../.smithy/skills/research/snowball.md"),
+            ),
+            (
+                "sift.md",
+                include_str!("../../../.smithy/skills/research/sift.md"),
+            ),
+            (
+                "ach.md",
+                include_str!("../../../.smithy/skills/research/ach.md"),
+            ),
+        ],
+    ),
+    (
+        "grill-me",
+        &[
+            (
+                "SKILL.md",
+                include_str!("../../../.smithy/skills/grill-me/SKILL.md"),
+            ),
+            (
+                "grilling.md",
+                include_str!("../../../.smithy/skills/grill-me/grilling.md"),
+            ),
+            (
+                "rust-first.md",
+                include_str!("../../../.smithy/skills/grill-me/rust-first.md"),
+            ),
+        ],
+    ),
+];
+
+fn bundled_skills() -> Vec<Skill> {
+    BUNDLED
+        .iter()
+        .filter_map(|(name, _)| bundled_skill(name))
+        .collect()
+}
+
+fn bundled_skill(name: &str) -> Option<Skill> {
+    let files = BUNDLED.iter().find(|(n, _)| *n == name)?.1;
+    let raw = files.iter().find(|(file, _)| *file == "SKILL.md")?.1;
+    let (meta, mut body) = parse_skill_md(raw, name).ok()?;
+    let extra = meta
+        .include
+        .iter()
+        .filter_map(|inc| {
+            let text = files.iter().find(|(file, _)| *file == inc)?.1;
+            Some(format!("# {inc}\n\n{}", text.trim()))
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if !extra.is_empty() {
+        body = format!("{}\n\n{extra}", body.trim_end());
+    }
+    Some(Skill {
+        meta,
+        body,
+        dir: PathBuf::from(format!("bundled:{name}")),
+    })
 }
 
 impl Skill {
@@ -217,18 +337,22 @@ impl Skill {
             .to_string();
         let (meta, body) = parse_skill_md(&raw, &fallback_name)?;
         let mut skill = Skill { meta, body, dir };
-        skill.splice_follow_ons();
+        skill.splice_includes();
         Ok(skill)
     }
 
-    /// Grill-me is three short files; a 27B will skip them if they are only `read`.
-    fn splice_follow_ons(&mut self) {
-        if self.meta.profile != ToolProfile::Grill {
+    fn splice_includes(&mut self) {
+        if self.meta.include.is_empty() {
             return;
         }
-        let extra = ["grilling.md", "rust-first.md"]
+        let extra = self
+            .meta
+            .include
             .iter()
-            .filter_map(|name| std::fs::read_to_string(self.dir.join(name)).ok())
+            .filter_map(|name| {
+                let text = std::fs::read_to_string(self.dir.join(name)).ok()?;
+                Some(format!("# {name}\n\n{}", text.trim()))
+            })
             .collect::<Vec<_>>()
             .join("\n\n");
         if !extra.is_empty() {
@@ -236,31 +360,9 @@ impl Skill {
         }
     }
 
-    pub fn system_prompt(&self, workspace: &Path) -> String {
-        let ws = workspace.display();
-        match self.meta.profile {
-            ToolProfile::Research => format!(
-                "{body}\n\n\
-                 Workspace root: {ws}\n\n\
-                 Write the note to `docs/research/YYYY-MM-DD-<slug>.md` through the `write` tool. \
-                 That call waits for Review; do not treat the file as landed until the tool \
-                 result says so. You have no `bash`, `edit`, or `explore`. Search, fetch, and \
-                 read; then write one note. Sequential — one model, not a swarm.",
-                body = self.body.trim()
-            ),
-            ToolProfile::Grill => format!(
-                "{body}\n\n\
-                 Workspace root: {ws}\n\n\
-                 Facts via `read`, `grep`, `explore`, `ls`, `glob`, `web_fetch`, `web_search`, \
-                 `symbol`. You cannot `write`, `edit`, or `bash` in this Session. When the \
-                 frontier is empty, wait for the user to confirm a shared understanding. They \
-                 will start a coding Session to implement.",
-                body = self.body.trim()
-            ),
-            ToolProfile::Coding => {
-                format!("{body}\n\nWorkspace root: {ws}", body = self.body.trim())
-            }
-        }
+    /// Body prefixed onto the current user message when `/name` is typed.
+    pub fn injection(&self) -> String {
+        format!("# Skill `{}`\n\n{}", self.meta.name, self.body.trim())
     }
 }
 
@@ -272,7 +374,9 @@ fn parse_skill_md(raw: &str, fallback_name: &str) -> Result<(SkillMeta, String),
                 name: fallback_name.to_string(),
                 description: String::new(),
                 argument_hint: String::new(),
-                profile: ToolProfile::from_name_hint(fallback_name),
+                tools: None,
+                include: Vec::new(),
+                max_seconds: None,
             },
             raw.trim().to_string(),
         ));
@@ -284,7 +388,9 @@ fn parse_skill_md(raw: &str, fallback_name: &str) -> Result<(SkillMeta, String),
     let mut name = fallback_name.to_string();
     let mut description = String::new();
     let mut argument_hint = String::new();
-    let mut profile = None;
+    let mut tools = None;
+    let mut include = Vec::new();
+    let mut max_seconds = None;
     for line in front.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -298,30 +404,47 @@ fn parse_skill_md(raw: &str, fallback_name: &str) -> Result<(SkillMeta, String),
             "name" => name = value,
             "description" => description = value,
             "argument-hint" => argument_hint = value,
-            "profile" => profile = Some(ToolProfile::parse(&value)),
+            "tools" => tools = parse_tools_field(&value),
+            "include" => include = parse_list(&value),
+            "max-seconds" => max_seconds = value.parse().ok(),
             _ => {}
         }
     }
-    let profile = profile.unwrap_or_else(|| ToolProfile::from_name_hint(&name));
     Ok((
         SkillMeta {
             name,
             description,
             argument_hint,
-            profile,
+            tools,
+            include,
+            max_seconds,
         },
         body.trim().to_string(),
     ))
 }
 
-impl ToolProfile {
-    fn from_name_hint(name: &str) -> Self {
-        match name {
-            "research" => Self::Research,
-            "grill-me" => Self::Grill,
-            _ => Self::Coding,
-        }
+/// `None` if the key is present but empty (treat as omitted). `Some([])` for `[]`.
+fn parse_tools_field(value: &str) -> Option<Vec<String>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
     }
+    Some(parse_list(trimmed))
+}
+
+fn parse_list(value: &str) -> Vec<String> {
+    let v = value
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim();
+    if v.is_empty() {
+        return Vec::new();
+    }
+    v.split(',')
+        .map(|s| unquote(s.trim()))
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 fn unquote(s: &str) -> String {
@@ -366,13 +489,33 @@ mod tests {
 
     #[test]
     fn frontmatter_fills_the_meta() {
-        let md = "---\nname: research\ndescription: Deep look\nargument-hint: \"The question\"\nprofile: research\n---\n\n# Hello\n";
+        let md = "---\nname: research\ndescription: Deep look\nargument-hint: \"The question\"\ntools: [read, write, web_search]\nmax-seconds: 7200\n---\n\n# Hello\n";
         let (meta, body) = parse_skill_md(md, "x").unwrap();
         assert_eq!(meta.name, "research");
         assert_eq!(meta.description, "Deep look");
         assert_eq!(meta.argument_hint, "The question");
-        assert_eq!(meta.profile, ToolProfile::Research);
+        assert_eq!(
+            meta.tools,
+            Some(vec!["read".into(), "write".into(), "web_search".into()])
+        );
+        assert_eq!(meta.max_seconds, Some(7200));
         assert!(body.contains("# Hello"));
+    }
+
+    #[test]
+    fn omitted_tools_means_coding_defaults() {
+        let md = "---\nname: notes\n---\n\nTake notes.\n";
+        let (meta, _) = parse_skill_md(md, "notes").unwrap();
+        assert_eq!(meta.tools, None);
+        assert!(meta.include.is_empty());
+        assert_eq!(meta.max_seconds, None);
+    }
+
+    #[test]
+    fn empty_tools_list_is_none_of_the_core_set() {
+        let md = "---\nname: silent\ntools: []\n---\n\nJust talk.\n";
+        let (meta, _) = parse_skill_md(md, "silent").unwrap();
+        assert_eq!(meta.tools, Some(Vec::new()));
     }
 
     #[test]
@@ -382,25 +525,23 @@ mod tests {
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(
             skill_dir.join("SKILL.md"),
-            "---\nname: research\ndescription: d\n---\n\nDo the work.\n",
+            "---\nname: research\ndescription: d\ntools: read, write\n---\n\nDo the work.\n",
         )
         .unwrap();
         let skill = load_skill(dir.path(), "research").expect("loaded");
-        assert_eq!(skill.meta.profile, ToolProfile::Research);
+        assert_eq!(skill.meta.tools, Some(vec!["read".into(), "write".into()]));
         assert!(skill.body.contains("Do the work"));
-        assert!(skill
-            .system_prompt(Path::new("/proj"))
-            .contains("docs/research"));
+        assert!(skill.injection().starts_with("# Skill `research`"));
     }
 
     #[test]
-    fn grill_splices_the_sibling_files() {
+    fn include_splices_sibling_files() {
         let dir = tempfile::tempdir().unwrap();
         let skill_dir = dir.path().join(".smithy/skills/grill-me");
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(
             skill_dir.join("SKILL.md"),
-            "---\nname: grill-me\nprofile: grill\n---\n\nRun a grilling session.\n",
+            "---\nname: grill-me\ninclude: grilling.md, rust-first.md\ntools: read, explore\n---\n\nRun a grilling session.\n",
         )
         .unwrap();
         std::fs::write(skill_dir.join("grilling.md"), "Ask the whole frontier.\n").unwrap();
@@ -410,11 +551,68 @@ mod tests {
         )
         .unwrap();
         let skill = load_skill(dir.path(), "grill-me").expect("loaded");
-        assert_eq!(skill.meta.profile, ToolProfile::Grill);
         assert!(skill.body.contains("Ask the whole frontier"));
         assert!(skill.body.contains("exclusively on rust"));
-        assert!(skill
-            .system_prompt(Path::new("/proj"))
-            .contains("cannot `write`"));
+        assert!(skill.injection().contains("# Skill `grill-me`"));
+    }
+
+    #[test]
+    fn a_third_skill_is_just_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join(".smithy/skills/domain-modeling");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: domain-modeling\ndescription: Sharpen the glossary.\n---\n\nUpdate CONTEXT.md.\n",
+        )
+        .unwrap();
+        let skill = load_skill(dir.path(), "domain-modeling").expect("loaded");
+        assert_eq!(skill.meta.tools, None);
+        assert!(skill.injection().contains("Update CONTEXT.md"));
+    }
+
+    #[test]
+    fn this_project_ships_research_and_grill_me() {
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest.parent().unwrap().parent().unwrap();
+        let names: Vec<String> = list_skills(root).into_iter().map(|m| m.name).collect();
+        assert!(names.iter().any(|n| n == "research"), "{names:?}");
+        assert!(names.iter().any(|n| n == "grill-me"), "{names:?}");
+    }
+
+    #[test]
+    fn research_and_grill_me_load_in_a_project_with_no_skills() {
+        let dir = tempfile::tempdir().unwrap();
+        let research = load_skill(dir.path(), "research").expect("bundled research");
+        assert_eq!(research.meta.name, "research");
+        assert!(
+            research.body.contains("Pinned question"),
+            "{}",
+            research.body
+        );
+        let grill = load_skill(dir.path(), "grill-me").expect("bundled grill-me");
+        assert_eq!(grill.meta.name, "grill-me");
+        assert!(grill.body.contains("Ask the whole frontier") || grill.body.contains("frontier"));
+        let names: Vec<String> = list_skills(dir.path())
+            .into_iter()
+            .map(|m| m.name)
+            .collect();
+        assert!(names.iter().any(|n| n == "research"), "{names:?}");
+        assert!(names.iter().any(|n| n == "grill-me"), "{names:?}");
+    }
+
+    #[test]
+    fn a_project_skill_still_overrides_the_shipped_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join(".smithy/skills/research");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: research\n---\n\nProject copy.\n",
+        )
+        .unwrap();
+        let skill = load_skill(dir.path(), "research").expect("project wins");
+        assert!(skill.body.contains("Project copy"));
+        assert!(!skill.body.contains("Pinned question"));
     }
 }

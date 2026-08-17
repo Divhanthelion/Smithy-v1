@@ -189,9 +189,7 @@ fn file_entry_view(
                     .border_radius(3.0)
                     .cursor(floem::style::CursorStyle::Pointer)
                     .hover(|s| s.color(design::ACCENT).background(design::BG_HOVER))
-                    .apply_if(is_parent_link, |s| {
-                        s.display(floem::taffy::Display::None)
-                    })
+                    .apply_if(is_parent_link, |s| s.display(floem::taffy::Display::None))
             }),
     ))
     .style(move |s| {

@@ -242,43 +242,43 @@ impl FileWatcher {
         })
     }
 
-    /// Start watching the root directory
+    /// Start watching the root directory.
+    ///
+    /// One recursive watch on the root, not a NonRecursive watch on every
+    /// directory. The old walk issued a syscall per folder and ran on the UI
+    /// thread during `app_view`, so a large Project (novernote) sat there for
+    /// minutes with the window still hidden. Filtering `target/` / `.git` /
+    /// gitignore is `should_process`, not "don't register the watch".
     pub fn start_watching(&mut self) -> notify::Result<()> {
-        // Walk directory tree, excluding hardcoded dirs
-        self.watch_directory_recursive(&self.root.clone())
+        // Seed before arming the watch: some backends emit a burst at
+        // subscribe time, and without the existence set those look like
+        // creations of files that were already here.
+        self.seed_known_paths(&self.root.clone());
+        self.watcher
+            .watch(&self.root.clone(), RecursiveMode::Recursive)
     }
 
-    fn watch_directory_recursive(&mut self, dir: &Path) -> notify::Result<()> {
-        // Watch this directory
-        self.watcher.watch(dir, RecursiveMode::NonRecursive)?;
-
-        // Recursively watch subdirectories, excluding hardcoded ones
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.filter_map(Result::ok) {
-                let path = entry.path();
-                if !path.is_dir() {
-                    // Seed the existence set, so the first event about a file
-                    // that was already here reads as a modification and not as
-                    // a creation.
-                    self.known_paths.insert(path.clone());
+    fn seed_known_paths(&mut self, dir: &Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                if path_is_excluded(&path) {
                     continue;
                 }
-                if path.is_dir() {
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        if !EXCLUDED_DIRS.contains(&name) {
-                            // Check gitignore
-                            let gitignore = self.gitignore.read().unwrap();
-                            if !gitignore.matched(&path, true).is_ignore() {
-                                drop(gitignore);
-                                self.watch_directory_recursive(&path)?;
-                            }
-                        }
-                    }
+                let ignored = {
+                    let gitignore = self.gitignore.read().unwrap();
+                    gitignore.matched(&path, true).is_ignore()
+                };
+                if !ignored {
+                    self.seed_known_paths(&path);
                 }
+                continue;
             }
+            self.known_paths.insert(path);
         }
-
-        Ok(())
     }
 
     /// Mark a file as open in the IDE (for external change detection)
@@ -332,8 +332,11 @@ impl FileWatcher {
         *self.gitignore.write().unwrap() = Self::build_gitignore(&self.root);
     }
 
-    /// Check if a path should be processed (not gitignored)
+    /// Check if a path should be processed (not gitignored, not a build tree)
     fn should_process(&self, path: &Path) -> bool {
+        if path_is_excluded(path) {
+            return false;
+        }
         let gitignore = self.gitignore.read().unwrap();
         !gitignore.matched(path, path.is_dir()).is_ignore()
     }
@@ -502,70 +505,101 @@ impl FileWatcherHandle {
     }
 }
 
-/// Create and run a file watcher in a background thread
+/// True when any path component is a directory we never want events from.
+fn path_is_excluded(path: &Path) -> bool {
+    path.components().any(|c| {
+        c.as_os_str()
+            .to_str()
+            .is_some_and(|name| EXCLUDED_DIRS.contains(&name))
+    })
+}
+
+/// Create and run a file watcher in a background thread.
+///
+/// Returns as soon as the channels exist. Building the gitignore matcher and
+/// walking the tree to seed known paths happens on the watcher thread — this
+/// used to run on the caller, which during launch is floem's UI thread, and
+/// a large Project made the window look like it had crashed (process up,
+/// nothing on screen).
 pub fn spawn_file_watcher(
     root: PathBuf,
 ) -> notify::Result<(FileWatcherHandle, Receiver<FileWatcherEvent>)> {
     let (command_tx, command_rx) = unbounded::<FileWatcherCommand>();
     let (event_tx, event_rx) = unbounded::<FileWatcherEvent>();
 
-    let mut watcher = FileWatcher::new(&root)?;
-    watcher.start_watching()?;
+    std::thread::Builder::new()
+        .name("smithy-file-watcher".into())
+        .spawn(move || {
+            let mut watcher = match FileWatcher::new(&root).and_then(|mut w| {
+                w.start_watching()?;
+                Ok(w)
+            }) {
+                Ok(w) => w,
+                Err(e) => {
+                    let _ = event_tx.send(FileWatcherEvent::Error(format!(
+                        "could not watch {}: {e}",
+                        root.display()
+                    )));
+                    return;
+                }
+            };
 
-    std::thread::spawn(move || {
-        loop {
-            // Process commands
-            while let Ok(cmd) = command_rx.try_recv() {
-                match cmd {
-                    FileWatcherCommand::FileOpened(path) => {
-                        watcher.mark_file_open(&path);
-                    }
-                    FileWatcherCommand::FileClosed(path) => {
-                        watcher.mark_file_closed(&path);
-                    }
-                    FileWatcherCommand::WatchDirectory(path) => {
-                        if let Err(e) = watcher.watcher.watch(&path, RecursiveMode::NonRecursive) {
-                            let _ = event_tx.send(FileWatcherEvent::Error(e.to_string()));
+            loop {
+                // Process commands
+                while let Ok(cmd) = command_rx.try_recv() {
+                    match cmd {
+                        FileWatcherCommand::FileOpened(path) => {
+                            watcher.mark_file_open(&path);
                         }
-                    }
-                    FileWatcherCommand::Rebase(root) => {
-                        // Replaced wholesale rather than re-pointed: the root,
-                        // the gitignore rules and the known-paths set all belong
-                        // to the old tree, and rebuilding is both simpler and
-                        // harder to get subtly wrong than unpicking three
-                        // pieces of state in place.
-                        match FileWatcher::new(&root).and_then(|mut fresh| {
-                            fresh.start_watching()?;
-                            Ok(fresh)
-                        }) {
-                            Ok(fresh) => watcher = fresh,
-                            Err(e) => {
-                                let _ = event_tx.send(FileWatcherEvent::Error(format!(
-                                    "could not watch {}: {e}",
-                                    root.display()
-                                )));
+                        FileWatcherCommand::FileClosed(path) => {
+                            watcher.mark_file_closed(&path);
+                        }
+                        FileWatcherCommand::WatchDirectory(path) => {
+                            if let Err(e) =
+                                watcher.watcher.watch(&path, RecursiveMode::NonRecursive)
+                            {
+                                let _ = event_tx.send(FileWatcherEvent::Error(e.to_string()));
                             }
                         }
-                    }
-                    FileWatcherCommand::RebuildGitignore => {
-                        watcher.rebuild_gitignore();
-                    }
-                    FileWatcherCommand::Shutdown => {
-                        return;
+                        FileWatcherCommand::Rebase(root) => {
+                            // Replaced wholesale rather than re-pointed: the root,
+                            // the gitignore rules and the known-paths set all belong
+                            // to the old tree, and rebuilding is both simpler and
+                            // harder to get subtly wrong than unpicking three
+                            // pieces of state in place.
+                            match FileWatcher::new(&root).and_then(|mut fresh| {
+                                fresh.start_watching()?;
+                                Ok(fresh)
+                            }) {
+                                Ok(fresh) => watcher = fresh,
+                                Err(e) => {
+                                    let _ = event_tx.send(FileWatcherEvent::Error(format!(
+                                        "could not watch {}: {e}",
+                                        root.display()
+                                    )));
+                                }
+                            }
+                        }
+                        FileWatcherCommand::RebuildGitignore => {
+                            watcher.rebuild_gitignore();
+                        }
+                        FileWatcherCommand::Shutdown => {
+                            return;
+                        }
                     }
                 }
-            }
 
-            // Process file events
-            let changes = watcher.process_events();
-            if !changes.is_empty() {
-                let _ = event_tx.send(FileWatcherEvent::Changes(changes));
-            }
+                // Process file events
+                let changes = watcher.process_events();
+                if !changes.is_empty() {
+                    let _ = event_tx.send(FileWatcherEvent::Changes(changes));
+                }
 
-            // Small sleep to avoid busy-waiting
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    });
+                // Small sleep to avoid busy-waiting
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        })
+        .expect("file watcher thread");
 
     let handle = FileWatcherHandle::new(command_tx);
     Ok((handle, event_rx))
@@ -580,6 +614,14 @@ mod tests {
         assert!(EXCLUDED_DIRS.contains(&"node_modules"));
         assert!(EXCLUDED_DIRS.contains(&"target"));
         assert!(EXCLUDED_DIRS.contains(&".git"));
+    }
+
+    #[test]
+    fn cargo_target_and_git_are_excluded_from_event_processing() {
+        assert!(path_is_excluded(Path::new("/proj/target/debug/foo.rlib")));
+        assert!(path_is_excluded(Path::new("/proj/.git/index")));
+        assert!(path_is_excluded(Path::new("/proj/node_modules/left-pad")));
+        assert!(!path_is_excluded(Path::new("/proj/src/main.rs")));
     }
 
     #[test]

@@ -73,7 +73,7 @@ pub enum KeySource {
 pub struct WebSearch {
     http: reqwest::Client,
     key: KeySource,
-    /// Research Sessions must not reuse the coding "two or three is enough" line.
+    /// Skills that list `web_search` skip the coding "two or three is enough" line.
     research: bool,
 }
 

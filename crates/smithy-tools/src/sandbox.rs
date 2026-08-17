@@ -342,6 +342,186 @@ fn catastrophic_recursive_delete(normalized: &str) -> Option<String> {
     None
 }
 
+/// Whether a shell command names a path outside the project.
+///
+/// YOLO uses this so `bash` that stays *down* in the Project can run without a
+/// prompt, while `cd ..`, `../sibling`, `~/...`, and `/etc/...` still ask.
+///
+/// It is a lexical read of the command string — the same class of speed-bump as
+/// [`check_bash`]. A one-liner that builds a path at runtime will not be seen.
+/// Those still hit the approval prompt only if this function returns true; the
+/// prompt remains the boundary.
+pub fn command_leaves_project(command: &str, root: &Path) -> bool {
+    for token in shell_tokens(command) {
+        if token_leaves_project(&token, root) {
+            return true;
+        }
+    }
+    for fragment in parent_path_fragments(command) {
+        if path_leaves_project(&fragment, root) {
+            return true;
+        }
+    }
+    for fragment in absolute_path_fragments(command) {
+        if path_leaves_project(fragment, root) {
+            return true;
+        }
+    }
+    false
+}
+
+fn shell_tokens(command: &str) -> Vec<String> {
+    command
+        .replace(['\n', '\r', ';', '|', '&', '<', '>', '(', ')', '`'], " ")
+        .split_whitespace()
+        .map(|t| t.trim_matches(|c| c == '"' || c == '\'').to_string())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+fn token_leaves_project(token: &str, root: &Path) -> bool {
+    if token.starts_with('-') && !token.contains('/') && !token.contains("..") {
+        return false;
+    }
+    if looks_like_home(token) || token == ".." || token.contains('/') || token.contains('\\') {
+        return path_leaves_project(token, root);
+    }
+    false
+}
+
+fn looks_like_home(token: &str) -> bool {
+    token == "~"
+        || token.starts_with("~/")
+        || token.starts_with("~\\")
+        || token == "$HOME"
+        || token == "${HOME}"
+        || token.starts_with("$HOME/")
+        || token.starts_with("${HOME}/")
+}
+
+fn expand_home(path: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    if home.is_empty() {
+        return path.to_string();
+    }
+    if path == "~" || path == "$HOME" || path == "${HOME}" {
+        return home;
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        return format!("{home}/{rest}");
+    }
+    if let Some(rest) = path.strip_prefix("$HOME/") {
+        return format!("{home}/{rest}");
+    }
+    if let Some(rest) = path.strip_prefix("${HOME}/") {
+        return format!("{home}/{rest}");
+    }
+    path.to_string()
+}
+
+fn path_leaves_project(path: &str, root: &Path) -> bool {
+    let expanded = expand_home(path);
+    if looks_like_home(path) && std::env::var("HOME").map(|h| h.is_empty()).unwrap_or(true) {
+        // Cannot resolve home; fail closed and ask.
+        return true;
+    }
+    let raw = Path::new(&expanded);
+    let candidate = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        root.join(raw)
+    };
+    match lexical_normalize(&candidate) {
+        Ok(normalized) => normalized.strip_prefix(root).is_err(),
+        Err(_) => true,
+    }
+}
+
+fn is_path_char(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(
+            c,
+            '.' | '_' | '-' | '/' | '\\' | '+' | '%' | '@' | '~' | '$' | '{' | '}'
+        )
+}
+
+fn is_parent_boundary(c: Option<char>) -> bool {
+    match c {
+        None => true,
+        Some(c) => !is_path_char(c) || c == '/' || c == '\\',
+    }
+}
+
+/// Paths that contain a `..` component, including those buried in quotes
+/// (`open("../x")`).
+fn parent_path_fragments(command: &str) -> Vec<String> {
+    let chars: Vec<(usize, char)> = command.char_indices().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 1 < chars.len() {
+        if chars[i].1 == '.' && chars[i + 1].1 == '.' {
+            let prev = (i > 0).then(|| chars[i - 1].1);
+            let next = chars.get(i + 2).map(|c| c.1);
+            if is_parent_boundary(prev) && is_parent_boundary(next) {
+                let mut lo = i;
+                while lo > 0 && is_path_char(chars[lo - 1].1) {
+                    lo -= 1;
+                }
+                let mut hi = i + 2;
+                while hi < chars.len() && is_path_char(chars[hi].1) {
+                    hi += 1;
+                }
+                let start = chars[lo].0;
+                let end = if hi < chars.len() {
+                    chars[hi].0
+                } else {
+                    command.len()
+                };
+                out.push(command[start..end].to_string());
+                i = hi;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Absolute paths that start at a `/` after a non-path character, so
+/// `open("/tmp/x")` is seen and `https://example.com/foo` is not.
+fn absolute_path_fragments(command: &str) -> Vec<&str> {
+    let chars: Vec<(usize, char)> = command.char_indices().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].1 == '/' {
+            let prev = (i > 0).then(|| chars[i - 1].1);
+            let next = chars.get(i + 1).map(|c| c.1);
+            let starts = match prev {
+                None => true,
+                Some(c) => !is_path_char(c),
+            };
+            if starts && next != Some('/') {
+                let begin = chars[i].0;
+                let mut hi = i + 1;
+                while hi < chars.len() && is_path_char(chars[hi].1) {
+                    hi += 1;
+                }
+                let end = if hi < chars.len() {
+                    chars[hi].0
+                } else {
+                    command.len()
+                };
+                out.push(&command[begin..end]);
+                i = hi;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,5 +651,55 @@ mod tests {
         assert!(check_bash("cargo test").is_ok());
         assert!(check_bash("ls -la && grep foo src/*.rs").is_ok());
         assert!(check_bash("git status").is_ok());
+    }
+
+    fn project() -> &'static Path {
+        Path::new("/tmp/smithy-proj")
+    }
+
+    #[test]
+    fn in_project_commands_do_not_leave() {
+        let root = project();
+        assert!(!command_leaves_project("cargo test", root));
+        assert!(!command_leaves_project("ls src/main.rs", root));
+        assert!(!command_leaves_project("rm -rf target", root));
+        assert!(!command_leaves_project("echo hi > src/out.txt", root));
+        assert!(!command_leaves_project("cat src/../src/main.rs", root));
+        assert!(!command_leaves_project(
+            "cat /tmp/smithy-proj/src/main.rs",
+            root
+        ));
+    }
+
+    #[test]
+    fn up_and_over_commands_leave() {
+        let root = project();
+        assert!(command_leaves_project("cd ..", root));
+        assert!(command_leaves_project("cd .. && ls", root));
+        assert!(command_leaves_project("echo x > ../out.txt", root));
+        assert!(command_leaves_project("rm ../secret", root));
+        assert!(command_leaves_project("cat /etc/hosts", root));
+        assert!(command_leaves_project(
+            "python -c 'open(\"../x\",\"w\")'",
+            root
+        ));
+        assert!(command_leaves_project(
+            "python -c 'open(\"/tmp/x\",\"w\")'",
+            root
+        ));
+    }
+
+    #[test]
+    fn home_paths_leave_unless_the_project_is_home() {
+        let root = project();
+        assert!(command_leaves_project("cat ~/.bashrc", root));
+        assert!(command_leaves_project("cat $HOME/.bashrc", root));
+        let home = std::env::var("HOME").unwrap_or_default();
+        if !home.is_empty() {
+            assert!(
+                !command_leaves_project("cat ~/.bashrc", Path::new(&home)),
+                "opening ~ as the Project must not trip YOLO"
+            );
+        }
     }
 }

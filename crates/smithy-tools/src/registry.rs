@@ -245,6 +245,15 @@ impl Registry {
         self.tools.iter().map(|t| t.name()).collect()
     }
 
+    /// Keep only the named tools. Unknown names are ignored; hooks are unchanged.
+    ///
+    /// Used when a Session is rebuilt with a Skill `tools:` allowlist, and when
+    /// resume replays a frozen OpenAI tool list. Callers reinstall hooks after
+    /// filtering so bash and write-review still match what remains.
+    pub fn retain_named(&mut self, names: &[String]) {
+        self.tools.retain(|t| names.iter().any(|n| n == t.name()));
+    }
+
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.tools.iter().map(|t| t.definition()).collect()
     }
@@ -508,6 +517,13 @@ mod tests {
             Registry::core().names(),
             vec!["read", "write", "edit", "ls", "glob", "grep", "bash", "todo"]
         );
+    }
+
+    #[test]
+    fn retain_named_drops_everything_not_on_the_list() {
+        let mut reg = Registry::core();
+        reg.retain_named(&["read".into(), "grep".into()]);
+        assert_eq!(reg.names(), vec!["read", "grep"]);
     }
 
     #[test]

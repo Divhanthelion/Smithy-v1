@@ -315,7 +315,10 @@ pub fn materialize(
                 ));
             }
             Err(e) => {
-                out.push_str(&format!("- `{}` could not be read: {e}\n", attachment.display));
+                out.push_str(&format!(
+                    "- `{}` could not be read: {e}\n",
+                    attachment.display
+                ));
             }
         }
     }

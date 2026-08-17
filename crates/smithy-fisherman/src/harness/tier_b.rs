@@ -12,9 +12,7 @@ use crate::fisherman::{
 };
 use crate::routine::{Doing, Place};
 
-use super::raster::{
-    is_bg, is_lamp_warm, is_rim, luminance, render_scene, STEEL_BODY,
-};
+use super::raster::{is_bg, is_lamp_warm, is_rim, luminance, render_scene, STEEL_BODY};
 use super::report::CheckResult;
 use super::{height, launched_built, BAND, DAY, SUNRISE, SUNSET, WIDTH};
 
@@ -143,7 +141,7 @@ fn fire_where_fire_is() -> CheckResult {
     // the doorstep reads as a decal" — the comment at paint's fire_base is
     // the assertion. Tagged, not coloured: the part mask is exact.
     let scene = sample(18.5, launched_built(), 40); // cooking at the fire
-    // Force Cooking/Fire if the clock landed elsewhere (cigarette overlay).
+                                                    // Force Cooking/Fire if the clock landed elsewhere (cigarette overlay).
     let scene = Scene {
         doing: Doing::Cooking,
         place: Place::Fire,
@@ -202,7 +200,9 @@ fn fire_where_fire_is() -> CheckResult {
         pass,
         measured: frac,
         threshold: Some(MIN_IN_FRAC),
-        detail: format!("{fire_in}/{fire_total} Fire-tagged pixels inside pit bbox (frac {frac:.3})"),
+        detail: format!(
+            "{fire_in}/{fire_total} Fire-tagged pixels inside pit bbox (frac {frac:.3})"
+        ),
         flips: vec![],
     }
 }
@@ -283,12 +283,7 @@ fn light_agrees() -> CheckResult {
         seconds: 12.0,
         ..asleep
     };
-    let door2 = door_openness(
-        asleep.doing,
-        asleep.place,
-        asleep.previous,
-        asleep.progress,
-    );
+    let door2 = door_openness(asleep.doing, asleep.place, asleep.previous, asleep.progress);
     let glow2 = door_glow(
         window_light(asleep.doing, asleep.place, asleep.progress),
         door2,

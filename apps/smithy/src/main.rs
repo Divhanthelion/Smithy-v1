@@ -7,14 +7,16 @@ use floem::peniko::Color;
 use floem::prelude::*;
 
 use smithy_editor::{
-    catppuccin, diff_modal, file_browser_view, main_layout_view, spawn_file_watcher, FileDiff,
-    FileWatcherEvent, IdeFileChange,
+    catppuccin, diff_modal, file_browser_view, main_layout_view, session_history_view,
+    sidebar_mode_bar, spawn_file_watcher, FileDiff, FileWatcherEvent, IdeFileChange, SidebarTab,
 };
 
 mod agent;
 mod app_state;
 mod call_graph;
 mod editor;
+#[cfg(target_os = "macos")]
+mod macos;
 mod meters;
 mod runtime;
 mod settings;
@@ -84,6 +86,16 @@ fn install_signal_handler(hooks: ExitHooks) {
 
 /// Main application entry point
 fn main() {
+    let default_panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        eprintln!("Smithy panic: {info}");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        default_panic(info);
+    }));
+
+    #[cfg(target_os = "macos")]
+    macos::prefer_metal_backend();
+
     // Log runtime configuration
     let info = runtime::runtime_info();
     eprintln!(
@@ -92,14 +104,34 @@ fn main() {
     );
     eprintln!("Set {}=<n> to configure worker threads", info.env_var);
 
-    // Create the Floem application with the main view and set window title
-    let config = floem::window::WindowConfig::default().title("Smithy");
-    floem::Application::new()
-        .window(|_| app_view(), Some(config))
-        .run();
+    // Size and origin are explicit because Floem otherwise creates a hidden
+    // window at a platform default, and macOS will happily restore that frame
+    // onto a display that is no longer connected. 80,48 is below the menu bar
+    // on the primary display.
+    let config = floem::window::WindowConfig::default()
+        .title("Smithy")
+        .size(floem::peniko::kurbo::Size::new(1440.0, 900.0))
+        .position(floem::peniko::kurbo::Point::new(80.0, 48.0));
+
+    let app = floem::Application::new();
+    #[cfg(target_os = "macos")]
+    let app = app.on_event(macos::handle_app_event);
+    app.window(
+        |_| {
+            eprintln!("Smithy: building window…");
+            let view = app_view();
+            eprintln!("Smithy: window ready (GPU still has to answer before it is shown)");
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+            view
+        },
+        Some(config),
+    )
+    .run();
 
     // The window closed normally. The signal path exits the process itself, so
     // reaching here means `run()` returned and the hooks have not fired.
+    eprintln!("Smithy: event loop ended");
+    let _ = std::io::Write::flush(&mut std::io::stderr());
     smithy_editor::kill_all_shells();
 }
 
@@ -528,10 +560,52 @@ fn app_view() -> impl IntoView {
     let file_browser = file_browser_view(
         file_browser_state,
         agent_state.file_browser_refresh,
-        on_file_open,
+        on_file_open.clone(),
         on_add_to_context,
         move || sidebar_for_hide.set(false),
     );
+
+    let sidebar_tab = signals.sidebar_tab;
+    let history_panel = {
+        let agent = agent_state.clone();
+        let open_file = on_file_open.clone();
+        let on_resume = {
+            let agent = agent.clone();
+            move |id: String| app_state::resume_session(&agent, &id)
+        };
+        let on_log = {
+            let agent = agent.clone();
+            move |id: String| {
+                if let Some(path) = app_state::session_log_path(&agent, &id) {
+                    open_file(path);
+                }
+            }
+        };
+        let on_delete = {
+            let agent = agent.clone();
+            move |id: String| app_state::delete_stored_session(&agent, &id)
+        };
+        session_history_view(agent.session_list, on_resume, on_log, on_delete)
+    };
+    let hide_sidebar = signals.sidebar_visible;
+    let sidebar = Stack::vertical((
+        sidebar_mode_bar(sidebar_tab, move || hide_sidebar.set(false)),
+        Container::new(file_browser).style(move |s| {
+            if sidebar_tab.get() == SidebarTab::Files {
+                s.flex_grow(1.0).width_full().min_height(0.0)
+            } else {
+                s.display(floem::style::Display::None)
+            }
+        }),
+        Container::new(history_panel).style(move |s| {
+            if sidebar_tab.get() == SidebarTab::History {
+                s.flex_grow(1.0).width_full().min_height(0.0)
+            } else {
+                s.display(floem::style::Display::None)
+            }
+        }),
+    ))
+    .style(|s| s.width_full().height_full().flex_col());
 
     // Create tab handlers
     let on_tab_click = {
@@ -901,6 +975,14 @@ fn app_view() -> impl IntoView {
                     smithy_editor::accel("B"),
                     signals.sidebar_visible,
                 ),
+                smithy_editor::MenuItem::action("Session history", {
+                    let visible = signals.sidebar_visible;
+                    let tab = signals.sidebar_tab;
+                    move || {
+                        visible.set(true);
+                        tab.set(SidebarTab::History);
+                    }
+                }),
                 smithy_editor::MenuItem::toggle_with(
                     "Agent",
                     smithy_editor::accel("L"),
@@ -1014,7 +1096,7 @@ fn app_view() -> impl IntoView {
         signals.sidebar_visible,
         signals.terminal_visible,
         signals.agent_visible,
-        file_browser,
+        sidebar,
         editor_view,
         terminal_view,
         agent_view,
@@ -1608,7 +1690,7 @@ fn switch_project(agent: &app_state::AgentState, root: std::path::PathBuf) {
     agent.panel.project_root.set(project.root.clone());
     *agent.pending_task.borrow_mut() = None;
     *agent.pending_skill.borrow_mut() = None;
-    agent.session_kind.set(smithy_agent::SessionKind::Coding);
+    agent.session_skill.set(None);
     // The map behind an empty editor belongs to the project, so it moves too.
     agent.project_map.set(String::new());
     refresh_project_map(agent, agent.project_map);

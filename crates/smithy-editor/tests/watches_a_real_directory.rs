@@ -75,6 +75,27 @@ fn file_name(path: &std::path::Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+/// Spawn used to walk every directory on the caller. During launch that caller
+/// is the UI thread, so a large Project made the window look crashed. Returning
+/// in milliseconds against a tree that would take far longer to watch
+/// directory-by-directory is the regression.
+#[test]
+fn spawn_returns_before_the_tree_is_walked() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for i in 0..80 {
+        let nested = dir.path().join(format!("d{i}")).join("inner");
+        std::fs::create_dir_all(&nested).expect("dirs");
+        std::fs::write(nested.join("f.txt"), "x").expect("file");
+    }
+    let start = Instant::now();
+    let (_handle, _rx) = spawn_file_watcher(dir.path().to_path_buf()).expect("spawn");
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "spawn blocked on the watch/walk ({elapsed:?}) — that is the no-window hang"
+    );
+}
+
 /// Whether any change concerns `name`.
 fn touches(changes: &[IdeFileChange], name: &str) -> bool {
     changes.iter().any(|c| match c {

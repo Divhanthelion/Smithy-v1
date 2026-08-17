@@ -10,19 +10,33 @@
 //! - **Tool steps are one line each until you need more.** An agent turn can be
 //!   twenty tool calls; rendering each as a paragraph buries the answer. Each
 //!   step is a single row — glyph, name, one-line argument summary — and its
-//!   output only appears when it failed or when you expand it.
+//!   output only appears when it failed or when you expand it. Three or more
+//!   consecutive steps collapse into one expandable batch so the answer is not
+//!   pushed off the screen.
 //! - **Reasoning is visually subordinate to the answer.** It's dimmed and
 //!   italicised, because it is context for the answer rather than the answer.
 //! - **The budget is always visible.** Prefill cost grows superlinearly with
 //!   context, so knowing you are at 40k rather than 4k explains why a turn got
 //!   slow. A thin bar costs almost no space and answers that question.
 
+use std::collections::HashMap;
+use std::time::Duration;
+
+use floem::peniko::kurbo::Point;
 use floem::peniko::Color;
 use floem::prelude::*;
-use floem::reactive::{Memo, RwSignal, SignalGet, SignalUpdate};
+use floem::reactive::{Effect, Memo, RwSignal, SignalGet, SignalUpdate};
 use floem::style::CustomStylable;
+use floem::text::{Attrs, AttrsList, FamilyOwned, FontStyle, FontWeight, LineHeightValue};
 
+use crate::markdown::{self, Block, Inline};
 use crate::theme::catppuccin;
+
+/// Consecutive Steps at or above this count share one expandable row.
+const BATCH_MIN: usize = 3;
+const MONO_FAM: [FamilyOwned; 1] = [FamilyOwned::Monospace];
+/// Far enough that [`Scroll::scroll_to`] clamps to the live edge.
+const SCROLL_BOTTOM: Point = Point::new(0.0, 1_000_000.0);
 
 /// One entry in the transcript.
 #[derive(Debug, Clone, PartialEq)]
@@ -151,6 +165,8 @@ pub struct AgentPanelState {
     pub last_request: RwSignal<Option<String>>,
     /// Skills for the `/` picker.
     pub skills: RwSignal<Vec<SkillPick>>,
+    /// Highlighted row in the `/` picker. Tab inserts it; arrows move it.
+    pub skill_cursor: RwSignal<usize>,
     /// What the model was told about the project, e.g.
     /// "layout, dependencies, modules, public API · ~6000 tokens".
     pub context_label: RwSignal<String>,
@@ -162,6 +178,13 @@ pub struct AgentPanelState {
     pub connected: RwSignal<bool>,
     /// Which step indices are expanded.
     pub expanded: RwSignal<Vec<usize>>,
+    /// Explicit open/closed for a Step batch, keyed by the first Step's index.
+    /// Missing means the default: open while any Step is running or failed,
+    /// closed once they have all succeeded.
+    pub batch_open: RwSignal<HashMap<usize, bool>>,
+    /// Stick the transcript to the live edge. Set when a Turn starts; cleared
+    /// when the user scrolls the transcript themselves.
+    pub follow_scroll: RwSignal<bool>,
     /// Files the user dropped, waiting to go out with the next message.
     ///
     /// Cleared on send rather than accumulating: an attachment is part of one
@@ -202,10 +225,13 @@ impl AgentPanelState {
             inspect_segments: RwSignal::new(Vec::new()),
             last_request: RwSignal::new(None),
             skills: RwSignal::new(Vec::new()),
+            skill_cursor: RwSignal::new(0),
             context_label: RwSignal::new(String::new()),
             context_usage: RwSignal::new(None),
             connected: RwSignal::new(false),
             expanded: RwSignal::new(Vec::new()),
+            batch_open: RwSignal::new(HashMap::new()),
+            follow_scroll: RwSignal::new(true),
             attachments: RwSignal::new(Vec::new()),
             drop_active: RwSignal::new(false),
             auto_approve: RwSignal::new(false),
@@ -225,7 +251,8 @@ impl AgentPanelState {
     }
 
     pub fn remove_attachment(&self, path: &std::path::Path) {
-        self.attachments.update(|list| list.retain(|a| a.path != path));
+        self.attachments
+            .update(|list| list.retain(|a| a.path != path));
     }
 
     pub fn toggle_attachment(&self, path: &std::path::Path) {
@@ -284,6 +311,9 @@ impl AgentPanelState {
         self.last_stop.set(None);
         self.inspect_segments.set(Vec::new());
         self.last_request.set(None);
+        self.expanded.set(Vec::new());
+        self.batch_open.set(HashMap::new());
+        self.follow_scroll.set(true);
     }
 }
 
@@ -385,28 +415,55 @@ pub fn agent_panel(
     // How the microphone's shortcut is written, for the hint beside it.
     hotkey: String,
 ) -> impl IntoView {
+    // Re-pin when a Turn starts. The user taking over the scrollbar is the
+    // only thing that unpins, and that must not survive into the next Turn.
+    Effect::new(move |_| {
+        if state.busy.get() {
+            state.follow_scroll.set(true);
+        }
+    });
+
     // The whole panel is the drop target, not just the composer. Aiming at a
     // text field while holding a drag is fiddly, and there is nothing else you
     // could mean by dropping a file on the agent.
+    let transcript_scroll = floem::views::scroll::Scroll::new(
+        Stack::vertical((transcript(state), live_activity(state)))
+            .style(|s| s.width_full().min_width(0.0).padding(10.0).gap(2.0)),
+    )
+    .scroll_to(move || {
+        let following = state.follow_scroll.get();
+        let _ = state.entries.get();
+        let _ = state.streaming_answer.get();
+        let _ = state.streaming_reasoning.get();
+        if following {
+            Some(SCROLL_BOTTOM)
+        } else {
+            None
+        }
+    })
+    .on_event(floem::event::listener::PointerWheel, move |_, _| {
+        state.follow_scroll.set(false);
+        floem::event::EventPropagation::Continue
+    })
+    .custom_style(|s: floem::views::scroll::ScrollCustomStyle| {
+        s.hide_bars(false)
+            .handle_background(catppuccin::SURFACE1)
+            .handle_border_radius(4.0)
+    })
+    .style(|s| {
+        s.flex_grow(1.0)
+            .flex_basis(0.0)
+            .width_full()
+            .min_height(0.0)
+            // Without this the transcript is as wide as its widest line
+            // and the panel stretches to match — see the note in
+            // `main_layout`'s chat container.
+            .min_width(0.0)
+    });
+
     let panel = Stack::vertical((
         header(state, on_close, on_reconnect, on_settings, on_clear_context),
-        floem::views::scroll::Scroll::new(transcript(state))
-            .custom_style(|s: floem::views::scroll::ScrollCustomStyle| {
-                s.hide_bars(false)
-                    .handle_background(catppuccin::SURFACE1)
-                    .handle_border_radius(4.0)
-            })
-            .style(|s| {
-                s.flex_grow(1.0)
-                    .flex_basis(0.0)
-                    .width_full()
-                    .min_height(0.0)
-                    // Without this the transcript is as wide as its widest line
-                    // and the panel stretches to match — see the note in
-                    // `main_layout`'s chat container.
-                    .min_width(0.0)
-            }),
-        live_activity(state),
+        transcript_scroll,
         budget_bar(state, on_inspect),
         attachment_row(state),
         composer(state, on_send, on_stop, on_voice, hotkey),
@@ -445,25 +502,52 @@ pub fn agent_panel(
     // the platform does not always send a Leave after a Drop — an outline that
     // stayed lit over a panel with nothing being dragged would be worse than no
     // outline at all.
+    //
+    // A macOS screenshot thumbnail often fires Enter and then nothing else —
+    // no Leave, no Drop — so the outline would stick forever. A short timer
+    // and a click both clear it; a real drag that lasts longer still drops,
+    // because drop_active is only the outline.
+    let drop_epoch = RwSignal::new(0u64);
+    let arm_drop_timeout = move || {
+        let epoch = drop_epoch.get_untracked() + 1;
+        drop_epoch.set(epoch);
+        floem::action::exec_after(Duration::from_millis(1500), move |_| {
+            if drop_epoch.get_untracked() == epoch {
+                state.drop_active.set(false);
+            }
+        });
+    };
+    let cancel_drop = move || {
+        drop_epoch.update(|e| *e = e.wrapping_add(1));
+        state.drop_active.set(false);
+    };
+
     Stack::new((
         panel.style(|s| s.width_full().height_full().min_width(0.0)),
         drop_overlay(state),
     ))
     .on_event_stop(floem::event::listener::FileDragEnter, move |_, _| {
-        state.drop_active.set(true)
+        state.drop_active.set(true);
+        arm_drop_timeout();
     })
     .on_event_stop(floem::event::listener::FileDragLeave, move |_, _| {
-        state.drop_active.set(false)
+        cancel_drop();
     })
     .on_event_stop(floem::event::listener::FileDragDrop, move |_, event| {
-        state.drop_active.set(false);
+        cancel_drop();
         state.attach(&event.paths);
+    })
+    .on_event(floem::event::listener::PointerDown, move |_, _| {
+        if state.drop_active.get_untracked() {
+            cancel_drop();
+        }
+        floem::event::EventPropagation::Continue
     })
     .on_event(floem::event::listener::KeyDown, move |_, ev| {
         if state.drop_active.get_untracked()
             && ev.key == floem::prelude::Key::Named(floem::prelude::NamedKey::Escape)
         {
-            state.drop_active.set(false);
+            cancel_drop();
             floem::event::EventPropagation::Stop
         } else {
             floem::event::EventPropagation::Continue
@@ -516,8 +600,12 @@ fn header(
                 })
                 .margin_right(5.0)
         }),
-        Label::derived(move || state.model_label.get())
-            .style(|s| nowrap(s).color(catppuccin::OVERLAY1).font_size(11.0).min_width(0.0)),
+        Label::derived(move || state.model_label.get()).style(|s| {
+            nowrap(s)
+                .color(catppuccin::OVERLAY1)
+                .font_size(11.0)
+                .min_width(0.0)
+        }),
         // Plain text, not a glyph: this appears exactly when something is
         // already wrong, which is the worst moment to discover a missing-glyph
         // box. See `design::glyph` on why that is a live hazard here.
@@ -560,14 +648,15 @@ fn header(
         // Always available, never hidden behind a full context bar. A session
         // restored at launch reports zero tokens until its first turn while
         // remembering everything, which is precisely when you want this.
-        // Off by default, and it says which it is rather than only what it
-        // would become — a toggle that reads "Auto-approve" gives you no way to
-        // tell whether edits are currently being gated.
+        // Off by default. YOLO skips Review for in-Project writes and skips the
+        // shell prompt for `bash` that stays down in the Project. A command that
+        // goes up or over still asks. The label says which state you are in,
+        // not which state a click would produce.
         Label::derived(move || {
             if state.auto_approve.get() {
-                format!("{} edits land directly", crate::design::glyph::WARN)
+                format!("{} YOLO", crate::design::glyph::WARN)
             } else {
-                format!("{} edits reviewed", crate::design::glyph::OK)
+                format!("{} reviewed", crate::design::glyph::OK)
             }
         })
         .on_event_stop(floem::event::listener::Click, move |_, _| {
@@ -590,7 +679,9 @@ fn header(
                 .hover(|s| s.background(catppuccin::SURFACE0))
         }),
         Label::derived(|| "New session".to_string())
-            .on_event_stop(floem::event::listener::Click, move |_, _| on_clear_context())
+            .on_event_stop(floem::event::listener::Click, move |_, _| {
+                on_clear_context()
+            })
             .style(move |s| {
                 nowrap(s)
                     .color(catppuccin::OVERLAY1)
@@ -663,19 +754,122 @@ fn icon_button(
         .style(move |s| s.apply_if(tip.is_empty(), |s| s))
 }
 
+#[derive(Clone, Debug)]
+enum TranscriptRow {
+    One {
+        index: usize,
+        entry: Entry,
+    },
+    Batch {
+        start: usize,
+        steps: Vec<BatchedStep>,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct BatchedStep {
+    index: usize,
+    step: usize,
+    name: String,
+    summary: String,
+    status: StepStatus,
+    detail: String,
+}
+
+fn batched_step(index: usize, entry: &Entry) -> Option<BatchedStep> {
+    match entry {
+        Entry::Step {
+            step,
+            name,
+            summary,
+            status,
+            detail,
+            ..
+        } => Some(BatchedStep {
+            index,
+            step: *step,
+            name: name.clone(),
+            summary: summary.clone(),
+            status: *status,
+            detail: detail.clone(),
+        }),
+        _ => None,
+    }
+}
+
+fn group_entries(entries: &[Entry]) -> Vec<TranscriptRow> {
+    let mut rows = Vec::new();
+    let mut i = 0;
+    while i < entries.len() {
+        if matches!(entries[i], Entry::Step { .. }) {
+            let start = i;
+            while i < entries.len() && matches!(entries[i], Entry::Step { .. }) {
+                i += 1;
+            }
+            if i - start >= BATCH_MIN {
+                let steps = entries[start..i]
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(offset, entry)| batched_step(start + offset, entry))
+                    .collect();
+                rows.push(TranscriptRow::Batch { start, steps });
+            } else {
+                for (index, entry) in entries.iter().enumerate().take(i).skip(start) {
+                    rows.push(TranscriptRow::One {
+                        index,
+                        entry: entry.clone(),
+                    });
+                }
+            }
+        } else {
+            rows.push(TranscriptRow::One {
+                index: i,
+                entry: entries[i].clone(),
+            });
+            i += 1;
+        }
+    }
+    rows
+}
+
+fn row_key(row: &TranscriptRow) -> String {
+    match row {
+        TranscriptRow::One { index, entry } => match entry {
+            Entry::Step {
+                id, status, detail, ..
+            } => format!("s{index}:{id}:{status:?}:{}", detail.len()),
+            _ => format!("e{index}"),
+        },
+        TranscriptRow::Batch { start, steps } => {
+            let fp: String = steps
+                .iter()
+                .map(|s| format!("{}{:?}{}", s.index, s.status, s.detail.len()))
+                .collect();
+            format!("b{start}:{}:{fp}", steps.len())
+        }
+    }
+}
+
 fn transcript(state: AgentPanelState) -> impl IntoView {
     dyn_stack(
-        move || state.entries.get().into_iter().enumerate(),
-        |(i, _)| *i,
-        move |(index, entry)| entry_view(state, index, entry),
+        move || group_entries(&state.entries.get()).into_iter(),
+        row_key,
+        move |row| row_view(state, row),
     )
-    .style(|s| s.flex_col().width_full().padding(10.0).gap(2.0))
+    .style(|s| s.flex_col().width_full().min_width(0.0))
+}
+
+fn row_view(state: AgentPanelState, row: TranscriptRow) -> impl IntoView {
+    match row {
+        TranscriptRow::One { index, entry } => entry_view(state, index, entry).into_any(),
+        TranscriptRow::Batch { start, steps } => batch_row(state, start, steps).into_any(),
+    }
 }
 
 fn entry_view(state: AgentPanelState, index: usize, entry: Entry) -> impl IntoView {
     match entry {
         Entry::User(text) => user_bubble(text).into_any(),
-        Entry::Answer(text) => answer_block(text).into_any(),
+        Entry::Answer(text) => markdown_answer(text).into_any(),
         Entry::Step {
             step,
             name,
@@ -695,6 +889,131 @@ fn entry_view(state: AgentPanelState, index: usize, entry: Entry) -> impl IntoVi
     }
 }
 
+fn batch_status(steps: &[BatchedStep]) -> StepStatus {
+    if steps.iter().any(|s| s.status == StepStatus::Failed) {
+        StepStatus::Failed
+    } else if steps.iter().any(|s| s.status == StepStatus::Running) {
+        StepStatus::Running
+    } else {
+        StepStatus::Ok
+    }
+}
+
+fn batch_label(steps: &[BatchedStep]) -> String {
+    let n = steps.len();
+    let mut names = Vec::new();
+    for step in steps {
+        if !names.iter().any(|n| n == &step.name) {
+            names.push(step.name.clone());
+        }
+    }
+    let shown = names.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+    let extra = names.len().saturating_sub(3);
+    if extra > 0 {
+        format!("{n} steps · {shown} +{extra}")
+    } else {
+        format!("{n} steps · {shown}")
+    }
+}
+
+fn batch_row(state: AgentPanelState, start: usize, steps: Vec<BatchedStep>) -> impl IntoView {
+    let status = batch_status(&steps);
+    let default_open = status != StepStatus::Ok;
+    let label = batch_label(&steps);
+    let first_step = steps.first().map(|s| s.step).unwrap_or(0);
+    let last_step = steps.last().map(|s| s.step).unwrap_or(first_step);
+
+    let is_open = move || {
+        state
+            .batch_open
+            .get()
+            .get(&start)
+            .copied()
+            .unwrap_or(default_open)
+    };
+
+    let toggle = move || {
+        let next = !is_open();
+        state.batch_open.update(|map| {
+            map.insert(start, next);
+        });
+    };
+
+    let steps_for_body = steps.clone();
+
+    Stack::vertical((
+        Stack::horizontal((
+            Label::derived(move || status.glyph().to_string()).style(move |s| {
+                s.color(status.color())
+                    .font_family(crate::design::SYMBOL.to_string())
+                    .font_size(9.0)
+                    .width(14.0)
+            }),
+            Label::derived(move || {
+                if first_step == last_step {
+                    format!("{first_step}")
+                } else {
+                    format!("{first_step}–{last_step}")
+                }
+            })
+            .style(|s| {
+                nowrap(s)
+                    .color(catppuccin::SURFACE2)
+                    .font_size(10.0)
+                    .width(36.0)
+            }),
+            Label::derived(move || label.clone()).style(|s| {
+                nowrap(s)
+                    .color(catppuccin::SAPPHIRE)
+                    .font_size(12.0)
+                    .font_family(crate::design::MONO.to_string())
+                    .flex_grow(1.0)
+                    .min_width(0.0)
+            }),
+            Label::derived(move || {
+                if is_open() {
+                    crate::design::glyph::EXPANDED.to_string()
+                } else {
+                    crate::design::glyph::COLLAPSED.to_string()
+                }
+            })
+            .style(|s| {
+                s.color(catppuccin::SURFACE2)
+                    .font_family(crate::design::SYMBOL.to_string())
+                    .font_size(9.0)
+                    .width(12.0)
+            }),
+        ))
+        .on_event_stop(floem::event::listener::Click, move |_, _| toggle())
+        .style(move |s| {
+            s.width_full()
+                .items_center()
+                .padding_horiz(4.0)
+                .padding_vert(3.0)
+                .border_radius(4.0)
+                .hover(|s| s.background(catppuccin::SURFACE0))
+                .cursor(floem::style::CursorStyle::Pointer)
+        }),
+        dyn_container(is_open, move |open| {
+            if open {
+                let steps = steps_for_body.clone();
+                Box::new(
+                    Stack::from_iter(steps.into_iter().map(|s| {
+                        step_row(
+                            state, s.index, s.step, s.name, s.summary, s.status, s.detail,
+                        )
+                    }))
+                    .style(|s| s.flex_col().width_full().padding_left(8.0).min_width(0.0)),
+                ) as Box<dyn View>
+            } else {
+                Box::new(Empty::new().style(|s| s.display(floem::taffy::Display::None)))
+                    as Box<dyn View>
+            }
+        }),
+    ))
+    .style(|s| s.width_full().min_width(0.0))
+}
+
 fn user_bubble(text: String) -> impl IntoView {
     Container::new(Label::derived(move || text.clone()).style(|s| {
         s.color(catppuccin::TEXT)
@@ -710,15 +1029,280 @@ fn user_bubble(text: String) -> impl IntoView {
     .style(|s| s.width_full().margin_vert(5.0))
 }
 
-fn answer_block(text: String) -> impl IntoView {
-    Label::derived(move || text.clone()).style(|s| {
-        s.color(catppuccin::TEXT)
-            .font_size(13.0)
-            .line_height(1.5)
+fn markdown_answer(text: String) -> impl IntoView {
+    let blocks = markdown::parse(&text);
+    Stack::from_iter(blocks.into_iter().map(block_view)).style(|s| {
+        s.flex_col()
             .width_full()
+            .min_width(0.0)
+            .gap(8.0)
             .padding_horiz(2.0)
             .padding_vert(6.0)
     })
+}
+
+fn block_view(block: Block) -> impl IntoView {
+    match block {
+        Block::Paragraph { inlines } => {
+            inline_block(inlines, 13.0, catppuccin::TEXT, false).into_any()
+        }
+        Block::Heading { level, inlines } => {
+            let size = match level {
+                1 => 18.0,
+                2 => 16.0,
+                _ => 14.0,
+            };
+            inline_block(inlines, size, catppuccin::TEXT, true).into_any()
+        }
+        Block::List { ordered, items } => list_view(ordered, items).into_any(),
+        Block::Code { lang, code } => code_block(lang, code).into_any(),
+    }
+}
+
+fn plain_text(inlines: &[Inline]) -> Option<String> {
+    match inlines {
+        [Inline::Text(s)] => Some(s.clone()),
+        [] => Some(String::new()),
+        _ => None,
+    }
+}
+
+fn inline_block(inlines: Vec<Inline>, size: f32, color: Color, heading: bool) -> impl IntoView {
+    if let Some(plain) = plain_text(&inlines) {
+        return Label::derived(move || plain.clone())
+            .style(move |s| {
+                s.color(color)
+                    .font_size(size)
+                    .line_height(1.5)
+                    .width_full()
+                    .min_width(0.0)
+                    .apply_if(heading, |s| s.font_weight(FontWeight::BOLD))
+            })
+            .into_any();
+    }
+    let (text, attrs) = layout_inlines(&inlines, size, color, heading);
+    let text_fn = text.clone();
+    let attrs_fn = attrs.clone();
+    rich_text(text, attrs, move || (text_fn.clone(), attrs_fn.clone()))
+        .style(|s| s.width_full().min_width(0.0))
+        .into_any()
+}
+
+fn list_view(ordered: bool, items: Vec<Vec<Inline>>) -> impl IntoView {
+    Stack::from_iter(items.into_iter().enumerate().map(move |(i, inlines)| {
+        let marker = if ordered {
+            format!("{}.", i + 1)
+        } else {
+            "•".to_string()
+        };
+        Stack::horizontal((
+            Label::derived(move || marker.clone()).style(|s| {
+                nowrap(s)
+                    .color(catppuccin::OVERLAY1)
+                    .font_size(13.0)
+                    .width(22.0)
+            }),
+            inline_block(inlines, 13.0, catppuccin::TEXT, false),
+        ))
+        .style(|s| s.width_full().min_width(0.0).items_start().gap(6.0))
+    }))
+    .style(|s| s.flex_col().width_full().min_width(0.0).gap(4.0))
+}
+
+fn code_block(lang: String, code: String) -> impl IntoView {
+    let copied = RwSignal::new(false);
+    let header = if lang.is_empty() {
+        "code".to_string()
+    } else {
+        lang
+    };
+    let code_for_copy = code.clone();
+    Stack::vertical((
+        Stack::horizontal((
+            Label::derived({
+                let header = header.clone();
+                move || header.clone()
+            })
+            .style(|s| {
+                nowrap(s)
+                    .color(catppuccin::OVERLAY1)
+                    .font_size(10.0)
+                    .font_family(crate::design::MONO.to_string())
+                    .flex_grow(1.0)
+                    .min_width(0.0)
+            }),
+            Label::derived(move || {
+                if copied.get() {
+                    "copied".to_string()
+                } else {
+                    "copy".to_string()
+                }
+            })
+            .on_event_stop(floem::event::listener::Click, move |_, _| {
+                let _ = floem::Clipboard::set_contents(code_for_copy.clone());
+                copied.set(true);
+                floem::action::exec_after(Duration::from_secs(2), move |_| {
+                    copied.set(false);
+                });
+            })
+            .style(|s| {
+                nowrap(s)
+                    .color(catppuccin::LAVENDER)
+                    .font_size(10.0)
+                    .padding_horiz(6.0)
+                    .padding_vert(2.0)
+                    .border_radius(4.0)
+                    .cursor(floem::style::CursorStyle::Pointer)
+                    .hover(|s| s.background(catppuccin::SURFACE1))
+            }),
+        ))
+        .style(|s| s.width_full().items_center()),
+        Label::derived(move || code.clone()).style(|s| {
+            s.color(catppuccin::SUBTEXT0)
+                .font_size(12.0)
+                .font_family(crate::design::MONO.to_string())
+                .line_height(1.4)
+                .width_full()
+                .min_width(0.0)
+        }),
+    ))
+    .style(|s| {
+        s.width_full()
+            .min_width(0.0)
+            .gap(4.0)
+            .padding(8.0)
+            .background(catppuccin::CRUST)
+            .border_radius(5.0)
+    })
+}
+
+fn answer_attrs() -> Attrs<'static> {
+    Attrs::new()
+        .font_size(13.0)
+        .color(catppuccin::TEXT)
+        .line_height(LineHeightValue::Normal(1.5))
+}
+
+fn layout_inlines(
+    inlines: &[Inline],
+    size: f32,
+    color: Color,
+    heading: bool,
+) -> (String, AttrsList) {
+    let mut defaults = Attrs::new()
+        .font_size(size)
+        .color(color)
+        .line_height(LineHeightValue::Normal(1.5));
+    if heading {
+        defaults = defaults.weight(FontWeight::BOLD);
+    }
+    let mut attrs = AttrsList::new(defaults);
+    let mut buf = String::new();
+    append_inlines(&mut buf, &mut attrs, inlines, size, color, heading);
+    (buf, attrs)
+}
+
+fn append_inlines(
+    buf: &mut String,
+    attrs: &mut AttrsList,
+    inlines: &[Inline],
+    size: f32,
+    color: Color,
+    heading: bool,
+) {
+    for inline in inlines {
+        let start = buf.len();
+        match inline {
+            Inline::Text(s) => buf.push_str(s),
+            Inline::Bold(s) => {
+                buf.push_str(s);
+                attrs.add_span(
+                    start..buf.len(),
+                    Attrs::new()
+                        .font_size(size)
+                        .color(color)
+                        .weight(FontWeight::BOLD)
+                        .line_height(LineHeightValue::Normal(1.5)),
+                );
+            }
+            Inline::Italic(s) => {
+                buf.push_str(s);
+                let mut span = Attrs::new()
+                    .font_size(size)
+                    .color(color)
+                    .font_style(FontStyle::Italic)
+                    .line_height(LineHeightValue::Normal(1.5));
+                if heading {
+                    span = span.weight(FontWeight::BOLD);
+                }
+                attrs.add_span(start..buf.len(), span);
+            }
+            Inline::Code(s) => {
+                buf.push_str(s);
+                attrs.add_span(
+                    start..buf.len(),
+                    Attrs::new()
+                        .font_size(size)
+                        .color(catppuccin::SAPPHIRE)
+                        .family(&MONO_FAM)
+                        .line_height(LineHeightValue::Normal(1.5)),
+                );
+            }
+        }
+    }
+}
+
+fn layout_flow(src: &str) -> (String, AttrsList) {
+    let blocks = markdown::parse(src);
+    let mut buf = String::new();
+    let mut attrs = AttrsList::new(answer_attrs());
+    for (i, block) in blocks.iter().enumerate() {
+        if i > 0 {
+            buf.push_str("\n\n");
+        }
+        match block {
+            Block::Paragraph { inlines } => {
+                append_inlines(&mut buf, &mut attrs, inlines, 13.0, catppuccin::TEXT, false);
+            }
+            Block::Heading { level, inlines } => {
+                let size = match *level {
+                    1 => 18.0,
+                    2 => 16.0,
+                    _ => 14.0,
+                };
+                append_inlines(&mut buf, &mut attrs, inlines, size, catppuccin::TEXT, true);
+            }
+            Block::List { ordered, items } => {
+                for (n, item) in items.iter().enumerate() {
+                    if n > 0 {
+                        buf.push('\n');
+                    }
+                    if *ordered {
+                        buf.push_str(&format!("{}. ", n + 1));
+                    } else {
+                        buf.push_str("• ");
+                    }
+                    append_inlines(&mut buf, &mut attrs, item, 13.0, catppuccin::TEXT, false);
+                }
+            }
+            Block::Code { code, .. } => {
+                let start = buf.len();
+                buf.push_str(code);
+                attrs.add_span(
+                    start..buf.len(),
+                    Attrs::new()
+                        .font_size(12.0)
+                        .color(catppuccin::SUBTEXT0)
+                        .family(&MONO_FAM)
+                        .line_height(LineHeightValue::Normal(1.4)),
+                );
+            }
+        }
+    }
+    if buf.is_empty() && !src.is_empty() {
+        buf.push_str(src);
+    }
+    (buf, attrs)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -771,8 +1355,12 @@ fn step_row(
                     .font_size(9.0)
                     .width(14.0)
             }),
-            Label::derived(move || format!("{step}"))
-                .style(|s| nowrap(s).color(catppuccin::SURFACE2).font_size(10.0).width(18.0)),
+            Label::derived(move || format!("{step}")).style(|s| {
+                nowrap(s)
+                    .color(catppuccin::SURFACE2)
+                    .font_size(10.0)
+                    .width(18.0)
+            }),
             Label::derived(move || name_for_row.clone()).style(|s| {
                 nowrap(s)
                     .color(catppuccin::SAPPHIRE)
@@ -889,8 +1477,8 @@ fn banner(text: String, color: Color, glyph: &'static str) -> impl IntoView {
 /// A `Memo` propagates only when its value actually changes, so the rebuild
 /// happens on the two transitions that matter — activity starting, activity
 /// stopping — instead of on every delta. The text still updates live without
-/// any of this: `Label::derived` re-reads its own signal, and a label changing
-/// its string is not a view being rebuilt.
+/// any of this: `Label::derived` and `rich_text`'s `text_fn` re-read their own
+/// signals, and changing a string is not a view being rebuilt.
 ///
 /// This is the third time this exact trap has been paid for here. It cost the
 /// terminal its keyboard focus once — every keystroke rebuilt the subtree and
@@ -940,15 +1528,16 @@ fn live_activity(state: AgentPanelState) -> impl IntoView {
                             // point.
                             Box::new(
                                 floem::views::scroll::Scroll::new(
-                                    Label::derived(move || state.streaming_reasoning.get())
-                                        .style(|s| {
+                                    Label::derived(move || state.streaming_reasoning.get()).style(
+                                        |s| {
                                             s.color(catppuccin::OVERLAY0)
                                                 .font_size(11.0)
                                                 .font_style(floem::text::FontStyle::Italic)
                                                 .line_height(1.45)
                                                 .width_full()
                                                 .padding_right(6.0)
-                                        }),
+                                        },
+                                    ),
                                 )
                                 .scroll_to_percent(move || {
                                     // Read the signal so this re-runs on every
@@ -981,15 +1570,17 @@ fn live_activity(state: AgentPanelState) -> impl IntoView {
                                     Empty::new().style(|s| s.display(floem::taffy::Display::None)),
                                 ) as Box<dyn View>;
                             }
-                            Box::new(Label::derived(move || state.streaming_answer.get()).style(
-                                |s| {
-                                    s.color(catppuccin::TEXT)
-                                        .font_size(13.0)
-                                        .line_height(1.5)
-                                        .width_full()
-                                        .margin_top(4.0)
-                                },
-                            )) as Box<dyn View>
+                            // `rich_text` updates in place via `text_fn`. Do not
+                            // parse this into a Stack of blocks on every token —
+                            // that is the dyn_container trap above.
+                            Box::new(
+                                rich_text(
+                                    String::new(),
+                                    AttrsList::new(answer_attrs()),
+                                    move || layout_flow(&state.streaming_answer.get()),
+                                )
+                                .style(|s| s.width_full().min_width(0.0).margin_top(4.0)),
+                            ) as Box<dyn View>
                         },
                     ),
                 ))
@@ -1001,11 +1592,7 @@ fn live_activity(state: AgentPanelState) -> impl IntoView {
                         // unbroken token in a streaming answer would otherwise widen
                         // this region and the panel with it.
                         .min_width(0.0)
-                        .padding_horiz(12.0)
-                        .padding_vert(8.0)
-                        .background(catppuccin::BASE)
-                        .border_top(1.0)
-                        .border_color(catppuccin::SURFACE0)
+                        .padding_vert(4.0)
                 }),
             ) as Box<dyn View>
         },
@@ -1207,14 +1794,14 @@ fn drop_overlay(state: AgentPanelState) -> impl IntoView {
                 // stack that owns them, so the outline stays up forever. A
                 // screenshot dragged from the macOS thumbnail is the usual way
                 // this shows up: Enter lights the overlay, then nothing else
-                // reaches the handler.
+                // reaches the handler. `pointer_events_none` stops the steal;
+                // the panel also times the outline out and clears it on click.
                 .pointer_events_none()
         } else {
             s.display(floem::taffy::Display::None)
         }
     })
 }
-
 
 #[derive(Clone)]
 struct LedgerLine {
@@ -1599,50 +2186,131 @@ fn microphone(
     .style(|s| s.items_center().position(floem::taffy::Position::Relative))
 }
 
-fn matching_skills(state: AgentPanelState) -> Vec<SkillPick> {
-    let input = state.input.get();
+fn command_matches(input: &str, skills: &[SkillPick]) -> Vec<SkillPick> {
     let Some(rest) = input.strip_prefix('/') else {
         return Vec::new();
     };
     if rest.contains(char::is_whitespace) {
         return Vec::new();
     }
-    state
-        .skills
-        .get()
-        .into_iter()
+    skills
+        .iter()
         .filter(|s| s.name.starts_with(rest))
+        .cloned()
         .collect()
 }
 
+fn matching_skills(state: AgentPanelState) -> Vec<SkillPick> {
+    command_matches(&state.input.get(), &state.skills.get())
+}
+
+/// Tab against the current `/` token. Unique prefix fills that name; a second
+/// Tab (or Shift+Tab) cycles when several still match.
+fn complete_slash(
+    input: &str,
+    names: &[String],
+    cursor: usize,
+    reverse: bool,
+) -> Option<(String, usize)> {
+    let rest = input.strip_prefix('/')?;
+    if rest.contains(char::is_whitespace) {
+        return None;
+    }
+    let matches: Vec<(usize, &String)> = names
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.starts_with(rest))
+        .collect();
+    if matches.is_empty() {
+        return None;
+    }
+    let exact = names.iter().position(|n| n == rest);
+    let pick = if let Some(at) = exact {
+        let n = names.len();
+        if reverse {
+            (at + n - 1) % n
+        } else {
+            (at + 1) % n
+        }
+    } else if reverse {
+        matches.last().map(|(i, _)| *i).unwrap_or(0)
+    } else {
+        matches
+            .get(cursor.min(matches.len() - 1))
+            .map(|(i, _)| *i)
+            .unwrap_or(0)
+    };
+    Some((format!("/{} ", names[pick]), pick))
+}
+
 fn skill_picker(state: AgentPanelState) -> impl IntoView {
-    dyn_stack(
+    floem::views::scroll::Scroll::new(dyn_stack(
         move || matching_skills(state),
         |s| s.name.clone(),
         move |skill| {
             let name = skill.name.clone();
-            let hint = if skill.argument_hint.is_empty() {
-                skill.description.clone()
-            } else {
-                format!("{} — {}", skill.description, skill.argument_hint)
-            };
-            Label::derived(move || format!("/{}  {hint}", skill.name))
-                .on_event_stop(floem::event::listener::Click, move |_, _| {
-                    state.input.set(format!("/{name} "));
+            let desc = skill.description.clone();
+            let hint = skill.argument_hint.clone();
+            let name_for_sel = name.clone();
+            Stack::vertical((
+                Label::derived({
+                    let name = name.clone();
+                    move || format!("/{name}")
+                })
+                .style(move |s| {
+                    let on = matching_skills(state)
+                        .get(state.skill_cursor.get())
+                        .is_some_and(|row| row.name == name_for_sel);
+                    s.color(if on {
+                        catppuccin::LAVENDER
+                    } else {
+                        catppuccin::TEXT
+                    })
+                    .font_size(12.0)
+                }),
+                Label::derived(move || {
+                    if hint.is_empty() {
+                        desc.clone()
+                    } else {
+                        format!("{desc} — {hint}")
+                    }
                 })
                 .style(|s| {
-                    s.color(catppuccin::TEXT)
-                        .font_size(12.0)
-                        .padding_horiz(10.0)
-                        .padding_vert(5.0)
-                        .cursor(floem::style::CursorStyle::Pointer)
-                        .hover(|s| s.background(catppuccin::SURFACE0))
-                })
+                    s.color(catppuccin::OVERLAY0)
+                        .font_size(11.0)
+                        .text_ellipsis()
+                        .width_full()
+                }),
+            ))
+            .style(move |s| {
+                let on = matching_skills(state)
+                    .get(state.skill_cursor.get())
+                    .is_some_and(|row| row.name == skill.name);
+                s.width_full()
+                    .padding_horiz(10.0)
+                    .padding_vert(5.0)
+                    .cursor(floem::style::CursorStyle::Pointer)
+                    .background(if on {
+                        catppuccin::SURFACE0
+                    } else {
+                        Color::from_rgba8(0, 0, 0, 0)
+                    })
+                    .hover(|s| s.background(catppuccin::SURFACE0))
+            })
+            .on_event_stop(floem::event::listener::Click, move |_, _| {
+                state.input.set(format!("/{name} "));
+            })
         },
-    )
+    ))
+    .custom_style(|s: floem::views::scroll::ScrollCustomStyle| {
+        s.hide_bars(false)
+            .handle_background(catppuccin::SURFACE1)
+            .handle_border_radius(4.0)
+    })
     .style(move |s| {
         s.flex_col()
             .width_full()
+            .max_height(180.0)
             .margin_bottom(6.0)
             .border(1.0)
             .border_color(catppuccin::SURFACE0)
@@ -1681,12 +2349,52 @@ fn composer(
         skill_picker(state),
         TextInput::new(state.input)
             .placeholder("Ask the agent, or / for a command…")
-            .on_event_stop(floem::event::listener::KeyDown, move |_, ev| {
-                if ev.key == floem::prelude::Key::Named(floem::prelude::NamedKey::Enter)
-                    && !ev.modifiers.contains(floem::prelude::Modifiers::SHIFT)
+            .on_event(floem::event::listener::KeyDown, move |_, ev| {
+                use floem::event::EventPropagation;
+                use floem::prelude::{Key, Modifiers, NamedKey};
+                if ev.key == Key::Named(NamedKey::Enter) && !ev.modifiers.contains(Modifiers::SHIFT)
                 {
                     send_on_enter();
+                    return EventPropagation::Stop;
                 }
+                let matches =
+                    command_matches(&state.input.get_untracked(), &state.skills.get_untracked());
+                if matches.is_empty() {
+                    return EventPropagation::Continue;
+                }
+                if ev.key == Key::Named(NamedKey::Tab) {
+                    let names: Vec<String> = state
+                        .skills
+                        .get_untracked()
+                        .iter()
+                        .map(|s| s.name.clone())
+                        .collect();
+                    let reverse = ev.modifiers.contains(Modifiers::SHIFT);
+                    if let Some((next, cursor)) = complete_slash(
+                        &state.input.get_untracked(),
+                        &names,
+                        state.skill_cursor.get_untracked(),
+                        reverse,
+                    ) {
+                        state.skill_cursor.set(cursor);
+                        state.input.set(next);
+                    }
+                    return EventPropagation::Stop;
+                }
+                let n = matches.len();
+                if ev.key == Key::Named(NamedKey::ArrowDown) {
+                    state
+                        .skill_cursor
+                        .set((state.skill_cursor.get_untracked() + 1) % n);
+                    return EventPropagation::Stop;
+                }
+                if ev.key == Key::Named(NamedKey::ArrowUp) {
+                    state
+                        .skill_cursor
+                        .set((state.skill_cursor.get_untracked() + n - 1) % n);
+                    return EventPropagation::Stop;
+                }
+                EventPropagation::Continue
             })
             .style(|s| {
                 s.width_full()
@@ -1705,7 +2413,8 @@ fn composer(
                 if state.busy.get() {
                     "working…".to_string()
                 } else {
-                    "Enter to send · Shift+Enter for a newline".to_string()
+                    "Enter to send · Tab completes /commands · Shift+Enter for a newline"
+                        .to_string()
                 }
             })
             .style(move |s| {
@@ -1983,6 +2692,144 @@ mod tests {
         assert!(
             rendered.contains("NoWrap"),
             "chrome must opt out of the inherited BreakWord: {rendered}"
+        );
+    }
+
+    #[test]
+    fn tab_completes_a_unique_prefix() {
+        let names = vec![
+            "compact".into(),
+            "handoff".into(),
+            "grill-me".into(),
+            "research".into(),
+        ];
+        let (out, _) = complete_slash("/c", &names, 0, false).unwrap();
+        assert_eq!(out, "/compact ");
+        let (out, _) = complete_slash("/r", &names, 0, false).unwrap();
+        assert_eq!(out, "/research ");
+        let (out, _) = complete_slash("/g", &names, 0, false).unwrap();
+        assert_eq!(out, "/grill-me ");
+    }
+
+    #[test]
+    fn tab_on_a_bare_slash_fills_the_highlighted_command() {
+        let names = vec!["compact".into(), "handoff".into(), "research".into()];
+        let (out, cursor) = complete_slash("/", &names, 0, false).unwrap();
+        assert_eq!(out, "/compact ");
+        assert_eq!(cursor, 0);
+        let (out, cursor) = complete_slash("/", &names, 0, true).unwrap();
+        assert_eq!(out, "/research ");
+        assert_eq!(cursor, 2);
+    }
+
+    #[test]
+    fn a_second_tab_cycles_when_the_name_is_already_filled() {
+        let names = vec!["compact".into(), "handoff".into()];
+        let (out, cursor) = complete_slash("/compact", &names, 0, false).unwrap();
+        assert_eq!(out, "/handoff ");
+        assert_eq!(cursor, 1);
+        let (out, cursor) = complete_slash("/handoff", &names, 1, false).unwrap();
+        assert_eq!(out, "/compact ");
+        assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn tab_does_nothing_once_arguments_have_started() {
+        let names = vec!["compact".into()];
+        assert!(complete_slash("/compact focus", &names, 0, false).is_none());
+        assert!(complete_slash("no slash", &names, 0, false).is_none());
+    }
+
+    fn ok_step(id: &str, n: usize, name: &str) -> Entry {
+        Entry::Step {
+            id: id.into(),
+            step: n,
+            name: name.into(),
+            summary: "x".into(),
+            status: StepStatus::Ok,
+            detail: String::new(),
+        }
+    }
+
+    #[test]
+    fn two_steps_stay_individual_rows() {
+        let rows = group_entries(&[ok_step("a", 1, "read"), ok_step("b", 2, "grep")]);
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(rows[0], TranscriptRow::One { index: 0, .. }));
+        assert!(matches!(rows[1], TranscriptRow::One { index: 1, .. }));
+    }
+
+    #[test]
+    fn three_consecutive_steps_collapse() {
+        let rows = group_entries(&[
+            ok_step("a", 1, "read"),
+            ok_step("b", 2, "grep"),
+            ok_step("c", 3, "bash"),
+        ]);
+        assert_eq!(rows.len(), 1);
+        match &rows[0] {
+            TranscriptRow::Batch { start, steps } => {
+                assert_eq!(*start, 0);
+                assert_eq!(steps.len(), 3);
+            }
+            other => panic!("expected a batch, got a single row: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_answer_splits_step_batches() {
+        let rows = group_entries(&[
+            Entry::User("go".into()),
+            ok_step("a", 1, "read"),
+            ok_step("b", 2, "grep"),
+            ok_step("c", 3, "bash"),
+            Entry::Answer("done".into()),
+            ok_step("d", 4, "read"),
+            ok_step("e", 5, "read"),
+        ]);
+        assert_eq!(rows.len(), 5);
+        assert!(matches!(rows[0], TranscriptRow::One { .. }));
+        assert!(matches!(rows[1], TranscriptRow::Batch { start: 1, .. }));
+        assert!(matches!(
+            rows[2],
+            TranscriptRow::One {
+                entry: Entry::Answer(_),
+                ..
+            }
+        ));
+        assert!(matches!(rows[3], TranscriptRow::One { index: 5, .. }));
+        assert!(matches!(rows[4], TranscriptRow::One { index: 6, .. }));
+    }
+
+    #[test]
+    fn batch_keys_change_when_a_step_resolves() {
+        let running = Entry::Step {
+            id: "a".into(),
+            step: 1,
+            name: "read".into(),
+            summary: "x".into(),
+            status: StepStatus::Running,
+            detail: String::new(),
+        };
+        let done = Entry::Step {
+            id: "a".into(),
+            step: 1,
+            name: "read".into(),
+            summary: "x".into(),
+            status: StepStatus::Ok,
+            detail: "hi".into(),
+        };
+        let before = row_key(&TranscriptRow::One {
+            index: 0,
+            entry: running,
+        });
+        let after = row_key(&TranscriptRow::One {
+            index: 0,
+            entry: done,
+        });
+        assert_ne!(
+            before, after,
+            "dyn_stack only rebuilds on key change; status must be in the key"
         );
     }
 }

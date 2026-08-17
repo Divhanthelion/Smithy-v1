@@ -24,6 +24,20 @@ crossbeam-channel.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6", default-features = false }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "NSArray",
+    "NSEnumerator",
+    "NSGeometry",
+] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "NSApplication",
+    "NSResponder",
+    "NSScreen",
+    "NSWindow",
+] }
+
 [dev-dependencies]
 proptest.workspace = true
 tempfile.workspace = true

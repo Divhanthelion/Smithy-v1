@@ -611,7 +611,8 @@ fn callee() {
     /// two, not two edges — the graph draws a thicker line, not a double arrow.
     #[test]
     fn repeated_calls_thicken_one_edge() {
-        let symbols = symbols_for("fn caller() {\n    callee();\n    callee();\n}\nfn callee() {\n}\n");
+        let symbols =
+            symbols_for("fn caller() {\n    callee();\n    callee();\n}\nfn callee() {\n}\n");
         let scip = ScipIndex {
             documents: vec![Document {
                 relative_path: "src/m.rs".into(),
@@ -648,8 +649,9 @@ fn callee() {
     /// rather than one ambiguous blob.
     #[test]
     fn methods_carry_their_container() {
-        let symbols =
-            symbols_for("impl Desktop {\n    fn create() {\n        helper();\n    }\n}\nfn helper() {\n}\n");
+        let symbols = symbols_for(
+            "impl Desktop {\n    fn create() {\n        helper();\n    }\n}\nfn helper() {\n}\n",
+        );
         let scip = ScipIndex {
             documents: vec![Document {
                 relative_path: "src/m.rs".into(),
@@ -715,17 +717,18 @@ fn callee() {
     /// the entire purpose — so the four buckets must sum to the total.
     #[test]
     fn every_reference_lands_in_exactly_one_bucket() {
-        let symbols = symbols_for("use crate::callee;\nfn caller() {\n    callee();\n}\nfn callee() {\n}\n");
+        let symbols =
+            symbols_for("use crate::callee;\nfn caller() {\n    callee();\n}\nfn callee() {\n}\n");
         let scip = ScipIndex {
             documents: vec![Document {
                 relative_path: "src/m.rs".into(),
                 occurrences: vec![
                     occ("c/caller().", 2, true),
                     occ("c/callee().", 5, true),
-                    occ("c/callee().", 3, false),   // an edge
-                    occ("c/callee().", 1, false),   // unattributed (a `use` line)
-                    occ("std/println!", 3, false),  // external
-                    occ("local 4", 3, false),       // a local
+                    occ("c/callee().", 3, false),  // an edge
+                    occ("c/callee().", 1, false),  // unattributed (a `use` line)
+                    occ("std/println!", 3, false), // external
+                    occ("local 4", 3, false),      // a local
                 ],
             }],
         };
@@ -751,8 +754,16 @@ fn callee() {
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
-        std::fs::write(src.join("a.rs"), "fn a() {\n    let x = 1;\n    let _ = x;\n}\n").unwrap();
-        std::fs::write(src.join("b.rs"), "fn b() {\n    let y = 2;\n    let _ = y;\n}\n").unwrap();
+        std::fs::write(
+            src.join("a.rs"),
+            "fn a() {\n    let x = 1;\n    let _ = x;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("b.rs"),
+            "fn b() {\n    let y = 2;\n    let _ = y;\n}\n",
+        )
+        .unwrap();
         let symbols = SymbolIndex::build(tmp.path());
 
         let scip = ScipIndex {
@@ -813,7 +824,11 @@ fn callee() {
             line: 1,
             end_line: 3,
         });
-        graph.edges.push(Edge { from: 0, to: 0, sites: 1 });
+        graph.edges.push(Edge {
+            from: 0,
+            to: 0,
+            sites: 1,
+        });
 
         let path = tmp.path().join("callgraph.json");
         graph.save(&path).unwrap();
@@ -876,7 +891,11 @@ fn callee() {
         assert_eq!(staleness.added, vec!["src/c.rs"]);
         assert_eq!(staleness.missing, vec!["src/b.rs"]);
         assert_eq!(staleness.file_count(), 2);
-        assert!(staleness.describe().contains("1 added"), "{}", staleness.describe());
+        assert!(
+            staleness.describe().contains("1 added"),
+            "{}",
+            staleness.describe()
+        );
         assert!(staleness.describe().contains("1 deleted"));
     }
 

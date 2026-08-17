@@ -28,5 +28,5 @@ pub mod schema;
 pub mod tools;
 
 pub use registry::{AllowBash, GatePause, HookDecision, Registry, Todo, Tool, ToolCtx, ToolHook};
-pub use sandbox::{check_bash, Workspace};
+pub use sandbox::{check_bash, command_leaves_project, Workspace};
 pub use schema::{ToolCall, ToolDefinition, ToolParameter, ToolResult};

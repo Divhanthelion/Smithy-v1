@@ -466,8 +466,7 @@ fn lighting_continuity() -> CheckResult {
     for sec in 1..(86_400u64 + 12 * 3600) {
         let scene = sample_at_abs(sec);
         let now = light_of(&scene);
-        let same_stretch =
-            scene.doing == prev_scene.doing && scene.place == prev_scene.place;
+        let same_stretch = scene.doing == prev_scene.doing && scene.place == prev_scene.place;
         if same_stretch {
             let d_lamp = (now.0 - prev.0).abs();
             let d_door = (now.1 - prev.1).abs();
@@ -586,4 +585,3 @@ fn face_of(scene: &Scene) -> f64 {
         scene.completion,
     )
 }
-

@@ -1,9 +1,18 @@
 //! Shared SSE line parsing for OpenAI-compatible streaming endpoints (LM Studio, OpenRouter, etc.).
 
+use std::time::Duration;
+
+use futures_util::StreamExt;
 use serde_json::Value;
 use smithy_tools::ToolCall;
 
-use crate::provider::{Completion, Delta};
+use crate::provider::{Completion, Delta, ProviderError};
+
+/// If the TCP connection stays open but the endpoint sends nothing, the panel
+/// sits on `working...` until the request timeout (fifteen minutes). That looks
+/// like a crash. Ninety seconds of silence after a 200 is a stall, not thinking
+/// — thinking models still emit `reasoning_content` tokens.
+pub const STREAM_IDLE: Duration = Duration::from_secs(90);
 
 #[derive(Default, Debug, Clone)]
 pub struct PartialCall {
@@ -143,4 +152,95 @@ pub fn build_tool_calls(partials: Vec<PartialCall>) -> Vec<ToolCall> {
             )
         })
         .collect()
+}
+
+/// Drain an OpenAI-style SSE body into a [`Completion`].
+///
+/// Shared by LM Studio, OpenRouter and DeepSeek so a stall is handled once.
+pub async fn consume_sse_stream<S, B, E>(
+    stream: S,
+    on_delta: Option<&(dyn Fn(Delta) + Send + Sync)>,
+) -> Result<Completion, ProviderError>
+where
+    S: futures_util::Stream<Item = Result<B, E>> + Unpin,
+    B: AsRef<[u8]>,
+    E: std::fmt::Display,
+{
+    consume_sse_with_idle(stream, on_delta, STREAM_IDLE).await
+}
+
+async fn consume_sse_with_idle<S, B, E>(
+    mut stream: S,
+    on_delta: Option<&(dyn Fn(Delta) + Send + Sync)>,
+    idle: Duration,
+) -> Result<Completion, ProviderError>
+where
+    S: futures_util::Stream<Item = Result<B, E>> + Unpin,
+    B: AsRef<[u8]>,
+    E: std::fmt::Display,
+{
+    let mut out = Completion::default();
+    let mut partials: Vec<PartialCall> = Vec::new();
+    let mut buffer = String::new();
+
+    loop {
+        let chunk = match tokio::time::timeout(idle, stream.next()).await {
+            Ok(Some(Ok(chunk))) => chunk,
+            Ok(Some(Err(e))) => {
+                return Err(ProviderError::BadResponse(format!("stream read error: {e}")));
+            }
+            Ok(None) => break,
+            Err(_) => {
+                return Err(ProviderError::BadResponse(
+                    "the model stopped sending tokens (stream stalled)".into(),
+                ));
+            }
+        };
+        buffer.push_str(&String::from_utf8_lossy(chunk.as_ref()));
+
+        let mut done = false;
+        while let Some(newline) = buffer.find('\n') {
+            let line = buffer[..newline].trim().to_string();
+            buffer.drain(..=newline);
+            if apply_sse_line(&line, &mut out, &mut partials, on_delta) {
+                done = true;
+            }
+        }
+        if done {
+            break;
+        }
+    }
+
+    out.tool_calls = build_tool_calls(partials);
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_silent_stream_fails_rather_than_sitting_forever() {
+        let stream = futures_util::stream::pending::<Result<Vec<u8>, String>>();
+        let err = consume_sse_with_idle(stream, None, Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("stalled"),
+            "a hung body has to surface as a failed turn, not working… forever: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_complete_sse_body_is_parsed() {
+        let frames = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n",
+            "data: [DONE]\n",
+        );
+        let stream = futures_util::stream::iter([Ok::<_, String>(frames.as_bytes().to_vec())]);
+        let out = consume_sse_stream(stream, None).await.expect("parses");
+        assert_eq!(out.reasoning, "think");
+        assert_eq!(out.content, "hi");
+    }
 }

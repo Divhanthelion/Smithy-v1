@@ -676,19 +676,17 @@ pub fn empty_editor_with_map(
     // container first, then layering inside it, is what makes the pane a pane.
     Container::new(
         Stack::new((
-            floem::views::scroll::Scroll::new(
-                Label::derived(move || map.get()).style(|s| {
-                    s.font_family(design::MONO.to_string())
-                        .font_size(design::TEXT_XS)
-                        .line_height(1.5)
-                        // Faint, not ghost: ghost on the forged backdrop was
-                        // indistinguishable from "not there" even after the
-                        // opaque fill landed.
-                        .color(design::FG_FAINT)
-                        .padding(design::SPACE_5)
-                        .width_full()
-                }),
-            )
+            floem::views::scroll::Scroll::new(Label::derived(move || map.get()).style(|s| {
+                s.font_family(design::MONO.to_string())
+                    .font_size(design::TEXT_XS)
+                    .line_height(1.5)
+                    // Faint, not ghost: ghost on the forged backdrop was
+                    // indistinguishable from "not there" even after the
+                    // opaque fill landed.
+                    .color(design::FG_FAINT)
+                    .padding(design::SPACE_5)
+                    .width_full()
+            }))
             .style(move |s| {
                 s.absolute()
                     .inset(0.0)
@@ -702,9 +700,8 @@ pub fn empty_editor_with_map(
             // Shortcuts float over the map. `shortcut_list` rather than
             // `empty_editor`, because that one paints an opaque background and
             // would hide the very thing this function exists to show.
-            Container::new(shortcut_list()).style(|s| {
-                s.absolute().inset(0.0).items_center().justify_center()
-            }),
+            Container::new(shortcut_list())
+                .style(|s| s.absolute().inset(0.0).items_center().justify_center()),
         ))
         .style(|s| s.width_full().height_full()),
     )

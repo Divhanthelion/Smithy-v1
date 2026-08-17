@@ -58,7 +58,7 @@ fn session(f: &Fixture, script: Vec<Completion>) -> Session {
 fn resumed(f: &Fixture, stored: StoredSession, script: Vec<Completion>) -> Session {
     let sampling = stored.sampling.clone();
     let limits = stored.limits.clone();
-    let kind = stored.kind;
+    let skill = stored.skill_name();
     let tools = stored.tools.clone();
     let mut session = Session::resume(
         Arc::new(ScriptedProvider::new(script)),
@@ -67,7 +67,7 @@ fn resumed(f: &Fixture, stored: StoredSession, script: Vec<Completion>) -> Sessi
         stored.into_history(),
         sampling,
         limits,
-        kind,
+        skill,
     );
     if let Some(tools) = tools {
         session.freeze_tools(tools);
@@ -92,7 +92,7 @@ fn store_from(f: &Fixture, id: &str, s: &Session) -> StoredSession {
         s.sampling(),
         s.limits(),
         s.reasoning().to_vec(),
-        s.kind(),
+        s.skill().map(str::to_string),
     )
     .with_tools(s.tools_schema().clone())
 }
@@ -362,7 +362,7 @@ async fn resume_sends_stored_tools_even_if_the_live_registry_moved() {
         stored.into_history(),
         Sampling::default(),
         Limits::default(),
-        smithy_agent::SessionKind::Coding,
+        None,
     );
     second.freeze_tools(tools);
     second.run_turn("again", None).await.expect("turn");

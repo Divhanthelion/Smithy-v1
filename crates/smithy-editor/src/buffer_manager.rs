@@ -319,7 +319,12 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(manager.buffer_count(), 1);
         assert_eq!(
-            manager.get_buffer(first).unwrap().borrow().text().to_string(),
+            manager
+                .get_buffer(first)
+                .unwrap()
+                .borrow()
+                .text()
+                .to_string(),
             "two"
         );
     }

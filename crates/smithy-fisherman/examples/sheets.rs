@@ -23,8 +23,7 @@ use std::process::ExitCode;
 use smithy_fisherman::harness;
 
 fn main() -> ExitCode {
-    let out = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/fisherman");
+    let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/fisherman");
     // Prefer workspace target/ when run from the crate; fall back to cwd.
     let out = if out.exists() || out.parent().is_some_and(|p| p.exists()) {
         // Normalise to workspace `target/fisherman`.

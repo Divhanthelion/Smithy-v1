@@ -75,7 +75,17 @@ pub fn fisherman_view(aesthetic: RwSignal<Aesthetic>, tick: RwSignal<u64>) -> im
         let hours = crate::localtime::local_hours(now);
         let day = crate::localtime::local_day(now);
         let (sunrise, sunset) = crate::celestial::todays_sun(now);
-        let scene = scene_at(w, h, band, hours, sunrise, sunset, day, session_seconds(), frame);
+        let scene = scene_at(
+            w,
+            h,
+            band,
+            hours,
+            sunrise,
+            sunset,
+            day,
+            session_seconds(),
+            frame,
+        );
         paint(&mut FloemInk(cx), &scene);
     })
     .style(|s| {

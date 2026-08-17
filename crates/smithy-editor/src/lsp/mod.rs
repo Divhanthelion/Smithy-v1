@@ -18,6 +18,6 @@ pub use registry::{
 };
 pub use transport::LspTransport;
 pub use types::{
-    DocumentPosition, DocumentRange, LspDiagnostic, LspHover,
-    PositionEncoding, PositionError, Severity,
+    DocumentPosition, DocumentRange, LspDiagnostic, LspHover, PositionEncoding, PositionError,
+    Severity,
 };

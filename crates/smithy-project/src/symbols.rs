@@ -243,9 +243,7 @@ impl SymbolIndex {
             .by_name
             .values()
             .flatten()
-            .filter(|s| {
-                s.kind == SymbolKind::Variant && s.container.as_deref() == Some(enum_name)
-            })
+            .filter(|s| s.kind == SymbolKind::Variant && s.container.as_deref() == Some(enum_name))
             .collect();
         variants.sort_by_key(|s| (s.line, s.column));
         variants
@@ -313,7 +311,10 @@ impl SymbolIndex {
                     end_line: symbol.end_line,
                 });
         }
-        self.by_name.entry(symbol.name.clone()).or_default().push(symbol);
+        self.by_name
+            .entry(symbol.name.clone())
+            .or_default()
+            .push(symbol);
     }
 
     /// Put each file's spans in declaration order. Called once after a build.
@@ -429,7 +430,15 @@ fn walk(
                 let Some(name) = name_of(child, source) else {
                     continue;
                 };
-                out.push(make(child, source, &name, SymbolKind::Module, None, module, file));
+                out.push(make(
+                    child,
+                    source,
+                    &name,
+                    SymbolKind::Module,
+                    None,
+                    module,
+                    file,
+                ));
                 if let Some(body) = child.child_by_field_name("body") {
                     let nested = if module.is_empty() {
                         name.clone()
@@ -443,7 +452,15 @@ fn walk(
                 let Some(name) = name_of(child, source) else {
                     continue;
                 };
-                out.push(make(child, source, &name, SymbolKind::Enum, None, module, file));
+                out.push(make(
+                    child,
+                    source,
+                    &name,
+                    SymbolKind::Enum,
+                    None,
+                    module,
+                    file,
+                ));
                 // The variants — the thing the map cannot show and a model
                 // cannot guess.
                 if let Some(body) = child.child_by_field_name("body") {
@@ -483,7 +500,15 @@ fn walk(
                 let Some(name) = name_of(child, source) else {
                     continue;
                 };
-                out.push(make(child, source, &name, SymbolKind::Trait, None, module, file));
+                out.push(make(
+                    child,
+                    source,
+                    &name,
+                    SymbolKind::Trait,
+                    None,
+                    module,
+                    file,
+                ));
                 if let Some(body) = child.child_by_field_name("body") {
                     walk(body, source, module, file, Some(&name), out);
                 }
@@ -622,9 +647,8 @@ mod tests {
     /// what was in it, and a model emitted a variant that did not exist.
     #[test]
     fn enum_variants_are_indexed_with_their_enum() {
-        let symbols = index_of(
-            "pub enum DesktopMsg {\n    CloseWindow(String),\n    DesktopClick,\n}\n",
-        );
+        let symbols =
+            index_of("pub enum DesktopMsg {\n    CloseWindow(String),\n    DesktopClick,\n}\n");
         let variants: Vec<&Symbol> = symbols
             .iter()
             .filter(|s| s.kind == SymbolKind::Variant)
@@ -639,9 +663,8 @@ mod tests {
     /// so the public-API map could never show it, and its arity was guessed.
     #[test]
     fn impl_methods_are_indexed_with_their_type() {
-        let symbols = index_of(
-            "impl Desktop {\n    fn restore_session(&mut self, session: Session) {}\n}\n",
-        );
+        let symbols =
+            index_of("impl Desktop {\n    fn restore_session(&mut self, session: Session) {}\n}\n");
         let method = symbols
             .iter()
             .find(|s| s.name == "restore_session")
@@ -675,8 +698,20 @@ mod tests {
     #[test]
     fn visibility_is_recorded_but_never_a_filter() {
         let symbols = index_of("pub struct Shown;\nstruct Hidden;\n");
-        assert!(symbols.iter().find(|s| s.name == "Shown").unwrap().is_public);
-        assert!(!symbols.iter().find(|s| s.name == "Hidden").unwrap().is_public);
+        assert!(
+            symbols
+                .iter()
+                .find(|s| s.name == "Shown")
+                .unwrap()
+                .is_public
+        );
+        assert!(
+            !symbols
+                .iter()
+                .find(|s| s.name == "Hidden")
+                .unwrap()
+                .is_public
+        );
     }
 
     #[test]
@@ -684,7 +719,9 @@ mod tests {
         let symbols = symbols_in("pub mod inner { pub struct Deep; }", "outer", "src/lib.rs");
         let deep = symbols.iter().find(|s| s.name == "Deep").unwrap();
         assert_eq!(deep.module, "outer::inner");
-        assert!(symbols.iter().any(|s| s.name == "inner" && s.kind == SymbolKind::Module));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "inner" && s.kind == SymbolKind::Module));
     }
 
     /// `mod foo;` has no body — its contents are in another file the walker
@@ -761,11 +798,21 @@ mod tests {
     fn a_rendered_line_does_not_repeat_the_keyword() {
         let symbols = index_of("pub enum DesktopMsg { CloseWindow(String) }\n");
         let e = symbols.iter().find(|s| s.kind == SymbolKind::Enum).unwrap();
-        assert_eq!(e.render(), "src/components/desktop.rs:1 — pub enum DesktopMsg");
+        assert_eq!(
+            e.render(),
+            "src/components/desktop.rs:1 — pub enum DesktopMsg"
+        );
 
         // A variant's signature is bare, so it does get a tag.
-        let v = symbols.iter().find(|s| s.kind == SymbolKind::Variant).unwrap();
-        assert!(v.render().contains("variant CloseWindow(String)"), "{}", v.render());
+        let v = symbols
+            .iter()
+            .find(|s| s.kind == SymbolKind::Variant)
+            .unwrap();
+        assert!(
+            v.render().contains("variant CloseWindow(String)"),
+            "{}",
+            v.render()
+        );
     }
 
     /// The case substring search cannot reach: a misremembered name that shares
@@ -832,9 +879,8 @@ mod tests {
     /// Innermost wins. An outer function must not swallow a nested one.
     #[test]
     fn a_nested_function_shadows_the_one_around_it() {
-        let index = indexed(
-            "fn outer() {\n    fn inner() {\n        deep();\n    }\n    shallow();\n}\n",
-        );
+        let index =
+            indexed("fn outer() {\n    fn inner() {\n        deep();\n    }\n    shallow();\n}\n");
         assert_eq!(index.enclosing("src/m.rs", 3).unwrap().name, "inner");
         assert_eq!(index.enclosing("src/m.rs", 5).unwrap().name, "outer");
     }
@@ -890,9 +936,7 @@ mod tests {
     /// calls from it.
     #[test]
     fn only_functions_and_methods_get_spans() {
-        let index = indexed(
-            "pub struct S { a: u8 }\npub enum E { A }\nfn f() {\n    g();\n}\n",
-        );
+        let index = indexed("pub struct S { a: u8 }\npub enum E { A }\nfn f() {\n    g();\n}\n");
         let names: Vec<&str> = index
             .spans_in("src/m.rs")
             .iter()

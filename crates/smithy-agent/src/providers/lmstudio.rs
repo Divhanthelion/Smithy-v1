@@ -17,11 +17,12 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures_util::StreamExt;
 use serde_json::{json, Value};
 
 use crate::provider::{Completion, CompletionRequest, Delta, Provider, ProviderError, Sampling};
-use crate::providers::sse::{apply_sse_line, build_tool_calls, PartialCall};
+use crate::providers::sse::consume_sse_stream;
+#[cfg(test)]
+use crate::providers::sse::{apply_sse_line, PartialCall};
 
 /// Cold prefill of a large context genuinely takes minutes on local hardware,
 /// and a thinking complete() can too. This timeout must not be shorter than
@@ -198,31 +199,7 @@ impl LmStudio {
             });
         }
 
-        let mut out = Completion::default();
-        let mut partials: Vec<PartialCall> = Vec::new();
-        let mut buffer = String::new();
-        let mut stream = response.bytes_stream();
-
-        while let Some(chunk) = stream.next().await {
-            let chunk =
-                chunk.map_err(|e| ProviderError::BadResponse(format!("stream read error: {e}")))?;
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-            // SSE frames are newline-delimited, but a chunk can split one in
-            // half — keep the trailing partial line in the buffer for next time.
-            while let Some(newline) = buffer.find('\n') {
-                let line = buffer[..newline].trim().to_string();
-                buffer.drain(..=newline);
-                if apply_sse_line(&line, &mut out, &mut partials, on_delta) {
-                    // [DONE]
-                    buffer.clear();
-                    break;
-                }
-            }
-        }
-
-        out.tool_calls = build_tool_calls(partials);
-        Ok(out)
+        consume_sse_stream(response.bytes_stream(), on_delta).await
     }
 }
 

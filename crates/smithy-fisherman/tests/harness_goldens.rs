@@ -7,9 +7,7 @@ use std::path::PathBuf;
 
 #[test]
 fn scenes_golden_matches_or_is_awaiting_blessing() {
-    let out = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/fisherman_golden_test");
+    let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/fisherman_golden_test");
     std::fs::create_dir_all(&out).expect("tmp");
-    smithy_fisherman::harness::golden::compare_or_bless(&out)
-        .expect("golden compare");
+    smithy_fisherman::harness::golden::compare_or_bless(&out).expect("golden compare");
 }

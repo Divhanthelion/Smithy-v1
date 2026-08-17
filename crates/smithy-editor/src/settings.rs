@@ -430,7 +430,11 @@ fn model_picker(
                     format!("{} of {total}", state.visible_models().len())
                 }
             })
-            .style(|s| s.font_size(10.0).color(catppuccin::SURFACE2).margin_right(8.0)),
+            .style(|s| {
+                s.font_size(10.0)
+                    .color(catppuccin::SURFACE2)
+                    .margin_right(8.0)
+            }),
             Label::derived(|| "Refresh".to_string())
                 .on_event_stop(floem::event::listener::Click, move |_, _| refresh())
                 .style(|s| {
@@ -569,8 +573,11 @@ fn model_row(
                 .style(|s| s.font_size(9.0).color(catppuccin::SURFACE2)),
         ))
         .style(|s| s.gap(1.0).flex_grow(1.0).min_width(0.0)),
-        Label::derived(move || context.clone())
-            .style(|s| s.font_size(9.0).color(catppuccin::SURFACE2).margin_right(8.0)),
+        Label::derived(move || context.clone()).style(|s| {
+            s.font_size(9.0)
+                .color(catppuccin::SURFACE2)
+                .margin_right(8.0)
+        }),
         Label::derived(move || badge.clone()).style(move |s| {
             s.font_size(9.0).color(if row.free || row.loaded {
                 catppuccin::GREEN
@@ -777,8 +784,16 @@ fn openrouter_fields(
     on_clear_key: std::rc::Rc<dyn Fn(&str)>,
 ) -> impl IntoView {
     Stack::vertical((
-        field("API base URL", state.openrouter_url, "https://openrouter.ai/api/v1"),
-        field("Model", state.openrouter_model, "anthropic/claude-3.5-sonnet"),
+        field(
+            "API base URL",
+            state.openrouter_url,
+            "https://openrouter.ai/api/v1",
+        ),
+        field(
+            "Model",
+            state.openrouter_model,
+            "anthropic/claude-3.5-sonnet",
+        ),
         secret_field(
             "API key",
             state.openrouter_key,
@@ -790,12 +805,13 @@ fn openrouter_fields(
     .style(|s| s.width_full().gap(10.0))
 }
 
-fn deepseek_fields(
-    state: SettingsState,
-    on_clear_key: std::rc::Rc<dyn Fn(&str)>,
-) -> impl IntoView {
+fn deepseek_fields(state: SettingsState, on_clear_key: std::rc::Rc<dyn Fn(&str)>) -> impl IntoView {
     Stack::vertical((
-        field("API base URL", state.deepseek_url, "https://api.deepseek.com"),
+        field(
+            "API base URL",
+            state.deepseek_url,
+            "https://api.deepseek.com",
+        ),
         field("Model", state.deepseek_model, "deepseek-v4-flash"),
         secret_field(
             "API key",
@@ -827,10 +843,17 @@ fn brave_fields(state: SettingsState, on_clear_key: std::rc::Rc<dyn Fn(&str)>) -
     .style(|s| s.width_full().gap(8.0))
 }
 
-fn field(label: &'static str, signal: RwSignal<String>, placeholder: &'static str) -> impl IntoView {
+fn field(
+    label: &'static str,
+    signal: RwSignal<String>,
+    placeholder: &'static str,
+) -> impl IntoView {
     Stack::vertical((
-        Label::derived(move || label.to_string())
-            .style(|s| s.font_size(11.0).color(catppuccin::SUBTEXT0).margin_bottom(4.0)),
+        Label::derived(move || label.to_string()).style(|s| {
+            s.font_size(11.0)
+                .color(catppuccin::SUBTEXT0)
+                .margin_bottom(4.0)
+        }),
         TextInput::new(signal)
             .placeholder(placeholder)
             .style(text_field_style),
@@ -1038,7 +1061,11 @@ mod tests {
         state.free_only.set(false);
 
         state.tools_only.set(true);
-        let ids: Vec<String> = state.visible_models().iter().map(|m| m.id.clone()).collect();
+        let ids: Vec<String> = state
+            .visible_models()
+            .iter()
+            .map(|m| m.id.clone())
+            .collect();
         assert_eq!(ids, vec!["chat"]);
 
         state.tools_only.set(false);
@@ -1053,7 +1080,11 @@ mod tests {
             row("paid-one", true, false, false),
         ]);
         state.free_only.set(true);
-        let ids: Vec<String> = state.visible_models().iter().map(|m| m.id.clone()).collect();
+        let ids: Vec<String> = state
+            .visible_models()
+            .iter()
+            .map(|m| m.id.clone())
+            .collect();
         assert_eq!(ids, vec!["free-one"]);
     }
 
@@ -1062,9 +1093,15 @@ mod tests {
     #[test]
     fn the_free_filter_never_hides_local_models() {
         let state = SettingsState::new();
-        state.models.set(vec![row("local-model", true, false, true)]);
+        state
+            .models
+            .set(vec![row("local-model", true, false, true)]);
         state.free_only.set(true);
-        assert_eq!(state.visible_models().len(), 1, "local models are not metered");
+        assert_eq!(
+            state.visible_models().len(),
+            1,
+            "local models are not metered"
+        );
     }
 
     #[test]
@@ -1079,7 +1116,11 @@ mod tests {
         state.tools_only.set(true);
         state.free_only.set(true);
         state.model_query.set("nemotron".into());
-        let ids: Vec<String> = state.visible_models().iter().map(|m| m.id.clone()).collect();
+        let ids: Vec<String> = state
+            .visible_models()
+            .iter()
+            .map(|m| m.id.clone())
+            .collect();
         assert_eq!(ids, vec!["nvidia/nemotron-free"]);
     }
 
@@ -1091,7 +1132,10 @@ mod tests {
 
         state.provider.set("openrouter".into());
         state.choose_model("google/gemma-4-31b-it:free");
-        assert_eq!(state.openrouter_model.get_untracked(), "google/gemma-4-31b-it:free");
+        assert_eq!(
+            state.openrouter_model.get_untracked(),
+            "google/gemma-4-31b-it:free"
+        );
         assert_eq!(state.lmstudio_model.get_untracked(), "", "untouched");
 
         state.provider.set("lmstudio".into());
