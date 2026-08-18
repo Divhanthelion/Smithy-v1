@@ -19,9 +19,7 @@ use async_trait::async_trait;
 use crossbeam_channel::Sender;
 use serde_json::Value;
 
-use smithy_agent::{
-    session::default_system_prompt, AgentConfig, Outcome, Session, SessionConfig, Skill, TurnEvent,
-};
+use smithy_agent::{AgentConfig, Outcome, Session, SessionConfig, Skill, TurnEvent};
 use smithy_editor::{PendingChangeManager, PendingFileChange};
 use smithy_tools::{
     command_leaves_project, HookDecision, Registry, ToolCall, ToolCtx, ToolHook, Workspace,
@@ -398,6 +396,8 @@ pub async fn build_session(
 
     let mcp = smithy_agent::mcp::attach_mcp(&project.root, &smithy_agent::mcp::RmcpConnector).await;
     let mut notices = mcp.notices;
+    let harness = smithy_agent::load_harness(&project.root);
+    notices.extend(harness.notices.iter().cloned());
     let already: Vec<String> = registry.names().into_iter().map(str::to_string).collect();
     for tool in mcp.tools {
         if already.iter().any(|n| n == tool.name()) {
@@ -421,7 +421,7 @@ pub async fn build_session(
 
     let project_chars = context.as_ref().map(|c| c.rendered.len()).unwrap_or(0);
     let map = context.as_ref().map(|c| c.rendered.as_str());
-    let mut prompt = default_system_prompt(workspace.root(), &registry.names(), map);
+    let mut prompt = smithy_agent::system_prompt(workspace.root(), &registry.names(), map);
     if let Some(skill) = &skill {
         prompt = format!("{prompt}\n\n{}", skill.injection());
     }

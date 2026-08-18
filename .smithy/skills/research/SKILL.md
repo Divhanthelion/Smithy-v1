@@ -3,6 +3,7 @@ name: research
 description: Long adversarial research — pin, snowball, disconfirm, write a cited note. Use only when the user types /research.
 argument-hint: "The question to research"
 tools: [read, write, ls, glob, grep, todo, web_fetch, web_search]
+include: snowball.md, sift.md, ach.md, authority.md
 max-seconds: 7200
 ---
 
@@ -14,7 +15,7 @@ If they passed arguments, that is the question. If they gave a topic, restate it
 
 Do not write a research agent, a scraper, or a new toolchain. Fetch, read, score, write the note.
 
-Sibling files in this skill directory (read them when the procedure names them): `snowball.md`, `sift.md`, `ach.md`.
+Sibling files in this skill directory (read them when the procedure names them): `snowball.md`, `sift.md`, `ach.md`, `authority.md`. Follow `authority.md` before ranking sources.
 
 ## Pin
 

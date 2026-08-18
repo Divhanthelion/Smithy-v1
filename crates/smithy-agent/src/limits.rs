@@ -8,7 +8,7 @@
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use smithy_tools::GatePause;
+use smithy_tools::{middle_truncate, GatePause};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Limits {
@@ -28,18 +28,14 @@ pub struct Limits {
     pub context_hard: i64,
     /// Give up after this many consecutive unusable responses.
     pub max_parse_retries: usize,
-    /// Soft cap on cumulative tool-result characters in one turn.
+    /// Soft cap on cumulative tool-result characters in one turn, and the
+    /// hard cap on a *single* result.
     ///
     /// Per-call caps are fine in isolation (`read` 2000 lines, `web_fetch` 64k
-    /// chars) but nothing bound their *sum*. One `web_fetch` at default is
-    /// ~16k tokens of uncached history; three greps and two fetches clear the
-    /// soft context warn inside five steps — all permanent, and none of it in
-    /// the cached prefix. That last part is what makes this worth bounding:
-    /// the frozen head of the prompt measures 76–79% cache hits, so it is
-    /// nearly free to re-send, while tool results are new bytes every turn and
-    /// are billed cold every time. Past this threshold we append a narrowing
-    /// hint to the result itself: warn, don't truncate — cutting risks removing
-    /// the answer the model needed, and would fail silently.
+    /// chars) but nothing bound their *sum*. A result over this size is middle-
+    /// truncated before it enters History. Past the same threshold *cumulatively*
+    /// we also append a narrowing hint. Do not scale this with a 1M window —
+    /// eight percent of a million tokens is a cap that never fires.
     #[serde(default = "default_tool_result_warn_chars")]
     pub tool_result_warn_chars: usize,
 }
@@ -52,13 +48,15 @@ fn default_tool_result_warn_chars() -> usize {
 
 /// Soft tool-result budget derived from the model's context window.
 ///
-/// Eight percent of the window, counted as characters (`chars ≈ tokens * 4`).
-/// The fraction is the failure above: enough headroom for a few focused reads,
-/// tight enough that a default `web_fetch` (64k chars) trips the warn on a
-/// 110k-class window before a second one lands.
+/// Eight percent of the window, counted as characters (`chars ≈ tokens * 4`),
+/// then clamped. The fraction is enough headroom for a few focused reads on a
+/// 32k–128k window. A 1M window must not raise this to hundreds of thousands
+/// of characters — that is how a 2000-line `read` sat in History forever.
 pub fn tool_result_warn_for_window(context_length: i64) -> usize {
     const SHARE: f64 = 0.08;
-    ((context_length.max(0) as f64) * SHARE * 4.0) as usize
+    const CEILING: usize = 24_000;
+    let scaled = ((context_length.max(0) as f64) * SHARE * 4.0) as usize;
+    scaled.min(CEILING)
 }
 
 impl Default for Limits {
@@ -232,13 +230,20 @@ impl Budget {
         self.last_prompt_tokens
     }
 
-    /// Count a tool result toward the per-turn aggregate and, past the soft
-    /// threshold, append a narrowing hint to the content *before* it enters
-    /// history. Append-only-safe: we shape the result, we do not rewrite it
-    /// later. Warn rather than truncate — cutting risks deleting the answer.
+    /// Count a tool result toward the per-turn aggregate. A single result over
+    /// the cap is middle-truncated *before* it enters history. Past the cap
+    /// cumulatively, a narrowing hint is appended. Append-only-safe: we shape
+    /// the result, we do not rewrite it later.
     pub fn annotate_tool_result(&mut self, content: &mut String) {
+        let cap = self.limits.tool_result_warn_chars;
+        if cap > 0 && content.chars().count() > cap {
+            *content = middle_truncate(content, cap);
+            content.push_str(
+                "\n\n[truncated; page with offset/limit or a narrower query rather than fetching more]",
+            );
+        }
         self.tool_result_chars = self.tool_result_chars.saturating_add(content.len());
-        if self.tool_result_chars > self.limits.tool_result_warn_chars {
+        if self.tool_result_chars > cap {
             content.push_str(
                 "\n\n[results are running long this turn; narrow the query rather than fetching more]",
             );
@@ -426,17 +431,38 @@ mod tests {
             "over the cap must tell the model what to do: {second}"
         );
         assert!(second.contains("running long"), "and say why: {second}");
-        // The body is still intact — we warn, we do not truncate.
+        // A small result is still intact — we truncate only when *this* body
+        // is over the cap.
         assert!(second.starts_with(&"y".repeat(50)));
         assert_eq!(b.tool_result_chars(), 110);
     }
 
     #[test]
-    fn tool_result_warn_scales_with_the_window() {
+    fn a_single_oversized_result_is_truncated_before_it_enters_history() {
+        let mut b = Budget::new(Limits {
+            tool_result_warn_chars: 80,
+            ..limits()
+        });
+        let mut body = "HEAD".to_string() + &"x".repeat(400) + "TAIL";
+        b.annotate_tool_result(&mut body);
+        assert!(body.contains("HEAD"), "{body}");
+        assert!(body.contains("TAIL"), "{body}");
+        assert!(body.contains("truncated"), "{body}");
+        assert!(
+            body.chars().count() < 400,
+            "the dump must not land whole: {}",
+            body.chars().count()
+        );
+        assert!(!body.contains(&"x".repeat(200)), "the middle is what goes");
+    }
+
+    #[test]
+    fn tool_result_warn_does_not_scale_with_a_million_token_window() {
         let small = tool_result_warn_for_window(32_768);
         let large = tool_result_warn_for_window(1_000_000);
-        assert!(large > small);
         assert_eq!(small, ((32_768.0_f64) * 0.08 * 4.0) as usize);
+        assert_eq!(large, 24_000, "a 1M window must not raise the sludge cap");
+        assert!(large >= small);
     }
 
     #[test]

@@ -147,7 +147,7 @@ impl OpenRouter {
         let s: &Sampling = request.sampling;
         let mut body = json!({
             "model": self.model,
-            "messages": request.history.to_api(),
+            "messages": request.history.to_api_with_reasoning(false),
             "tools": request.tools,
             "stream": true,
             "temperature": s.temperature,
@@ -175,6 +175,10 @@ impl Provider for OpenRouter {
 
     fn model(&self) -> &str {
         &self.model
+    }
+
+    fn stub_superseded_snapshots(&self) -> bool {
+        true
     }
 
     async fn preflight(&self) -> Result<(), ProviderError> {

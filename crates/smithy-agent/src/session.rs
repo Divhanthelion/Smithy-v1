@@ -868,7 +868,7 @@ impl Session {
                         let mut result: ToolResult = self.registry.execute(call, &self.ctx).await;
                         budget.record_tool_calls(1);
                         // Shape the result before it enters history — past the
-                        // aggregate cap, a narrowing hint; never a rewrite later.
+                        // aggregate cap, truncate a dump and hint to narrow.
                         budget.annotate_tool_result(&mut result.content);
 
                         emit(
@@ -882,6 +882,7 @@ impl Session {
                             },
                         );
                         self.history.push(Message::tool_result(&result));
+                        forget_superseded_file(&mut self.history, &*self.provider, call, &result);
                     }
                 }
             }
@@ -934,9 +935,39 @@ fn compact_instruction(focus: &str) -> String {
     format!(
         "Summarize this conversation so it can continue in the same Session. \
 The summary replaces the transcript the model will be sent next. \
-Keep decisions, file paths, what was already right, what is still open, and the next move. \
-Drop tool traces, retries, and abandoned dead ends. Write markdown. Do not call tools.{focus_line}"
+Keep decisions, file paths, constraints, failed approaches and why they failed, \
+test failures that are not in a file, what is still open, and the next move. \
+Do not paste source — disk is the source of truth. Drop stale file dumps and raw tool payloads. \
+Write markdown. Do not call tools.{focus_line}"
     )
+}
+
+fn forget_superseded_file(
+    history: &mut History,
+    provider: &dyn Provider,
+    call: &smithy_tools::ToolCall,
+    result: &ToolResult,
+) {
+    if result.is_error || !matches!(call.name.as_str(), "write" | "edit") {
+        return;
+    }
+    let Some(path) = path_from_call(call) else {
+        return;
+    };
+    // The just-landed write/edit args were model output, not yet a cached
+    // prefix. Dropping them before the next request is safe for every provider.
+    history.redact_landed_write_args(&call.id, &path);
+    if provider.stub_superseded_snapshots() {
+        history.stub_superseded_file(&path);
+    }
+}
+
+fn path_from_call(call: &smithy_tools::ToolCall) -> Option<String> {
+    call.parsed_arguments()
+        .ok()?
+        .get("path")?
+        .as_str()
+        .map(str::to_string)
 }
 
 fn conversation_text(history: &History) -> String {
@@ -964,7 +995,7 @@ fn conversation_text(history: &History) -> String {
     out
 }
 
-/// The default system prompt.
+/// The default system prompt (shipped Harness template, no file lookup).
 ///
 /// Kept a pure function of its inputs so it is byte-stable within a session:
 /// no timestamps, no per-turn variation, nothing that would change the head of
@@ -975,46 +1006,42 @@ fn conversation_text(history: &History) -> String {
 /// cached prefix, so it is prefilled once for the whole session instead of
 /// re-sent with every message. It is also why it cannot be refreshed mid-session:
 /// changing it invalidates the cache for every turn that follows.
+///
+/// For a Project that may have an edited Harness file, use [`system_prompt`].
 pub fn default_system_prompt(
     workspace: &std::path::Path,
     tool_names: &[&str],
     project_context: Option<&str>,
 ) -> String {
-    let base = format!(
-        "You are Smithy, a coding agent working in a single workspace on the user's machine.\n\
-         \n\
-         Workspace root: {ws}\n\
-         \n\
-         You have these tools: {tools}. Call a tool to take an action. Prefer to act with tools \
-         rather than describe what you would do. Take one focused step at a time: call a tool, \
-         observe its result, then decide the next step.\n\
-         \n\
-         Guidelines:\n\
-         - Discover files with `glob` (by name) and `ls` (a directory); search contents with \
-         `grep`. Use `read` with offset/limit for large files.\n\
-         - `glob` and `grep` skip anything the repository ignores, so a file they cannot find may \
-         still exist. `read` and `ls` do not skip it. If the user names a file and `glob` finds \
-         nothing, `read` the path directly before concluding it is missing — plans and design \
-         notes are often in ignored paths.\n\
-         - Before you name an enum variant, call a method, or refer to any item you have not read \
-         in this conversation, look it up with `symbol`. It answers in one call with the file, \
-         line and exact signature, and lists an enum's variants or a type's methods. The project \
-         summary below is a *map*: it tells you what exists, not what shape it has. Guessing a \
-         variant name or an argument count from the map is the single commonest way to write code \
-         that does not compile.\n\
-         - For a small change to an existing file use `edit`. Use `write` to create a new file or \
-         fully rewrite one — always emit the COMPLETE contents, never a diff.\n\
-         - For a multi-step job, call `todo` first to lay out the plan, and update it as you \
-         finish steps. Skip it for trivial one-step tasks.\n\
-         - Keep `bash` commands short and non-interactive. Output is truncated if large.\n\
-         - When the task is complete, reply with a short plain-text summary and DO NOT call any \
-         tool. That is how you end your turn.\n\
-         - Be concise. Do not narrate at length; let tool results speak.",
-        ws = workspace.display(),
-        tools = tool_names.join(", "),
-    );
+    system_prompt_from(
+        crate::harness::SYSTEM_TEMPLATE,
+        workspace,
+        tool_names,
+        project_context,
+    )
+}
 
-    with_project_context(base, project_context)
+/// System prompt for a Project: `SYSTEM.md`, then any `harness.toml` includes,
+/// then the Map. Project files, then user files, then what Smithy ships.
+pub fn system_prompt(
+    project: &std::path::Path,
+    tool_names: &[&str],
+    project_context: Option<&str>,
+) -> String {
+    let harness = crate::harness::load_harness(project);
+    with_project_context(harness.filled_base(project, tool_names), project_context)
+}
+
+fn system_prompt_from(
+    template: &str,
+    workspace: &std::path::Path,
+    tool_names: &[&str],
+    project_context: Option<&str>,
+) -> String {
+    with_project_context(
+        crate::harness::fill_system_template(template, workspace, tool_names),
+        project_context,
+    )
 }
 
 /// Join a Map onto a base system prompt so the snapshot warning cannot drift.
@@ -1491,6 +1518,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn compact_keeps_failures_and_does_not_ask_to_drop_tool_traces() {
+        let instruction = compact_instruction("");
+        assert!(instruction.contains("failed approaches"), "{instruction}");
+        assert!(
+            instruction.contains("disk is the source of truth"),
+            "{instruction}"
+        );
+        assert!(
+            !instruction.contains("Drop tool traces"),
+            "dropping traces is how Compact spends 10s grepping: {instruction}"
+        );
+    }
+
     #[tokio::test]
     async fn compact_replaces_history_and_keeps_the_system_prompt() {
         let (_t, mut s, provider) = harness(vec![
@@ -1614,13 +1655,10 @@ mod prefix_invariant_tests {
         (tmp, session)
     }
 
-    /// **The invariant the whole caching architecture rests on.**
-    ///
-    /// Every message present at the end of turn N must still be byte-identical
-    /// at the end of turn N+1. If any earlier byte changes, the endpoint's
-    /// prefix cache misses and the entire conversation is re-prefilled from
-    /// cold — minutes of latency at real context sizes, on every subsequent
-    /// turn.
+    /// **The invariant the caching architecture rests on, for providers that
+    /// keep the prefix.** ScriptedProvider defaults to that policy (LM Studio).
+    /// DeepSeek opts into stubbing stale file snapshots after a write, which
+    /// is a deliberate miss — Compact is the other one.
     #[tokio::test]
     async fn earlier_messages_are_never_rewritten() {
         let (_t, mut session) = harness(vec![

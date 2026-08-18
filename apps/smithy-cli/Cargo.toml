@@ -1,0 +1,20 @@
+[package]
+name = "smithy-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Terminal Session for the Smithy agent — same loop as the editor, files you can edit"
+
+[[bin]]
+name = "smithy-agent"
+path = "src/main.rs"
+
+[dependencies]
+smithy-agent.workspace = true
+smithy-tools.workspace = true
+smithy-project.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+similar.workspace = true

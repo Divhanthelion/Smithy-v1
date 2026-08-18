@@ -187,7 +187,9 @@ where
         let chunk = match tokio::time::timeout(idle, stream.next()).await {
             Ok(Some(Ok(chunk))) => chunk,
             Ok(Some(Err(e))) => {
-                return Err(ProviderError::BadResponse(format!("stream read error: {e}")));
+                return Err(ProviderError::BadResponse(format!(
+                    "stream read error: {e}"
+                )));
             }
             Ok(None) => break,
             Err(_) => {

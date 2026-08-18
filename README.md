@@ -105,6 +105,27 @@ cargo install --path apps/smithy --force
 binary of the same version, and since the version rarely changes, an upgrade
 would silently do nothing.
 
+The same Session, in the terminal, without opening the window:
+
+```bash
+cargo install --path apps/smithy-cli --force
+cd ~/code/your-project
+smithy-agent
+```
+
+That is the loop you can take apart. Copy the shipped system prompt into the
+Project with `smithy-agent --init-harness`, edit `.smithy/harness/SYSTEM.md`,
+then `/new` (or restart) so the next Session loads it. Extra files in that
+directory are **not** sent unless you list them in `harness.toml`:
+
+```toml
+include = ["voice.md"]
+```
+
+`/inspect` prints the segments this Session will POST (chars, and tokens once
+the provider has billed). `--yolo` skips Review for in-Project writes. `/help`
+lists the rest.
+
 The editor, terminal, file browser and language-server features all work without
 LM Studio — you just won't have an agent.
 
@@ -277,20 +298,23 @@ yours. It can't write, edit, run commands, or call itself, and it stops after
 about a dozen tool calls and reports partially rather than grinding. That bound
 is deliberate — Explore is not Research.
 
-**`/research`** and **`/grill-me`** are Skills, not Session kinds. Smithy
-ships both; they show up in every Project. A Project or `~/.smithy/skills/`
-copy overrides the shipped one. Drop a `SKILL.md` in `.smithy/skills/<name>/`
-and type `/name`. The body is prefixed onto that user message; conversation
-history and the frozen tool list stay. Optional frontmatter: `tools` (allowlist;
-omit for the coding set), `include` (sibling files concatenated into the body),
-`max-seconds`. `tools` and `max-seconds` apply only if a Session is rebuilt.
-MCP tools still attach.
+Skills are slash-only, not Session kinds. Smithy ships `/research`,
+`/grill-me`, `/grill-with-docs`, `/pointed-research`, `/domain-modeling`,
+`/code-review`, `/load-bearing-review`, and `/ship`. They show up in every
+Project. A Project or `~/.smithy/skills/` copy overrides the shipped one. Drop
+a `SKILL.md` in `.smithy/skills/<name>/` and type `/name`. The body is prefixed
+onto that user message; conversation history and the frozen tool list stay.
+Optional frontmatter: `tools` (allowlist; omit for the coding set), `include`
+(sibling files concatenated into the body), `max-seconds`. `tools` and
+`max-seconds` apply only if a Session is rebuilt. MCP tools still attach.
 
 The bundled research skill writes one note at `docs/research/YYYY-MM-DD-<slug>.md`
 through Review. It names search, fetch, read, and write as generally suited.
 Grill-me interviews as `❓ Qn` and waits; it names `read` / `explore` for facts.
 When you confirm a shared understanding, keep going in this Session or start a
-new one to implement.
+new one to implement. `/grill-with-docs` is the same interview plus `CONTEXT.md`
+and ADRs. `/pointed-research` pins a decision and writes a cited note.
+`/ship` tests, commits, and pushes.
 
 Type `/` in the composer for the picker. **Tab** completes (`/c` → `/compact `);
 arrows move the highlight. `@path` on a command becomes an

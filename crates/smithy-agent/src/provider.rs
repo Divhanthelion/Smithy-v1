@@ -159,6 +159,22 @@ pub trait Provider: Send + Sync {
         Ok(None)
     }
 
+    /// Whether tool-calling assistant messages must send `reasoning_content`
+    /// back on the next request. DeepSeek V4 400s without it. Default off —
+    /// the trace is stored on the Message either way; this only controls the
+    /// POST body.
+    fn round_trip_reasoning(&self) -> bool {
+        false
+    }
+
+    /// After a write lands, rewrite earlier `read`/`edit`/`write` payloads for
+    /// that path. A miss of the prefix cache is cheaper than attending to a
+    /// stale file. Local KV caches (LM Studio) leave this off — Compact is
+    /// their rewrite.
+    fn stub_superseded_snapshots(&self) -> bool {
+        false
+    }
+
     /// Get one completion. `on_delta`, when present, is called as fragments
     /// arrive; the assembled completion is returned either way.
     async fn complete(
@@ -174,7 +190,7 @@ pub trait Provider: Send + Sync {
     /// pair; real providers add sampling and stream flags.
     fn build_body(&self, request: &CompletionRequest<'_>) -> Value {
         serde_json::json!({
-            "messages": request.history.to_api(),
+            "messages": request.history.to_api_with_reasoning(self.round_trip_reasoning()),
             "tools": request.tools,
         })
     }
@@ -196,6 +212,7 @@ pub mod test_support {
     pub struct ScriptedProvider {
         script: Mutex<std::collections::VecDeque<Completion>>,
         pub calls: Mutex<usize>,
+        stub_superseded: bool,
     }
 
     impl ScriptedProvider {
@@ -203,6 +220,16 @@ pub mod test_support {
             Self {
                 script: Mutex::new(script.into()),
                 calls: Mutex::new(0),
+                stub_superseded: false,
+            }
+        }
+
+        /// Opt into rewriting stale file snapshots after a write lands.
+        pub fn stubbing_superseded(script: Vec<Completion>) -> Self {
+            Self {
+                script: Mutex::new(script.into()),
+                calls: Mutex::new(0),
+                stub_superseded: true,
             }
         }
 
@@ -218,6 +245,9 @@ pub mod test_support {
         }
         fn model(&self) -> &str {
             "test-model"
+        }
+        fn stub_superseded_snapshots(&self) -> bool {
+            self.stub_superseded
         }
         async fn complete(
             &self,

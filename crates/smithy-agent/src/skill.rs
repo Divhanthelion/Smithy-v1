@@ -7,8 +7,10 @@
 //! does not compress history. Tools stay whatever this Session was born with.
 //!
 //! Lookup: Project `.smithy/skills/<name>/SKILL.md`, then
-//! `~/.smithy/skills/<name>/SKILL.md`, then the `research` and `grill-me`
-//! procedures Smithy ships. Compact and Handoff are harness Commands, not
+//! `~/.smithy/skills/<name>/SKILL.md`, then the procedures Smithy ships
+//! (`research`, `grill-me`, `grill-with-docs`, `pointed-research`,
+//! `domain-modeling`, `code-review`, `load-bearing-review`, `ship`,
+//! `rust-first`, `authority`). Compact and Handoff are harness Commands, not
 //! Skills; they are listed in the `/` picker anyway.
 
 use std::path::{Path, PathBuf};
@@ -119,7 +121,7 @@ fn project_skills_dir(project: &Path) -> PathBuf {
 }
 
 /// Load `{name}/SKILL.md` from the Project, then the user directory, then
-/// procedures Smithy ships (`research`, `grill-me`).
+/// procedures Smithy ships.
 pub fn load_skill(project: &Path, name: &str) -> Option<Skill> {
     if !is_skill_name(name) {
         return None;
@@ -251,46 +253,39 @@ fn scan_dir(root: &Path, into: &mut std::collections::BTreeMap<String, SkillMeta
 }
 
 /// Procedures Smithy ships. Paths are the repo copies; `include_str!` embeds
-/// them so `/research` and `/grill-me` work in a Project that has neither.
+/// them so the Commands work in a Project that has neither a Project copy nor
+/// a `~/.smithy/skills/` copy.
+macro_rules! bundled_files {
+    ($dir:literal: $($file:literal),+ $(,)?) => {
+        (
+            $dir,
+            &[
+                $(
+                    ($file, include_str!(concat!("../../../.smithy/skills/", $dir, "/", $file))),
+                )+
+            ] as &[(&str, &str)],
+        )
+    };
+}
+
 const BUNDLED: &[(&str, &[(&str, &str)])] = &[
-    (
-        "research",
-        &[
-            (
-                "SKILL.md",
-                include_str!("../../../.smithy/skills/research/SKILL.md"),
-            ),
-            (
-                "snowball.md",
-                include_str!("../../../.smithy/skills/research/snowball.md"),
-            ),
-            (
-                "sift.md",
-                include_str!("../../../.smithy/skills/research/sift.md"),
-            ),
-            (
-                "ach.md",
-                include_str!("../../../.smithy/skills/research/ach.md"),
-            ),
-        ],
+    bundled_files!("research": "SKILL.md", "snowball.md", "sift.md", "ach.md", "authority.md"),
+    bundled_files!("grill-me": "SKILL.md", "grilling.md", "rust-first.md"),
+    bundled_files!(
+        "grill-with-docs": "SKILL.md",
+        "grilling.md",
+        "rust-first.md",
+        "domain-modeling.md",
+        "CONTEXT-FORMAT.md",
+        "ADR-FORMAT.md"
     ),
-    (
-        "grill-me",
-        &[
-            (
-                "SKILL.md",
-                include_str!("../../../.smithy/skills/grill-me/SKILL.md"),
-            ),
-            (
-                "grilling.md",
-                include_str!("../../../.smithy/skills/grill-me/grilling.md"),
-            ),
-            (
-                "rust-first.md",
-                include_str!("../../../.smithy/skills/grill-me/rust-first.md"),
-            ),
-        ],
-    ),
+    bundled_files!("pointed-research": "SKILL.md", "rust-first.md", "authority.md"),
+    bundled_files!("domain-modeling": "SKILL.md", "CONTEXT-FORMAT.md", "ADR-FORMAT.md"),
+    bundled_files!("code-review": "SKILL.md", "rust-first.md"),
+    bundled_files!("load-bearing-review": "SKILL.md", "lenses.md", "template.md"),
+    bundled_files!("ship": "SKILL.md", "rust-first.md"),
+    bundled_files!("rust-first": "SKILL.md"),
+    bundled_files!("authority": "SKILL.md"),
 ];
 
 fn bundled_skills() -> Vec<Skill> {
@@ -576,8 +571,21 @@ mod tests {
         let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let root = manifest.parent().unwrap().parent().unwrap();
         let names: Vec<String> = list_skills(root).into_iter().map(|m| m.name).collect();
-        assert!(names.iter().any(|n| n == "research"), "{names:?}");
-        assert!(names.iter().any(|n| n == "grill-me"), "{names:?}");
+        for expected in [
+            "research",
+            "grill-me",
+            "grill-with-docs",
+            "pointed-research",
+            "domain-modeling",
+            "code-review",
+            "load-bearing-review",
+            "ship",
+        ] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "{expected} in {names:?}"
+            );
+        }
     }
 
     #[test]
@@ -593,12 +601,15 @@ mod tests {
         let grill = load_skill(dir.path(), "grill-me").expect("bundled grill-me");
         assert_eq!(grill.meta.name, "grill-me");
         assert!(grill.body.contains("Ask the whole frontier") || grill.body.contains("frontier"));
+        let pointed = load_skill(dir.path(), "pointed-research").expect("bundled pointed-research");
+        assert!(pointed.body.contains("decision"), "{}", pointed.body);
         let names: Vec<String> = list_skills(dir.path())
             .into_iter()
             .map(|m| m.name)
             .collect();
         assert!(names.iter().any(|n| n == "research"), "{names:?}");
         assert!(names.iter().any(|n| n == "grill-me"), "{names:?}");
+        assert!(names.iter().any(|n| n == "ship"), "{names:?}");
     }
 
     #[test]

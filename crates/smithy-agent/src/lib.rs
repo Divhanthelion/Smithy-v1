@@ -4,11 +4,15 @@
 //! source projects and the only one whose design was driven by measurement
 //! rather than assumption. What it brings, and why each part is load-bearing:
 //!
-//! - **Append-only history.** Prefix caching on a local endpoint is a strict
-//!   prefix match: a warm identical prefix is dramatically faster to prefill,
-//!   and changing one early token reverts to the full cold cost. So history is
-//!   never mutated, reordered, or re-rendered, and the system prompt and tool
-//!   schemas are byte-stable for the life of a session.
+//! - **Append-only history, with two explicit rewrites.** Prefix caching on a
+//!   local endpoint is a strict prefix match: a warm identical prefix is
+//!   dramatically faster to prefill, and changing one early token reverts to the
+//!   full cold cost. Ordinary turns only append, and the system prompt and tool
+//!   schemas are byte-stable for the life of a session. Compact installs a new
+//!   prefix on purpose. After a write lands, providers that opt in (DeepSeek,
+//!   OpenRouter) stub superseded `read`/`edit`/`write` payloads for that path —
+//!   a stale file in History is a lie, and disk is the source of truth. LM Studio
+//!   does not rewrite earlier turns; Compact is its rewrite.
 //! - **[`Budget`].** Step, wall-clock, and context ceilings, with the token
 //!   count read from the API's own `usage.prompt_tokens` rather than a local
 //!   tokenizer. Cheapest possible protection against a runaway loop.
@@ -42,6 +46,7 @@
 pub mod catalogue;
 pub mod config;
 pub mod explore;
+pub mod harness;
 pub mod limits;
 pub mod mcp;
 pub mod message;
@@ -56,6 +61,10 @@ pub mod symbol_tool;
 pub use catalogue::{ModelEntry, ModelTier};
 pub use config::{AgentConfig, Endpoint, ProviderChoice};
 pub use explore::Explore;
+pub use harness::{
+    init_project_harness, load_harness, project_system_prompt_path, resolve_system_template,
+    unused_harness_files, Harness, HarnessSource, IncludedFile, SYSTEM_TEMPLATE,
+};
 pub use limits::{tool_result_warn_for_window, Budget, Limits, Stop};
 pub use message::{History, Message, Role};
 pub use parse::{parse, Action};
@@ -63,8 +72,8 @@ pub use persist::{transcript, SessionStore, TranscriptEntry};
 pub use provider::{Completion, CompletionRequest, Delta, Provider, ProviderError, Sampling};
 pub use providers::{create_provider_from_env, LmStudio, ModelInfo, OpenRouter};
 pub use session::{
-    with_project_context, ContextLedger, ContextSegment, Outcome, Session, SessionConfig, Stopper,
-    TurnEvent, Usage, CANCELLED,
+    default_system_prompt, system_prompt, with_project_context, ContextLedger, ContextSegment,
+    Outcome, Session, SessionConfig, Stopper, TurnEvent, Usage, CANCELLED,
 };
 pub use skill::{
     handoff_injection, harness_commands, install_bundled_user_skills, is_harness_command,

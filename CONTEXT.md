@@ -23,7 +23,7 @@ One conversation the user is in: resume id, History, frozen tools, Map. New sess
 _Avoid_: using Session to mean "a new prefix"; chat, thread as type names
 
 **History**:
-The messages this Session will send on the next completion. Ordinary turns append. Compact replaces them with a summary. Resume replays them verbatim.
+The messages this Session will send on the next completion. Ordinary turns append. After a write lands, some Providers replace superseded `read`/`edit`/`write` payloads for that path with a stub (disk is the source of truth). Compact replaces the rest with a summary. Resume replays them verbatim.
 _Avoid_: the Project; the panel's view-only transcript; Handoff notes
 
 **Turn**:
@@ -84,12 +84,16 @@ The drawing trait the Fisherman (and harness) paint through. UI-crate adapters i
 
 ### Commands and skills
 
+**Harness**:
+The files that assemble a Session: `SYSTEM.md` plus any `include` listed in `harness.toml`. Project `.smithy/harness/`, then `~/.smithy/harness/`, then what Smithy ships. A file in that directory that is not listed is not sent. Editing mid-Session does not hot-reload.
+_Avoid_: Skill as the harness; always-on rules that are not in the include list; stuffing Cursor rules into every Turn
+
 **Command**:
 Composer `/name` plus optional args. A Skill Command injects `SKILL.md` into this turn. Compact and Handoff are harness Commands, not Skills.
 _Avoid_: every slash being a Skill; slash as a mid-chat tool swap
 
 **Skill**:
-A `SKILL.md` (Project `.smithy/skills/<name>/`, then `~/.smithy/skills/<name>/`, then the `research` and `grill-me` procedures Smithy ships) loaded only when the user types that Command. A context-injection macro: the body is prefixed onto the current user message (the panel shows what they typed). Optional frontmatter `tools` (allowlist), `include` (sibling files), `max-seconds`. `tools` and `max-seconds` wait for New session, not Compact. Editing the file mid-Session does not hot-reload.
+A `SKILL.md` (Project `.smithy/skills/<name>/`, then `~/.smithy/skills/<name>/`, then the procedures Smithy ships) loaded only when the user types that Command. A context-injection macro: the body is prefixed onto the current user message (the panel shows what they typed). Optional frontmatter `tools` (allowlist), `include` (sibling files), `max-seconds`. `tools` and `max-seconds` wait for New session, not Compact. Editing the file mid-Session does not hot-reload.
 _Avoid_: auto-invoke from ambient text, marketplace, stuffing `@` files into the system prompt, a Session kind per skill, compressing history to apply a skill
 
 **Compact**:

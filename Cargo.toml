@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "apps/smithy",
+    "apps/smithy-cli",
     "crates/smithy-editor",
     "crates/smithy-fisherman",
     "crates/smithy-tools",

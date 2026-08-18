@@ -155,7 +155,7 @@ impl LmStudio {
         let s: &Sampling = request.sampling;
         let mut body = json!({
             "model": self.model,
-            "messages": request.history.to_api(),
+            "messages": request.history.to_api_with_reasoning(false),
             "tools": request.tools,
             "stream": true,
             "temperature": s.temperature,
@@ -334,7 +334,9 @@ impl ModelInfo {
         };
         crate::limits::Limits {
             context_hard: (ctx as f64 * 0.85) as i64,
-            context_warn: (ctx as f64 * 0.25) as i64,
+            // 25% of a 1M window is 250k — a warn that never fires while the
+            // prompt is already sludge. Cap at the original 32k-class warn.
+            context_warn: ((ctx as f64 * 0.25) as i64).min(32_768),
             max_steps: steps_for_context(ctx),
             tool_result_warn_chars: crate::limits::tool_result_warn_for_window(ctx),
             ..defaults
@@ -810,6 +812,18 @@ mod native_api_tests {
             limits.context_hard < 131_072,
             "the hard stop must leave room for the response"
         );
+    }
+
+    #[test]
+    fn a_million_token_window_does_not_raise_the_sludge_budgets() {
+        let info = ModelInfo {
+            context_length: Some(1_000_000),
+            ..Default::default()
+        };
+        let limits = info.suggested_limits();
+        assert_eq!(limits.context_warn, 32_768);
+        assert_eq!(limits.tool_result_warn_chars, 24_000);
+        assert_eq!(limits.context_hard, 850_000);
     }
 
     #[test]

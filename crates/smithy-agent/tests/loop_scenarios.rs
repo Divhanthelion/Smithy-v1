@@ -59,6 +59,26 @@ fn harness(script: Vec<Completion>) -> Harness {
     harness_with(script, Registry::core(), Limits::default())
 }
 
+fn harness_stubbing(script: Vec<Completion>) -> Harness {
+    let root = tempfile::tempdir().expect("tempdir");
+    std::fs::write(root.path().join("notes.txt"), "alpha\nbravo\n").expect("seed");
+    let workspace = Workspace::open(root.path()).expect("workspace");
+    let ctx = Arc::new(ToolCtx::new(workspace));
+    let provider = Arc::new(ScriptedProvider::stubbing_superseded(script));
+    let session = Session::new(
+        provider.clone(),
+        Arc::new(Registry::core()),
+        ctx.clone(),
+        SessionConfig::new("you are a test"),
+    );
+    Harness {
+        _root: root,
+        session,
+        provider,
+        ctx,
+    }
+}
+
 /// Collect the events a turn emits, so ordering and pairing can be asserted.
 fn recording_sink() -> (
     Arc<std::sync::Mutex<Vec<TurnEvent>>>,
@@ -113,6 +133,76 @@ async fn a_tool_result_is_fed_back_and_the_turn_answers() {
     assert!(
         history.contains("alpha"),
         "the tool's output must reach the model, not just the UI: {history}"
+    );
+}
+
+/// After a write lands, the prior `read` of that file is a lie. Providers that
+/// opt in stub it so the next completion does not attend to stale bytes.
+#[tokio::test]
+async fn a_landed_write_drops_the_stale_read_when_the_provider_opts_in() {
+    let mut h = harness_stubbing(vec![
+        tool_call("c1", "read", r#"{"path": "notes.txt"}"#),
+        tool_call(
+            "c2",
+            "write",
+            r#"{"path": "notes.txt", "content": "omega\n"}"#,
+        ),
+        answer("rewrote it"),
+    ]);
+
+    h.session
+        .run_turn("replace notes.txt", None)
+        .await
+        .expect("turn");
+
+    assert_eq!(
+        h.ctx.workspace.read_to_string("notes.txt").expect("disk"),
+        "omega\n",
+        "disk is the source of truth"
+    );
+    let history = h.session.history().to_api().to_string();
+    assert!(
+        !history.contains("alpha"),
+        "stale file body must not be sent: {history}"
+    );
+    assert!(
+        !history.contains("omega\\n") && !history.contains("\"omega"),
+        "the write payload belongs on disk, not in History: {history}"
+    );
+    assert!(
+        history.contains("omitted"),
+        "the stub has to say why the body is gone: {history}"
+    );
+}
+
+/// LM Studio's prefix cache is a strict KV. Stubbing an earlier read would
+/// miss it. The just-landed write args still drop — they were never in a
+/// cached prefix.
+#[tokio::test]
+async fn a_landed_write_keeps_the_earlier_read_when_the_prefix_must_hold() {
+    let mut h = harness(vec![
+        tool_call("c1", "read", r#"{"path": "notes.txt"}"#),
+        tool_call(
+            "c2",
+            "write",
+            r#"{"path": "notes.txt", "content": "omega\n"}"#,
+        ),
+        answer("rewrote it"),
+    ]);
+
+    h.session
+        .run_turn("replace notes.txt", None)
+        .await
+        .expect("turn");
+
+    let history = h.session.history().to_api().to_string();
+    assert!(
+        history.contains("alpha"),
+        "the earlier read stays so the prefix still hits: {history}"
+    );
+    assert!(
+        !history.contains("\"omega"),
+        "the just-landed write payload is not in History: {history}"
     );
 }
 

@@ -139,7 +139,7 @@ impl DeepSeek {
         let s: &Sampling = request.sampling;
         let mut body = json!({
             "model": self.model,
-            "messages": request.history.to_api(),
+            "messages": request.history.to_api_with_reasoning(true),
             "tools": request.tools,
             "stream": true,
             "temperature": s.temperature,
@@ -161,6 +161,14 @@ impl Provider for DeepSeek {
 
     fn model(&self) -> &str {
         &self.model
+    }
+
+    fn round_trip_reasoning(&self) -> bool {
+        true
+    }
+
+    fn stub_superseded_snapshots(&self) -> bool {
+        true
     }
 
     /// Confirm the key works, using `/models`.
