@@ -23,11 +23,15 @@ impl Tool for Read {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::new(
             "read",
-            "Read a file from the workspace. Returns up to 2000 lines, each prefixed with its \
-             line number and a tab. Use offset/limit to page through larger files. Lines longer \
-             than 2000 characters are truncated.",
+            "Read a file from the Project or the session scratch directory. Returns up to 2000 \
+             lines, each prefixed with its line number and a tab. Use offset/limit to page \
+             through larger files. Lines longer than 2000 characters are truncated.",
             vec![
-                ToolParameter::string("path", "File path, relative to the workspace root.", true),
+                ToolParameter::string(
+                    "path",
+                    "File path: Project-relative, or an absolute path in the Project or scratch.",
+                    true,
+                ),
                 ToolParameter::integer("offset", "1-based line to start from (default 1).", false),
                 ToolParameter::integer("limit", "Max lines to return (default 2000).", false),
             ],

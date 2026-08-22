@@ -14,7 +14,7 @@ _Avoid_: workspace (except the sandbox type), folder, repo (unless you mean git)
 A Cargo `[workspace]` with members. Say this in full when you mean the Rust package graph, never "workspace" alone.
 
 **Workspace**:
-The `cap-std` directory capability rooted at the Project. The OS refuses escapes, including via symlinks. It is a handle, not a synonym for Project.
+The `cap-std` directory capability rooted at the Project, plus a second capability for session scratch under the OS temp directory. The OS refuses escapes, including via symlinks. `/tmp` itself is not open. It is a handle, not a synonym for Project.
 
 ### The agent
 

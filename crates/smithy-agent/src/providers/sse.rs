@@ -8,11 +8,39 @@ use smithy_tools::ToolCall;
 
 use crate::provider::{Completion, Delta, ProviderError};
 
-/// If the TCP connection stays open but the endpoint sends nothing, the panel
-/// sits on `working...` until the request timeout (fifteen minutes). That looks
-/// like a crash. Ninety seconds of silence after a 200 is a stall, not thinking
-/// — thinking models still emit `reasoning_content` tokens.
+/// Hosted endpoints: 90s of socket silence is a hang. Do not use this on a
+/// local engine — llama.cpp can decode for minutes without flushing SSE
+/// (prefill, then again while buffering a large `write` body). The turn
+/// clock is the hang bound there.
 pub const STREAM_IDLE: Duration = Duration::from_secs(90);
+
+/// How long to wait for SSE bytes.
+#[derive(Clone, Copy, Debug)]
+pub struct StreamIdle {
+    /// Until the first chunk. Local prefill is silent for this whole window.
+    pub until_first: Duration,
+    /// Between chunks once tokens have started.
+    pub between: Duration,
+}
+
+impl StreamIdle {
+    /// Cloud endpoints start streaming promptly. The same bound both sides.
+    pub const fn stall() -> Self {
+        Self {
+            until_first: STREAM_IDLE,
+            between: STREAM_IDLE,
+        }
+    }
+
+    /// Local: no second, shorter idle. Prefill and mid-stream gaps share the
+    /// request/turn timeout. A quiet socket is not evidence the GPU stopped.
+    pub fn local(timeout: Duration) -> Self {
+        Self {
+            until_first: timeout,
+            between: timeout,
+        }
+    }
+}
 
 #[derive(Default, Debug, Clone)]
 pub struct PartialCall {
@@ -162,29 +190,36 @@ pub async fn consume_sse_stream<S, B, E>(
     on_delta: Option<&(dyn Fn(Delta) + Send + Sync)>,
 ) -> Result<Completion, ProviderError>
 where
-    S: futures_util::Stream<Item = Result<B, E>> + Unpin,
+    S: futures_util::Stream<Item = Result<B, E>>,
     B: AsRef<[u8]>,
     E: std::fmt::Display,
 {
-    consume_sse_with_idle(stream, on_delta, STREAM_IDLE).await
+    consume_sse_with_idle(stream, on_delta, StreamIdle::stall()).await
 }
 
-async fn consume_sse_with_idle<S, B, E>(
-    mut stream: S,
+pub async fn consume_sse_with_idle<S, B, E>(
+    stream: S,
     on_delta: Option<&(dyn Fn(Delta) + Send + Sync)>,
-    idle: Duration,
+    idle: StreamIdle,
 ) -> Result<Completion, ProviderError>
 where
-    S: futures_util::Stream<Item = Result<B, E>> + Unpin,
+    S: futures_util::Stream<Item = Result<B, E>>,
     B: AsRef<[u8]>,
     E: std::fmt::Display,
 {
+    tokio::pin!(stream);
     let mut out = Completion::default();
     let mut partials: Vec<PartialCall> = Vec::new();
     let mut buffer = String::new();
+    let mut waiting_first = true;
 
     loop {
-        let chunk = match tokio::time::timeout(idle, stream.next()).await {
+        let wait = if waiting_first {
+            idle.until_first
+        } else {
+            idle.between
+        };
+        let chunk = match tokio::time::timeout(wait, stream.next()).await {
             Ok(Some(Ok(chunk))) => chunk,
             Ok(Some(Err(e))) => {
                 return Err(ProviderError::BadResponse(format!(
@@ -193,11 +228,15 @@ where
             }
             Ok(None) => break,
             Err(_) => {
-                return Err(ProviderError::BadResponse(
-                    "the model stopped sending tokens (stream stalled)".into(),
-                ));
+                let msg = if waiting_first {
+                    "the model sent no tokens (prefill or stall)".to_string()
+                } else {
+                    "the model stopped sending tokens (stream stalled)".to_string()
+                };
+                return Err(ProviderError::BadResponse(msg));
             }
         };
+        waiting_first = false;
         buffer.push_str(&String::from_utf8_lossy(chunk.as_ref()));
 
         let mut done = false;
@@ -220,16 +259,67 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt;
+
+    fn idle(until_first: Duration, between: Duration) -> StreamIdle {
+        StreamIdle {
+            until_first,
+            between,
+        }
+    }
 
     #[tokio::test]
     async fn a_silent_stream_fails_rather_than_sitting_forever() {
         let stream = futures_util::stream::pending::<Result<Vec<u8>, String>>();
-        let err = consume_sse_with_idle(stream, None, Duration::from_millis(20))
-            .await
-            .unwrap_err();
+        let err = consume_sse_with_idle(
+            stream,
+            None,
+            idle(Duration::from_millis(20), Duration::from_secs(5)),
+        )
+        .await
+        .unwrap_err();
         assert!(
-            err.to_string().contains("stalled"),
+            err.to_string().contains("stall"),
             "a hung body has to surface as a failed turn, not working… forever: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slow_first_chunk_is_prefill_not_a_stall() {
+        let frames = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n",
+            "data: [DONE]\n",
+        )
+        .to_string();
+        let stream = futures_util::stream::once(async move {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            Ok::<_, String>(frames.into_bytes())
+        });
+        let out = consume_sse_with_idle(
+            stream,
+            None,
+            idle(Duration::from_millis(200), Duration::from_millis(10)),
+        )
+        .await
+        .expect("prefill silence must not abort the stream");
+        assert_eq!(out.content, "hi");
+    }
+
+    #[tokio::test]
+    async fn silence_after_the_first_chunk_is_a_stall() {
+        let first = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n".to_vec();
+        let stream = futures_util::stream::once(async { Ok::<_, String>(first) })
+            .chain(futures_util::stream::pending::<Result<Vec<u8>, String>>());
+        let err = consume_sse_with_idle(
+            stream,
+            None,
+            idle(Duration::from_secs(5), Duration::from_millis(20)),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("stopped sending"),
+            "generation silence is still a stall: {err}"
         );
     }
 

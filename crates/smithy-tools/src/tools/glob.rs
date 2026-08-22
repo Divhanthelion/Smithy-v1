@@ -22,6 +22,7 @@
 use async_trait::async_trait;
 use ignore::WalkBuilder;
 use serde_json::Value;
+use std::path::PathBuf;
 
 use crate::registry::{Tool, ToolCtx};
 use crate::schema::{arg_str, arg_str_opt, ToolDefinition, ToolOutput, ToolParameter};
@@ -45,7 +46,8 @@ impl Tool for Glob {
                 ToolParameter::string("pattern", "Glob pattern, e.g. `**/*.rs`.", true),
                 ToolParameter::string(
                     "path",
-                    "Directory to search under, relative to the workspace root (default: root).",
+                    "Directory to search under: Project-relative, or an absolute path in the \
+                     Project or scratch (default: Project root).",
                     false,
                 ),
             ],
@@ -75,7 +77,8 @@ impl Tool for Glob {
             Ok(m) => m,
             Err(e) => return ToolOutput::err(e),
         };
-        let ws_root = ctx.workspace.root().to_path_buf();
+        let project_root = ctx.workspace.root().to_path_buf();
+        let scratch_root = ctx.workspace.scratch_root().map(PathBuf::from);
 
         let found = tokio::task::spawn_blocking(move || {
             let mut found: Vec<String> = Vec::new();
@@ -89,12 +92,15 @@ impl Tool for Glob {
                 if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
                     continue;
                 }
-                let Ok(rel) = entry.path().strip_prefix(&ws_root) else {
-                    continue; // outside the workspace; cannot be named
+                let Some(shown) = crate::sandbox::shown_if_contained(
+                    entry.path(),
+                    &project_root,
+                    scratch_root.as_deref(),
+                ) else {
+                    continue;
                 };
-                let rel_str = rel.to_string_lossy().replace('\\', "/");
-                if matcher.matches(&rel_str) {
-                    found.push(rel_str);
+                if matcher.matches(&shown) {
+                    found.push(shown);
                 }
             }
             found.sort();

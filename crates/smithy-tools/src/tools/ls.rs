@@ -21,7 +21,8 @@ impl Tool for Ls {
              trailing slash. Use `glob` to find files by name across the tree.",
             vec![ToolParameter::string(
                 "path",
-                "Directory path relative to the workspace root (default: the root itself).",
+                "Directory: Project-relative, or an absolute path in the Project or scratch \
+                 (default: the Project root).",
                 false,
             )],
         )

@@ -1276,6 +1276,10 @@ pub fn setup_agent_effect(agent: AgentState) {
                     panel.streaming_reasoning.set(String::new());
                     panel.push(smithy_editor::AgentEntry::Error(error));
                     panel.busy.set(false);
+                    // Same as Stopped: the user message (and any finished
+                    // tool steps) are already in History. Dropping them hid
+                    // why the turn died and forced a retry from an empty file.
+                    save_session(&for_save);
                 }
                 AgentUiEvent::Compacted {
                     summary,
