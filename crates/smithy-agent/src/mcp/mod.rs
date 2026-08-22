@@ -14,11 +14,13 @@ use serde_json::Value;
 use smithy_tools::{Registry, Tool, ToolDefinition};
 
 mod client;
+mod hook;
 mod schema;
 mod wrap;
 
 pub use client::RmcpConnector;
-pub use wrap::{McpInvoke, McpTool, UnavailableMcpTool};
+pub use hook::McpReviewHook;
+pub use wrap::{is_mcp_tool_name, McpInvoke, McpTool, UnavailableMcpTool};
 
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const CALL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -79,6 +81,9 @@ pub struct ListedTool {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+    /// `true` when the MCP server declared `annotations.readOnlyHint = true`.
+    /// `false` (the default) means the tool may mutate remote state.
+    pub read_only: bool,
 }
 
 pub struct ConnectedServer {
@@ -99,6 +104,8 @@ pub trait McpConnector: Send + Sync {
 pub struct McpAttach {
     pub tools: Vec<Box<dyn Tool>>,
     pub notices: Vec<String>,
+    /// Names of MCP tools that declared `readOnlyHint = true`.
+    pub read_only_tools: Vec<String>,
 }
 
 /// Project `.smithy/mcp.json` replaces a user entry of the same name.
@@ -178,6 +185,7 @@ fn is_allowed(server: &McpServer, remote_name: &str) -> bool {
 pub async fn attach_mcp(project: &Path, connector: &dyn McpConnector) -> McpAttach {
     let (file, mut notices) = load_mcp_files(project);
     let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+    let mut read_only_tools: Vec<String> = Vec::new();
     for (name, server) in &file.servers {
         if !server.enabled {
             continue;
@@ -194,7 +202,14 @@ pub async fn attach_mcp(project: &Path, connector: &dyn McpConnector) -> McpAtta
         match tokio::time::timeout(CONNECT_TIMEOUT, connector.connect(name, server, project)).await
         {
             Ok(Ok(connected)) => {
-                wrap_listed(name, server, connected, &mut tools, &mut notices);
+                wrap_listed(
+                    name,
+                    server,
+                    connected,
+                    &mut tools,
+                    &mut notices,
+                    &mut read_only_tools,
+                );
             }
             Ok(Err(e)) => notices.push(format!("MCP `{name}` omitted: {e}")),
             Err(_) => notices.push(format!(
@@ -203,7 +218,11 @@ pub async fn attach_mcp(project: &Path, connector: &dyn McpConnector) -> McpAtta
             )),
         }
     }
-    McpAttach { tools, notices }
+    McpAttach {
+        tools,
+        notices,
+        read_only_tools,
+    }
 }
 
 fn wrap_listed(
@@ -212,6 +231,7 @@ fn wrap_listed(
     connected: ConnectedServer,
     tools: &mut Vec<Box<dyn Tool>>,
     notices: &mut Vec<String>,
+    read_only_tools: &mut Vec<String>,
 ) {
     for listed in connected.tools {
         if !is_allowed(cfg, &listed.name) {
@@ -240,11 +260,15 @@ fn wrap_listed(
         } else {
             listed.description
         };
+        if listed.read_only {
+            read_only_tools.push(advertised.clone());
+        }
         tools.push(Box::new(McpTool {
             name: advertised.clone(),
             remote_name: listed.name,
             definition: ToolDefinition::new(advertised, description, params),
             invoke: connected.invoke.clone(),
+            read_only: listed.read_only,
         }));
     }
 }
@@ -433,11 +457,13 @@ mod tests {
                     name: "get_me".into(),
                     description: "whoami".into(),
                     input_schema: serde_json::json!({"type": "object"}),
+                    read_only: true,
                 },
                 ListedTool {
                     name: "create_issue".into(),
                     description: "write".into(),
                     input_schema: serde_json::json!({"type": "object"}),
+                    read_only: false,
                 },
             ],
         };
@@ -473,6 +499,7 @@ mod tests {
                 name: "weird".into(),
                 description: String::new(),
                 input_schema: serde_json::json!({"$ref": "#/nope"}),
+                read_only: false,
             }],
         };
         let attach = attach_mcp(tmp.path(), &connector).await;

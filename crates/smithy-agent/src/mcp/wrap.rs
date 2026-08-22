@@ -9,6 +9,11 @@ use smithy_tools::{Tool, ToolCtx, ToolDefinition};
 
 use super::CALL_TIMEOUT;
 
+/// Check whether a tool name is an MCP tool (contains `_` separator).
+pub fn is_mcp_tool_name(name: &str) -> bool {
+    name.contains('_')
+}
+
 /// `tools/call` against a connected server.
 #[async_trait]
 pub trait McpInvoke: Send + Sync {
@@ -20,6 +25,9 @@ pub struct McpTool {
     pub remote_name: String,
     pub definition: ToolDefinition,
     pub invoke: Arc<dyn McpInvoke>,
+    /// `true` when the MCP server declared `annotations.readOnlyHint = true`.
+    /// Mutating tools (where this is `false`) are denied by `McpReviewHook`.
+    pub read_only: bool,
 }
 
 #[async_trait]
@@ -100,6 +108,7 @@ mod tests {
             remote_name: "get_me".into(),
             definition: ToolDefinition::new("github_get_me", "me", vec![]),
             invoke: Arc::new(Boom),
+            read_only: true,
         };
         let dir = tempfile::tempdir().unwrap();
         let ctx = ToolCtx::new(Workspace::open(dir.path()).unwrap());

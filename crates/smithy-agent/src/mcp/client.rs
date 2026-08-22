@@ -122,10 +122,19 @@ async fn finish_connect(client: RunningService<RoleClient, ()>) -> Result<Connec
     let tools = listed
         .tools
         .into_iter()
-        .map(|t| ListedTool {
-            name: t.name.into_owned(),
-            description: t.description.map(|d| d.into_owned()).unwrap_or_default(),
-            input_schema: Value::Object((*t.input_schema).clone()),
+        .map(|t| {
+            // Per MCP spec, `read_only_hint` defaults to false (the pessimistic assumption).
+            let read_only = t
+                .annotations
+                .as_ref()
+                .and_then(|a| a.read_only_hint)
+                .unwrap_or(false);
+            ListedTool {
+                name: t.name.into_owned(),
+                description: t.description.map(|d| d.into_owned()).unwrap_or_default(),
+                input_schema: Value::Object((*t.input_schema).clone()),
+                read_only,
+            }
         })
         .collect();
     Ok(ConnectedServer {
