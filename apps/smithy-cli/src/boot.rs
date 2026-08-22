@@ -94,6 +94,7 @@ pub async fn boot(project: &Project, yolo: bool, skill: Option<Skill>) -> Result
 
     let mcp = smithy_agent::mcp::attach_mcp(&project.root, &smithy_agent::mcp::RmcpConnector).await;
     let mut notices = mcp.notices;
+    let read_only_mcp_tools = mcp.read_only_tools;
     let already: Vec<String> = registry.names().into_iter().map(str::to_string).collect();
     for tool in mcp.tools {
         if already.iter().any(|n| n == tool.name()) {
@@ -110,11 +111,10 @@ pub async fn boot(project: &Project, yolo: bool, skill: Option<Skill>) -> Result
     }
 
     let auto_approve = Arc::new(AtomicBool::new(yolo));
-    let review_writes = {
-        let names = registry.names();
-        names.contains(&"write") || names.contains(&"edit")
-    };
-    let has_bash = registry.names().contains(&"bash");
+    let names = registry.names();
+    let review_writes = names.contains(&"write") || names.contains(&"edit");
+    let has_bash = names.contains(&"bash");
+    let has_mcp = names.iter().any(|n| smithy_agent::mcp::is_mcp_tool_name(n));
     if review_writes {
         registry.add_hook(Box::new(WriteReviewHook {
             auto_approve: auto_approve.clone(),
@@ -124,6 +124,11 @@ pub async fn boot(project: &Project, yolo: bool, skill: Option<Skill>) -> Result
         registry.add_hook(Box::new(ShellApprovalHook {
             auto_approve: auto_approve.clone(),
         }));
+    }
+    if has_mcp {
+        registry.add_hook(Box::new(
+            smithy_agent::mcp::McpReviewHook::with_read_only_tools(read_only_mcp_tools),
+        ));
     }
 
     let project_chars = extracted.rendered.len();

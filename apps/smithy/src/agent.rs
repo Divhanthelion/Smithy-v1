@@ -397,6 +397,7 @@ pub async fn build_session(
 
     let mcp = smithy_agent::mcp::attach_mcp(&project.root, &smithy_agent::mcp::RmcpConnector).await;
     let mut notices = mcp.notices;
+    let read_only_mcp_tools = mcp.read_only_tools;
     let harness = smithy_agent::load_harness(&project.root);
     notices.extend(harness.notices.iter().cloned());
     let already: Vec<String> = registry.names().into_iter().map(str::to_string).collect();
@@ -418,7 +419,13 @@ pub async fn build_session(
     } else if let Some(allow) = skill.as_ref().and_then(|s| s.meta.tools.as_ref()) {
         retain_skill_tools(&mut registry, allow, skill.as_ref(), &mut notices);
     }
-    install_session_hooks(&mut registry, events.clone(), shell_approval, review);
+    install_session_hooks(
+        &mut registry,
+        events.clone(),
+        shell_approval,
+        review,
+        read_only_mcp_tools,
+    );
 
     let project_chars = context.as_ref().map(|c| c.rendered.len()).unwrap_or(0);
     let map = context.as_ref().map(|c| c.rendered.as_str());
@@ -626,10 +633,12 @@ fn install_session_hooks(
     events: Sender<AgentUiEvent>,
     shell_approval: Sender<ShellApprovalRequest>,
     review: ReviewGate,
+    read_only_mcp_tools: Vec<String>,
 ) {
     let names = registry.names();
     let review_writes = names.contains(&"write") || names.contains(&"edit");
     let has_bash = names.contains(&"bash");
+    let has_mcp = names.iter().any(|n| smithy_agent::mcp::is_mcp_tool_name(n));
     if review_writes {
         registry.add_hook(Box::new(WriteReviewHook {
             pending: review.pending,
@@ -643,6 +652,11 @@ fn install_session_hooks(
             tx: shell_approval,
             auto_approve: review.auto_approve,
         }));
+    }
+    if has_mcp {
+        registry.add_hook(Box::new(
+            smithy_agent::mcp::McpReviewHook::with_read_only_tools(read_only_mcp_tools),
+        ));
     }
 }
 
