@@ -17,11 +17,70 @@
 //! produce a good error message ("escapes the workspace root") instead of the
 //! opaque `ENOTCAPABLE` cap-std would otherwise return. It is not what makes
 //! this safe.
+//!
+//! A second capability covers session scratch under the OS temp directory. That
+//! is still a `Dir`, not a path-string allowlist of `/tmp`. The rest of `/tmp`
+//! stays closed.
 
 use std::path::{Component, Path, PathBuf};
 
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
+
+/// One confined directory: the Project, or session scratch.
+struct Cap {
+    root: PathBuf,
+    dir: Dir,
+}
+
+impl Cap {
+    fn open(root: &Path, label: &str) -> Result<Cap, String> {
+        let canonical = root.canonicalize().map_err(|e| {
+            format!(
+                "{label} {} does not exist or is unreadable: {e}",
+                root.display()
+            )
+        })?;
+        if !canonical.is_dir() {
+            return Err(format!(
+                "{label} {} is not a directory",
+                canonical.display()
+            ));
+        }
+        let dir = Dir::open_ambient_dir(&canonical, ambient_authority())
+            .map_err(|e| format!("cannot open {label} {}: {e}", canonical.display()))?;
+        Ok(Cap {
+            root: canonical,
+            dir,
+        })
+    }
+
+    /// Normalize a model-supplied path into a directory-relative one.
+    fn relative(&self, path: &str, outside: &str, escapes: &str) -> Result<PathBuf, String> {
+        let raw = Path::new(path);
+
+        let stripped: PathBuf = if raw.is_absolute() {
+            // Canonicalize lexically before comparing, so `/root/./a` matches.
+            let normalized = lexical_normalize(raw)?;
+            normalized
+                .strip_prefix(&self.root)
+                .map_err(|_| format!("path `{path}` is {outside} {}", self.root.display()))?
+                .to_path_buf()
+        } else {
+            let joined = self.root.join(raw);
+            let normalized = lexical_normalize(&joined)?;
+            normalized
+                .strip_prefix(&self.root)
+                .map_err(|_| format!("path `{path}` {escapes}"))?
+                .to_path_buf()
+        };
+
+        if stripped.as_os_str().is_empty() {
+            return Ok(PathBuf::from("."));
+        }
+        Ok(stripped)
+    }
+}
 
 /// A workspace root, held as a capability.
 ///
@@ -31,123 +90,114 @@ use cap_std::fs::Dir;
 /// about. (The doc here used to describe cloning behaviour for an impl that
 /// does not exist.)
 pub struct Workspace {
-    /// Canonicalized root, kept for display and for the lexical pre-check.
-    root: PathBuf,
-    /// The capability. Every filesystem operation goes through this.
-    dir: Dir,
+    project: Cap,
+    /// Session scratch under the OS temp directory. Still a capability. Missing
+    /// only if the directory could not be created.
+    scratch: Option<Cap>,
 }
 
 impl std::fmt::Debug for Workspace {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Workspace")
-            .field("root", &self.root)
+            .field("root", &self.project.root)
+            .field("scratch", &self.scratch.as_ref().map(|c| &c.root))
             .finish()
     }
 }
 
 impl Workspace {
-    /// Open `root` as a confined workspace.
+    /// Open `root` as a confined workspace, plus a session scratch Dir.
     pub fn open(root: impl AsRef<Path>) -> Result<Workspace, String> {
-        let root = root.as_ref();
-        let canonical = root.canonicalize().map_err(|e| {
-            format!(
-                "workspace {} does not exist or is unreadable: {e}",
-                root.display()
-            )
-        })?;
-        if !canonical.is_dir() {
-            return Err(format!(
-                "workspace {} is not a directory",
-                canonical.display()
-            ));
-        }
-        let dir = Dir::open_ambient_dir(&canonical, ambient_authority())
-            .map_err(|e| format!("cannot open workspace {}: {e}", canonical.display()))?;
-        Ok(Workspace {
-            root: canonical,
-            dir,
-        })
+        let project = Cap::open(root.as_ref(), "workspace")?;
+        let scratch = open_scratch(&project.root);
+        Ok(Workspace { project, scratch })
     }
 
     pub fn root(&self) -> &Path {
-        &self.root
+        &self.project.root
     }
 
-    /// Normalize a model-supplied path into a workspace-relative one.
+    /// Absolute path of the session scratch directory, if it opened.
+    pub fn scratch_root(&self) -> Option<&Path> {
+        self.scratch.as_ref().map(|c| c.root.as_path())
+    }
+
+    /// Normalize a model-supplied path into a Project-relative one.
     ///
     /// Accepts either a relative path or an absolute path that already lies
     /// inside the root (models frequently echo back absolute paths they saw in
     /// tool output). Rejects anything that escapes, with a message the model can
     /// act on. `cap-std` will reject an escape too — this just gets there first
     /// with a better explanation.
+    ///
+    /// Scratch paths are not Project-relative; use the filesystem methods,
+    /// which locate scratch as well.
     pub fn relative(&self, path: &str) -> Result<PathBuf, String> {
-        let raw = Path::new(path);
-
-        let stripped: PathBuf = if raw.is_absolute() {
-            // Canonicalize lexically before comparing, so `/root/./a` matches.
-            let normalized = lexical_normalize(raw)?;
-            normalized
-                .strip_prefix(&self.root)
-                .map_err(|_| {
-                    format!(
-                        "path `{path}` is outside the workspace root {}",
-                        self.root.display()
-                    )
-                })?
-                .to_path_buf()
-        } else {
-            let joined = self.root.join(raw);
-            let normalized = lexical_normalize(&joined)?;
-            normalized
-                .strip_prefix(&self.root)
-                .map_err(|_| format!("path `{path}` escapes the workspace root"))?
-                .to_path_buf()
-        };
-
-        if stripped.as_os_str().is_empty() {
-            return Ok(PathBuf::from("."));
-        }
-        Ok(stripped)
+        self.project.relative(
+            path,
+            "outside the workspace root",
+            "escapes the workspace root",
+        )
     }
 
-    /// Display form for messages back to the model: always workspace-relative.
+    fn locate(&self, path: &str) -> Result<(&Cap, PathBuf), String> {
+        match self.relative(path) {
+            Ok(rel) => Ok((&self.project, rel)),
+            Err(project_err) => match &self.scratch {
+                Some(scratch) => match scratch.relative(
+                    path,
+                    "outside the scratch directory",
+                    "escapes the scratch directory",
+                ) {
+                    Ok(rel) => Ok((scratch, rel)),
+                    Err(_) => Err(project_err),
+                },
+                None => Err(project_err),
+            },
+        }
+    }
+
+    /// Display form for messages back to the model: Project-relative, or the
+    /// absolute scratch path.
     pub fn display_path(&self, path: &str) -> String {
-        self.relative(path)
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| path.to_string())
+        match self.locate(path) {
+            Ok((cap, rel)) if cap.root == self.project.root => rel.display().to_string(),
+            Ok((cap, rel)) => cap.root.join(rel).display().to_string(),
+            Err(_) => path.to_string(),
+        }
     }
 
     pub fn read_to_string(&self, path: &str) -> Result<String, String> {
-        let rel = self.relative(path)?;
-        self.dir
+        let (cap, rel) = self.locate(path)?;
+        cap.dir
             .read_to_string(&rel)
             .map_err(|e| format!("cannot read `{}`: {e}", rel.display()))
     }
 
     pub fn write(&self, path: &str, contents: &str) -> Result<(), String> {
-        let rel = self.relative(path)?;
+        let (cap, rel) = self.locate(path)?;
         if let Some(parent) = rel.parent() {
             if !parent.as_os_str().is_empty() {
-                self.dir
+                cap.dir
                     .create_dir_all(parent)
                     .map_err(|e| format!("cannot create parent of `{}`: {e}", rel.display()))?;
             }
         }
-        self.dir
+        cap.dir
             .write(&rel, contents.as_bytes())
             .map_err(|e| format!("cannot write `{}`: {e}", rel.display()))
     }
 
     pub fn exists(&self, path: &str) -> bool {
-        match self.relative(path) {
-            Ok(rel) => self.dir.exists(&rel),
+        match self.locate(path) {
+            Ok((cap, rel)) => cap.dir.exists(&rel),
             Err(_) => false,
         }
     }
 
     pub fn is_dir(&self, path: &str) -> bool {
-        match self.relative(path) {
-            Ok(rel) => self.dir.metadata(&rel).map(|m| m.is_dir()).unwrap_or(false),
+        match self.locate(path) {
+            Ok((cap, rel)) => cap.dir.metadata(&rel).map(|m| m.is_dir()).unwrap_or(false),
             Err(_) => false,
         }
     }
@@ -155,8 +205,8 @@ impl Workspace {
     /// List a directory. Returns `(name, is_dir)` pairs, sorted directories-first
     /// then alphabetically, so output is deterministic across runs.
     pub fn read_dir(&self, path: &str) -> Result<Vec<(String, bool)>, String> {
-        let rel = self.relative(path)?;
-        let entries = self
+        let (cap, rel) = self.locate(path)?;
+        let entries = cap
             .dir
             .read_dir(&rel)
             .map_err(|e| format!("cannot list `{}`: {e}", rel.display()))?;
@@ -177,7 +227,8 @@ impl Workspace {
     /// Only for handing a cwd to a subprocess or a path to a UI layer — never
     /// route a filesystem operation through this, or the capability is bypassed.
     pub fn absolute(&self, path: &str) -> Result<PathBuf, String> {
-        Ok(self.root.join(self.relative(path)?))
+        let (cap, rel) = self.locate(path)?;
+        Ok(cap.root.join(rel))
     }
 
     /// An absolute path for `path`, verified to be inside the workspace **after
@@ -201,19 +252,79 @@ impl Workspace {
     /// `follow_links(false)` does not help: it governs symlinks the walker meets
     /// as *entries*, not the root it is told to start from.
     pub fn absolute_real(&self, path: &str) -> Result<PathBuf, String> {
-        let candidate = self.absolute(path)?;
+        let (cap, rel) = self.locate(path)?;
+        let candidate = cap.root.join(rel);
         let real = candidate
             .canonicalize()
             .map_err(|e| format!("cannot resolve `{path}`: {e}"))?;
-        let real_root = self
-            .root
-            .canonicalize()
-            .map_err(|e| format!("cannot resolve the workspace root: {e}"))?;
-        if !real.starts_with(&real_root) {
+        if !real.starts_with(&cap.root) {
             return Err(format!("`{path}` resolves outside the workspace"));
         }
         Ok(real)
     }
+}
+
+/// Where this Project's session scratch lives.
+///
+/// Stable for a given canonical Project path so a later Session can find files
+/// the last one left. Not `/tmp` itself — that would be every other process's
+/// temp files.
+pub fn scratch_dir_for(project: &Path) -> PathBuf {
+    let canon = project
+        .canonicalize()
+        .unwrap_or_else(|_| project.to_path_buf());
+    std::env::temp_dir()
+        .join("smithy")
+        .join(scratch_key(&canon))
+}
+
+fn scratch_key(project: &Path) -> String {
+    let bytes = project.to_string_lossy().into_owned().into_bytes();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn open_scratch(project_root: &Path) -> Option<Cap> {
+    let dir = scratch_dir_for(project_root);
+    std::fs::create_dir_all(&dir).ok()?;
+    Cap::open(&dir, "scratch").ok()
+}
+
+/// YOLO skips Review for this write only if the path is in the Project.
+///
+/// Scratch (and anything else) still waits. The product claim is in-Project,
+/// not "any path the tools can name".
+pub fn yolo_skips_write(workspace: &Workspace, path: &str) -> bool {
+    workspace.relative(path).is_ok()
+}
+
+/// YOLO skips the shell prompt only for a command that stays down in the Project.
+pub fn yolo_skips_bash(command: &str, project_root: &Path) -> bool {
+    !command_leaves_project(command, project_root)
+}
+
+/// How a walker result should be named, if it still sits inside a capability.
+///
+/// Project files are Project-relative. Scratch files are absolute, so the
+/// model can `read` them without guessing the scratch root.
+pub fn shown_if_contained(
+    real: &Path,
+    project_root: &Path,
+    scratch_root: Option<&Path>,
+) -> Option<String> {
+    if let Ok(rel) = real.strip_prefix(project_root) {
+        return Some(rel.to_string_lossy().replace('\\', "/"));
+    }
+    if let Some(scratch) = scratch_root {
+        if real.starts_with(scratch) {
+            return Some(real.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    None
 }
 
 /// Resolve `.` and `..` textually, without touching the filesystem.
@@ -602,6 +713,30 @@ mod tests {
     fn write_outside_root_is_refused() {
         let (_tmp, ws) = workspace();
         assert!(ws.write("../evil.txt", "x").is_err());
+    }
+
+    #[test]
+    fn scratch_is_a_second_capability_not_the_whole_temp_dir() {
+        let (_tmp, ws) = workspace();
+        let scratch = ws.scratch_root().expect("scratch opens");
+        let note = scratch.join("note.txt");
+        let path = note.to_str().unwrap();
+        ws.write(path, "parked\n").unwrap();
+        assert_eq!(ws.read_to_string(path).unwrap(), "parked\n");
+        assert!(
+            !yolo_skips_write(&ws, path),
+            "scratch writes still go through Review under YOLO"
+        );
+        assert!(yolo_skips_write(&ws, "src/main.rs"));
+        assert!(ws.read_to_string("/etc/passwd").is_err());
+        let stray = std::env::temp_dir().join("smithy-not-scratch.txt");
+        let _ = fs::write(&stray, "nope\n");
+        let stray_s = stray.to_str().unwrap();
+        assert!(
+            ws.read_to_string(stray_s).is_err(),
+            "OS temp outside scratch stays closed"
+        );
+        let _ = fs::remove_file(&stray);
     }
 
     #[test]

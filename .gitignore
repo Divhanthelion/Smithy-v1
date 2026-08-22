@@ -47,8 +47,22 @@ script.sh
 #
 # Note for anyone reading this later: untracking does not remove them from the
 # history. They are readable at every commit before this one.
+#
+# Keep README.md, CHANGELOG.md, CONTEXT.md, shipped Skills, and the Harness
+# template in git. Those are the product.
 AGENTS.md
+CLAUDE.md
+GEMINI.md
+CODING_STANDARDS.md
+HANDOFF.md
+PLAN.md
+LBR.md
+NOTES.md
+TODO.md
+DEVLOG.md
+session.md
 docs/
+.scratch/
 
 # GH_Audit hygiene
 .DS_Store

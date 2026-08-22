@@ -40,7 +40,8 @@ impl Tool for Grep {
                 ToolParameter::string("pattern", "Regular expression to search for.", true),
                 ToolParameter::string(
                     "path",
-                    "Directory to search under, relative to the workspace root (default: root).",
+                    "Directory to search under: Project-relative, or an absolute path in the \
+                     Project or scratch (default: Project root).",
                     false,
                 ),
                 ToolParameter::string(
@@ -91,6 +92,7 @@ impl Tool for Grep {
         };
 
         let ws_root = ctx.workspace.root().to_path_buf();
+        let scratch_root = ctx.workspace.scratch_root().map(std::path::PathBuf::from);
         let pattern_owned = pattern.to_string();
 
         let search = tokio::task::spawn_blocking(move || {
@@ -114,10 +116,13 @@ impl Tool for Grep {
                 {
                     continue;
                 }
-                let Ok(rel) = entry.path().strip_prefix(&ws_root) else {
+                let Some(rel_str) = crate::sandbox::shown_if_contained(
+                    entry.path(),
+                    &ws_root,
+                    scratch_root.as_deref(),
+                ) else {
                     continue;
                 };
-                let rel_str = rel.to_string_lossy().replace('\\', "/");
 
                 if let Some(inc) = &include {
                     if !super::glob::matches_include(inc, &rel_str) {

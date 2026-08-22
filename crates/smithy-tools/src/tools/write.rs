@@ -19,7 +19,11 @@ impl Tool for Write {
              file contents — never a diff or an excerpt. For a small change to an existing file, \
              prefer `edit`. Missing parent directories are created.",
             vec![
-                ToolParameter::string("path", "File path, relative to the workspace root.", true),
+                ToolParameter::string(
+                    "path",
+                    "File path: Project-relative, or an absolute path in the Project or scratch.",
+                    true,
+                ),
                 ToolParameter::string("content", "The complete file contents.", true),
             ],
         )

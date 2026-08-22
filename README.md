@@ -8,8 +8,10 @@ working with the network off.
 
 The agent can read your code, search it, run commands and write files. Every
 write comes back as a diff you approve hunk by hunk, and every shell command
-waits for your go-ahead. It never touches anything outside the project you have
-open.
+waits for your go-ahead. Filesystem tools stay in the project you have open,
+plus a session scratch directory under the OS temp folder. Shell is a
+subprocess: it can leave that tree, and it waits unless you turn YOLO on for
+in-project commands.
 
 ![Smithy showing a compiler-resolved call graph beside the agent panel](assets/smithy.png)
 
@@ -37,10 +39,11 @@ it went.
 
 **The sandbox is a capability, not a path check.** Filesystem tools hold a
 `cap-std` directory handle for your project root, so the operating system itself
-refuses to let those reads and writes out — symlinks included. There is no
-string comparison to outwit. Shell is different: `bash` is a subprocess, not a
+refuses to let those reads and writes out — symlinks included. A second handle
+covers session scratch under the OS temp directory; `/tmp` itself is not open.
+There is no string comparison to outwit. Shell is different: `bash` is a subprocess, not a
 capability, and it does not run until a shell-approval hook is installed.
-With YOLO on, commands that stay down in the Project skip that prompt;
+With YOLO on, in-Project writes skip Review and commands that stay down in the Project skip the shell prompt;
 `cd ..` and paths outside the Project still ask. Environment names matching `*_API_KEY`, `*_TOKEN`, and `*_SECRET` are scrubbed
 from the child; `cd ..` out of the project remains possible.
 

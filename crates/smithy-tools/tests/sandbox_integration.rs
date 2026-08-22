@@ -143,6 +143,31 @@ async fn no_path_taking_tool_can_reach_outside_the_workspace() {
     );
 }
 
+#[tokio::test]
+async fn filesystem_tools_can_use_session_scratch() {
+    let s = sandbox();
+    let registry = Registry::core();
+    let scratch = s.ctx.workspace.scratch_root().expect("scratch");
+    let path = scratch.join("parked.txt");
+    let path_str = path.to_str().unwrap();
+
+    let written = run(
+        &registry,
+        &s.ctx,
+        "write",
+        json!({ "path": path_str, "content": "parked\n" }),
+    )
+    .await;
+    assert!(!written.is_error, "{}", written.content);
+
+    let read = run(&registry, &s.ctx, "read", json!({ "path": path_str })).await;
+    assert!(
+        read.content.contains("parked"),
+        "scratch read failed: {}",
+        read.content
+    );
+}
+
 /// Research 07 vector 3, end to end: a symlink *inside* the workspace pointing
 /// outside it. The path never leaves the root textually, so a purely lexical
 /// check passes it — this is why the sandbox is a capability and not a string

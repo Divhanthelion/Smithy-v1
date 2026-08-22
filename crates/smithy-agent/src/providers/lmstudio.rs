@@ -20,9 +20,9 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::provider::{Completion, CompletionRequest, Delta, Provider, ProviderError, Sampling};
-use crate::providers::sse::consume_sse_stream;
 #[cfg(test)]
 use crate::providers::sse::{apply_sse_line, PartialCall};
+use crate::providers::sse::{consume_sse_with_idle, StreamIdle};
 
 /// Cold prefill of a large context genuinely takes minutes on local hardware,
 /// and a thinking complete() can too. This timeout must not be shorter than
@@ -199,7 +199,16 @@ impl LmStudio {
             });
         }
 
-        consume_sse_stream(response.bytes_stream(), on_delta).await
+        // llama.cpp is silent on the wire during prefill *and* while it
+        // buffers a large tool-call body. A 90s between-chunk idle is a
+        // second timer that cannot see Metal; it aborted a live `write`.
+        // The turn clock / request timeout is the hang bound.
+        consume_sse_with_idle(
+            response.bytes_stream(),
+            on_delta,
+            StreamIdle::local(request.http_timeout(REQUEST_TIMEOUT)),
+        )
+        .await
     }
 }
 
@@ -338,6 +347,7 @@ impl ModelInfo {
             // prompt is already sludge. Cap at the original 32k-class warn.
             context_warn: ((ctx as f64 * 0.25) as i64).min(32_768),
             max_steps: steps_for_context(ctx),
+            max_seconds: seconds_for_context(ctx),
             tool_result_warn_chars: crate::limits::tool_result_warn_for_window(ctx),
             ..defaults
         }
@@ -395,21 +405,43 @@ fn fmt_ctx(n: i64) -> String {
 fn steps_for_context(context_length: i64) -> usize {
     const BASELINE_CONTEXT: i64 = 32_768;
     const BASELINE_STEPS: usize = 60;
-    const PER_DOUBLING: usize = 30;
+    const PER_DOUBLING: usize = 60;
     const CEILING: usize = 300;
 
     if context_length <= BASELINE_CONTEXT {
         return BASELINE_STEPS;
     }
     // One increment per *whole* doubling past the baseline:
-    //   32k→60, 64k→90, 128k→120, 256k→150, 512k→180, 1,048,576→210.
+    //   32k→60, 64k→120, 128k→180, 256k→240, 512k→300, 1M→300 (capped).
     // Note the floor: DeepSeek advertises 1,000,000 rather than 1 MiB, which is
-    // 4.93 doublings and so earns 180, not 210. Rounding down is the right
-    // direction for a backstop.
+    // 4.93 doublings and so earns the same 300 as 512k. Rounding down is the
+    // right direction for a backstop.
     let doublings = ((context_length as f64) / (BASELINE_CONTEXT as f64))
         .log2()
         .floor() as usize;
     (BASELINE_STEPS + doublings * PER_DOUBLING).min(CEILING)
+}
+
+/// Wall-clock budget for one turn, given the model's context window.
+///
+/// Step count used to scale with the window while time stayed a flat 15 minutes.
+/// A DeepSeek session with 180 steps therefore had five seconds per step — the
+/// clock bound first, and the extra steps were fiction. Time has to grow with
+/// the work a larger window is allowed to do, and still cap, because a hung
+/// turn must end.
+fn seconds_for_context(context_length: i64) -> u64 {
+    const BASELINE_CONTEXT: i64 = 32_768;
+    const BASELINE_SECONDS: u64 = 900;
+    const PER_DOUBLING: u64 = 900;
+    const CEILING: u64 = 7_200;
+
+    if context_length <= BASELINE_CONTEXT {
+        return BASELINE_SECONDS;
+    }
+    let doublings = ((context_length as f64) / (BASELINE_CONTEXT as f64))
+        .log2()
+        .floor() as u64;
+    (BASELINE_SECONDS + doublings * PER_DOUBLING).min(CEILING)
 }
 
 #[cfg(test)]
@@ -435,25 +467,25 @@ mod step_budget_tests {
         let deepseek = info(Some(1_000_000)).suggested_limits().max_steps;
         assert_eq!(small, 60, "the baseline is preserved");
         assert_eq!(
-            deepseek, 180,
-            "three times the budget the failed session had"
+            deepseek, 300,
+            "the 1M backstop is the ceiling, not the 32k budget"
         );
     }
 
     #[test]
     fn the_step_budget_grows_per_doubling() {
         assert_eq!(steps_for_context(32_768), 60);
-        assert_eq!(steps_for_context(65_536), 90);
-        assert_eq!(steps_for_context(131_072), 120);
-        assert_eq!(steps_for_context(262_144), 150);
-        assert_eq!(steps_for_context(1_048_576), 210);
+        assert_eq!(steps_for_context(65_536), 120);
+        assert_eq!(steps_for_context(131_072), 180);
+        assert_eq!(steps_for_context(262_144), 240);
+        assert_eq!(steps_for_context(1_048_576), 300);
     }
 
     /// Only whole doublings count, so an advertised "1M" that is not 1 MiB
     /// rounds down rather than up. Rounding down is right for a backstop.
     #[test]
     fn a_partial_doubling_rounds_down() {
-        assert_eq!(steps_for_context(1_000_000), 180);
+        assert_eq!(steps_for_context(1_000_000), 300);
         assert_eq!(
             steps_for_context(60_000),
             60,
@@ -483,6 +515,17 @@ mod step_budget_tests {
         let defaults = crate::limits::Limits::default();
         assert_eq!(limits.max_steps, defaults.max_steps);
         assert_eq!(limits.context_hard, defaults.context_hard);
+        assert_eq!(limits.max_seconds, defaults.max_seconds);
+    }
+
+    #[test]
+    fn a_larger_window_earns_more_wall_clock() {
+        let small = info(Some(32_768)).suggested_limits().max_seconds;
+        let deepseek = info(Some(1_000_000)).suggested_limits().max_seconds;
+        assert_eq!(small, 900);
+        assert_eq!(deepseek, 4_500);
+        assert_eq!(seconds_for_context(65_536), 1_800);
+        assert_eq!(seconds_for_context(i64::MAX / 4), 7_200);
     }
 }
 

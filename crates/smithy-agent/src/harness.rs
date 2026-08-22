@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-/// Shipped system prompt. `{{workspace}}` and `{{tools}}` are filled in.
+/// Shipped system prompt. `{{workspace}}`, `{{scratch}}`, and `{{tools}}` are filled in.
 pub const SYSTEM_TEMPLATE: &str = include_str!("../harness/SYSTEM.md");
 
 /// Where a system prompt template was loaded from.
@@ -55,7 +55,7 @@ pub struct Harness {
 }
 
 impl Harness {
-    /// SYSTEM.md plus includes, with `{{workspace}}` / `{{tools}}` filled in.
+    /// SYSTEM.md plus includes, with `{{workspace}}` / `{{scratch}}` / `{{tools}}` filled in.
     /// The Map is joined afterwards by [`crate::session::with_project_context`].
     pub fn filled_base(&self, workspace: &Path, tool_names: &[&str]) -> String {
         let mut base = fill_system_template(&self.template, workspace, tool_names);
@@ -242,12 +242,18 @@ pub fn unused_harness_files(project: &Path, harness: &Harness) -> Vec<PathBuf> {
     out
 }
 
-/// Fill `{{workspace}}` / `{{tools}}`. Trailing whitespace is stripped so a
+/// Fill `{{workspace}}` / `{{scratch}}` / `{{tools}}`. Trailing whitespace is stripped so a
 /// POSIX final newline in the file does not become a blank line in the prompt.
 /// The Map is joined afterwards by [`crate::session::with_project_context`].
 pub fn fill_system_template(template: &str, workspace: &Path, tool_names: &[&str]) -> String {
     template
         .replace("{{workspace}}", &workspace.display().to_string())
+        .replace(
+            "{{scratch}}",
+            &smithy_tools::scratch_dir_for(workspace)
+                .display()
+                .to_string(),
+        )
         .replace("{{tools}}", &tool_names.join(", "))
         .trim_end()
         .to_string()
@@ -284,7 +290,9 @@ mod tests {
         assert!(rendered.contains("You have these tools: read, write."));
         assert!(rendered.contains("Be concise."));
         assert!(!rendered.contains("{{workspace}}"));
+        assert!(!rendered.contains("{{scratch}}"));
         assert!(!rendered.contains("{{tools}}"));
+        assert!(rendered.contains("Scratch directory:"));
     }
 
     #[test]

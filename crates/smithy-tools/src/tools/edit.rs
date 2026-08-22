@@ -35,7 +35,11 @@ impl Tool for Edit {
              automatically, and near-misses in whitespace or a single line are resolved \
              automatically. Preferred over `write` for small changes to large files.",
             vec![
-                ToolParameter::string("path", "File path, relative to the workspace root.", true),
+                ToolParameter::string(
+                    "path",
+                    "File path: Project-relative, or an absolute path in the Project or scratch.",
+                    true,
+                ),
                 ToolParameter::string(
                     "old_string",
                     "Text to replace. Must be unique in the file unless replace_all is true.",

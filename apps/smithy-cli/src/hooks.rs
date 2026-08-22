@@ -10,7 +10,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value;
 use similar::TextDiff;
-use smithy_tools::{command_leaves_project, HookDecision, ToolCall, ToolCtx, ToolHook};
+use smithy_tools::{yolo_skips_bash, yolo_skips_write, HookDecision, ToolCall, ToolCtx, ToolHook};
 
 pub struct ShellApprovalHook {
     pub auto_approve: Arc<AtomicBool>,
@@ -33,7 +33,7 @@ impl ToolHook for ShellApprovalHook {
             .to_string();
 
         if self.auto_approve.load(Ordering::Relaxed)
-            && !command_leaves_project(&command, ctx.workspace.root())
+            && yolo_skips_bash(&command, ctx.workspace.root())
         {
             return HookDecision::Allow;
         }
@@ -62,13 +62,13 @@ impl ToolHook for WriteReviewHook {
     }
 
     async fn before(&self, call: &ToolCall, args: &Value, ctx: &ToolCtx) -> HookDecision {
-        if self.auto_approve.load(Ordering::Relaxed) {
-            return HookDecision::Allow;
-        }
-
         let Some(path) = args.get("path").and_then(|v| v.as_str()) else {
             return HookDecision::Allow;
         };
+
+        if self.auto_approve.load(Ordering::Relaxed) && yolo_skips_write(&ctx.workspace, path) {
+            return HookDecision::Allow;
+        }
 
         let new_content = match proposed_content(call, args, ctx, path) {
             Ok(Some(c)) => c,

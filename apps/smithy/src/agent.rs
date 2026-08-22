@@ -22,7 +22,8 @@ use serde_json::Value;
 use smithy_agent::{AgentConfig, Outcome, Session, SessionConfig, Skill, TurnEvent};
 use smithy_editor::{PendingChangeManager, PendingFileChange};
 use smithy_tools::{
-    command_leaves_project, HookDecision, Registry, ToolCall, ToolCtx, ToolHook, Workspace,
+    yolo_skips_bash, yolo_skips_write, HookDecision, Registry, ToolCall, ToolCtx, ToolHook,
+    Workspace,
 };
 
 use crate::app_state::{AgentUiEvent, ReviewOutcome, ShellApprovalRequest};
@@ -59,7 +60,7 @@ impl ToolHook for ShellApprovalHook {
             .to_string();
 
         if self.auto_approve.load(Ordering::Relaxed)
-            && !command_leaves_project(&command, ctx.workspace.root())
+            && yolo_skips_bash(&command, ctx.workspace.root())
         {
             return HookDecision::Allow;
         }
@@ -130,13 +131,13 @@ impl ToolHook for WriteReviewHook {
         // The gate switched off: the tool runs and writes for itself, and this
         // hook is not in the picture at all. Checked before any diffing, so the
         // fuzzy cascade is not paid for a review nobody will see.
-        if self.auto_approve.load(Ordering::Relaxed) {
-            return HookDecision::Allow;
-        }
-
         let Some(path) = args.get("path").and_then(|v| v.as_str()) else {
             return HookDecision::Allow;
         };
+
+        if self.auto_approve.load(Ordering::Relaxed) && yolo_skips_write(&ctx.workspace, path) {
+            return HookDecision::Allow;
+        }
 
         let new_content = match call.name.as_str() {
             "write" => match args.get("content").and_then(|v| v.as_str()) {
