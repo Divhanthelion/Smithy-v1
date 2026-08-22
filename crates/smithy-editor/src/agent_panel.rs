@@ -953,7 +953,7 @@ fn batch_row(state: AgentPanelState, start: usize, steps: Vec<BatchedStep>) -> i
                 if first_step == last_step {
                     format!("{first_step}")
                 } else {
-                    format!("{first_step}–{last_step}")
+                    format!("{first_step}—{last_step}")
                 }
             })
             .style(|s| {
@@ -1093,7 +1093,7 @@ fn list_view(ordered: bool, items: Vec<Vec<Inline>>) -> impl IntoView {
         let marker = if ordered {
             format!("{}.", i + 1)
         } else {
-            "•".to_string()
+            "·".to_string()
         };
         Stack::horizontal((
             Label::derived(move || marker.clone()).style(|s| {
@@ -1280,7 +1280,7 @@ fn layout_flow(src: &str) -> (String, AttrsList) {
                     if *ordered {
                         buf.push_str(&format!("{}. ", n + 1));
                     } else {
-                        buf.push_str("• ");
+                        buf.push_str("· ");
                     }
                     append_inlines(&mut buf, &mut attrs, item, 13.0, catppuccin::TEXT, false);
                 }

@@ -27,7 +27,7 @@ pub struct McpReviewHook {
 impl McpReviewHook {
     /// Build the hook from the current registry, extracting which MCP tools are read-only.
     pub fn from_registry(registry: &Registry) -> Self {
-        let mut read_only_tools = std::collections::HashSet::new();
+        let read_only_tools = std::collections::HashSet::new();
         for name in registry.names() {
             // We need to check if this tool is an MCP tool and if it's read-only.
             // The registry doesn't expose the Tool itself, so we rely on the tool

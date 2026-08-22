@@ -130,7 +130,7 @@ fn history_row(
             }),
         ))
         .style(|s| s.flex_grow(1.0).flex_col().min_width(0.0).gap(2.0)),
-        Label::new("☰".to_string())
+        Label::new(crate::design::glyph::DOCUMENT.to_string())
             .style(move |s| {
                 s.font_size(11.0)
                     .color(theme.header_text)
