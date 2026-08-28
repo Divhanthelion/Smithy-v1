@@ -11,8 +11,6 @@
 //! `EditorHandle::save`, and a `LineEnding` that was detected on load and never
 //! read by anything — including the save it existed for.
 
-use ropey::Rope;
-
 use std::path::{Path, PathBuf};
 
 use crate::error::BufferError;
@@ -44,7 +42,9 @@ impl Default for BufferId {
 /// let the tab bar and the editor disagree about whether a file was dirty.
 pub struct Buffer {
     id: BufferId,
-    text: Rope,
+    /// Load cache only. Edits live in floem's document; this is never the
+    /// source of dirty-state after the pane is built.
+    text: String,
     path: Option<PathBuf>,
     language_id: Option<String>,
 }
@@ -54,7 +54,7 @@ impl Buffer {
     pub fn new() -> Self {
         Self {
             id: BufferId::new(),
-            text: Rope::new(),
+            text: String::new(),
             path: None,
             language_id: None,
         }
@@ -65,7 +65,7 @@ impl Buffer {
     pub fn from_str(text: &str) -> Self {
         Self {
             id: BufferId::new(),
-            text: Rope::from_str(text),
+            text: text.to_string(),
             path: None,
             language_id: None,
         }
@@ -76,13 +76,13 @@ impl Buffer {
         self.id
     }
 
-    /// Get a reference to the underlying rope
-    pub fn text(&self) -> &Rope {
+    /// The file as loaded. Not the live editor text.
+    pub fn text(&self) -> &str {
         &self.text
     }
 
     pub fn char_count(&self) -> usize {
-        self.text.len_chars()
+        self.text.chars().count()
     }
 
     /// Get the file path associated with this buffer
@@ -101,7 +101,7 @@ impl Buffer {
         let language_id = language_from_path(&path);
         Self {
             id: BufferId::new(),
-            text: Rope::from_str(text),
+            text: text.to_string(),
             path: Some(path),
             language_id,
         }
@@ -109,7 +109,7 @@ impl Buffer {
 
     /// Replace the text. Used when re-clicking an inspection tab.
     pub fn replace_text(&mut self, text: &str) {
-        self.text = Rope::from_str(text);
+        self.text = text.to_string();
     }
 
     /// Load a buffer from a file
@@ -121,7 +121,7 @@ impl Buffer {
     /// * `Ok(Buffer)` with the file contents
     /// * `Err(BufferError)` if the file cannot be read
     pub fn from_file(path: &Path) -> Result<Self, BufferError> {
-        let text = Self::read_rope_from_path(path)?;
+        let text = Self::read_string_from_path(path)?;
 
         let language_id = language_from_path(path);
 
@@ -137,7 +137,7 @@ impl Buffer {
     pub fn reload(&mut self) -> Result<(), BufferError> {
         if let Some(path) = &self.path {
             let path_clone = path.clone();
-            let text = Self::read_rope_from_path(&path_clone)?;
+            let text = Self::read_string_from_path(&path_clone)?;
             self.text = text;
             Ok(())
         } else {
@@ -145,24 +145,13 @@ impl Buffer {
         }
     }
 
-    /// Read file content into a Rope
-    fn read_rope_from_path(path: &Path) -> Result<Rope, BufferError> {
-        use std::fs::File;
-        use std::io::BufReader;
-
-        let file = File::open(path).map_err(|e| {
+    fn read_string_from_path(path: &Path) -> Result<String, BufferError> {
+        std::fs::read_to_string(path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 BufferError::FileNotFound(path.to_path_buf())
             } else if e.kind() == std::io::ErrorKind::PermissionDenied {
                 BufferError::PermissionDenied(path.to_path_buf())
-            } else {
-                BufferError::Io(e)
-            }
-        })?;
-
-        let reader = BufReader::new(file);
-        Rope::from_reader(reader).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::InvalidData {
+            } else if e.kind() == std::io::ErrorKind::InvalidData {
                 BufferError::InvalidUtf8(path.to_path_buf())
             } else {
                 BufferError::Io(e)
@@ -237,14 +226,12 @@ mod tests {
                     let mut file = std::fs::File::create(&temp_path).map_err(|e| {
                         proptest::test_runner::TestCaseError::fail(format!("Create error: {}", e))
                     })?;
-                    for chunk in buffer.text().chunks() {
-                        file.write_all(chunk.as_bytes()).map_err(|e| {
-                            proptest::test_runner::TestCaseError::fail(format!(
-                                "Write error: {}",
-                                e
-                            ))
-                        })?;
-                    }
+                    file.write_all(buffer.text().as_bytes()).map_err(|e| {
+                        proptest::test_runner::TestCaseError::fail(format!(
+                            "Write error: {}",
+                            e
+                        ))
+                    })?;
                     file.flush().map_err(|e| {
                         proptest::test_runner::TestCaseError::fail(format!("Flush error: {}", e))
                     })?;
@@ -259,8 +246,8 @@ mod tests {
                 let _ = std::fs::remove_file(&temp_path);
 
                 // Compare content
-                let original_content: String = buffer.text().chars().collect();
-                let loaded_content: String = loaded_buffer.text().chars().collect();
+                let original_content = buffer.text();
+                let loaded_content = loaded_buffer.text();
 
                 prop_assert_eq!(
                     original_content,

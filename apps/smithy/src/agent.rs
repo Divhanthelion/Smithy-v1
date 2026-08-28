@@ -139,6 +139,12 @@ impl ToolHook for WriteReviewHook {
             return HookDecision::Allow;
         }
 
+        let old_content = match ctx.workspace.read_to_string(path) {
+            Ok(text) => text,
+            Err(_) if call.name == "edit" => return HookDecision::Allow,
+            Err(_) => String::new(),
+        };
+
         let new_content = match call.name.as_str() {
             "write" => match args.get("content").and_then(|v| v.as_str()) {
                 Some(c) => c.to_string(),
@@ -163,15 +169,12 @@ impl ToolHook for WriteReviewHook {
                 ) else {
                     return HookDecision::Allow;
                 };
-                let Ok(current) = ctx.workspace.read_to_string(path) else {
-                    return HookDecision::Allow;
-                };
-                match smithy_tools::fuzzy::find(&current, old) {
+                match smithy_tools::fuzzy::find(&old_content, old) {
                     Some(m) if m.auto_apply => {
-                        let mut updated = String::with_capacity(current.len() + new.len());
-                        updated.push_str(&current[..m.byte_offset]);
+                        let mut updated = String::with_capacity(old_content.len() + new.len());
+                        updated.push_str(&old_content[..m.byte_offset]);
                         updated.push_str(new);
-                        updated.push_str(&current[m.byte_offset + m.matched_text.len()..]);
+                        updated.push_str(&old_content[m.byte_offset + m.matched_text.len()..]);
                         updated
                     }
                     _ => return HookDecision::Allow,
@@ -180,7 +183,6 @@ impl ToolHook for WriteReviewHook {
             _ => return HookDecision::Allow,
         };
 
-        let old_content = ctx.workspace.read_to_string(path).unwrap_or_default();
         if old_content == new_content {
             return HookDecision::Deny(format!("`{path}` already has exactly that content"));
         }

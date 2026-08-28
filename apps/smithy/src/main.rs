@@ -3,6 +3,10 @@
 //! The entry point: builds the window, wires every panel to the state in
 //! [`app_state`], and owns the shortcuts and the modals that sit above them.
 
+use std::cell::Cell;
+use std::rc::Rc;
+use std::time::Duration;
+
 use floem::peniko::Color;
 use floem::prelude::*;
 
@@ -326,13 +330,12 @@ fn app_view() -> impl IntoView {
     let ask_hover_menu = ask_hover.clone();
     let ask_definition_menu = ask_definition.clone();
 
-    // Tell the language server about every edit.
-    //
-    // We sent `didOpen` and then nothing, so rust-analyzer's view of the file
-    // was frozen at the moment it opened: diagnostics went stale on the first
-    // keystroke and reported errors against text that no longer existed.
+    // Tell the language server about edits after a short idle, not on every
+    // keystroke. `file_changed` still sends the whole buffer (the LSP wrapper
+    // takes a String), so the cost we can cut here is how often we pay it.
     {
         let lsp_handle = app_state.lsp_handle.clone();
+        let pending = Rc::new(Cell::new(0u64));
         floem::reactive::Effect::new(move |_| {
             let Some(handle) = open_editor.get() else {
                 return;
@@ -344,7 +347,16 @@ fn app_view() -> impl IntoView {
             if version == 0 {
                 return;
             }
-            lsp_handle.file_changed(handle.path.clone(), version as i32, handle.text());
+            pending.set(version);
+            let lsp_handle = lsp_handle.clone();
+            let pending = pending.clone();
+            let handle = handle.clone();
+            floem::action::exec_after(Duration::from_millis(100), move |_| {
+                if pending.get() != version {
+                    return;
+                }
+                lsp_handle.file_changed(handle.path.clone(), version as i32, handle.text());
+            });
         });
     }
 
@@ -721,28 +733,35 @@ fn app_view() -> impl IntoView {
                         let project_root = project_for_diags.borrow().root.clone();
                         // Display paths relative to the project, so rows are readable.
                         let file = smithy_editor::ProblemRow::label_for(&path, &project_root);
-                        let rows = incoming
-                            .iter()
-                            .map(|d| smithy_editor::ProblemRow::from_diagnostic(&file, d))
-                            .collect();
+                        let apply_inline = open_editor
+                            .get_untracked()
+                            .as_ref()
+                            .is_some_and(|h| smithy_editor::is_same_file(&h.path, &path));
+                        let n = incoming.len();
+                        let mut rows = Vec::with_capacity(n);
+                        let mut inline = Vec::new();
+                        if apply_inline {
+                            inline.reserve(n);
+                        }
+                        for d in &incoming {
+                            rows.push(smithy_editor::ProblemRow::from_diagnostic(&file, d));
+                            if apply_inline {
+                                inline.push(smithy_editor::InlineDiagnostic {
+                                    line: d.range.start.line as usize,
+                                    start_column: d.range.start.column as usize,
+                                    end_column: d.range.end.column as usize,
+                                    severity: d.severity,
+                                });
+                            }
+                        }
                         diagnostics.publish(file, rows);
 
                         // Same diagnostics, second destination: the open editor's
                         // inline styling. Only for the file actually on screen —
                         // pushing another file's ranges would mark arbitrary text.
-                        if let Some(handle) = open_editor.get_untracked() {
-                            if smithy_editor::is_same_file(&handle.path, &path) {
-                                handle.set_diagnostics(
-                                    incoming
-                                        .iter()
-                                        .map(|d| smithy_editor::InlineDiagnostic {
-                                            line: d.range.start.line as usize,
-                                            start_column: d.range.start.column as usize,
-                                            end_column: d.range.end.column as usize,
-                                            severity: d.severity,
-                                        })
-                                        .collect(),
-                                );
+                        if apply_inline {
+                            if let Some(handle) = open_editor.get_untracked() {
+                                handle.set_diagnostics(inline);
                             }
                         }
                     }
@@ -1067,24 +1086,27 @@ fn app_view() -> impl IntoView {
     // time, which is already finer than the backdrop can show.
     let sky_tick = smithy_editor::celestial::minute_tick();
 
-    // The sky over San Francisco right now, then circuitry lit by what the
-    // language server reports, then the code. All layered under the editor
-    // rather than replacing it, so nothing about the editor changes when the
-    // look does.
-    //
-    // The sky goes *under* the circuitry rather than instead of it. That was
-    // the open question — replace or layer — and layering is the conservative
-    // answer: it keeps both and can be undone, where replacing throws the
-    // circuitry away to find out. The mosaic is sparse translucent tiles rather
-    // than a solid ground, so the star field reads through it. If it turns out
-    // to read as noise over the stars, dropping `draw_mosaic` is one line.
+    // Forged is a different view tree, not the same tree in different colours.
+    // Flat does not mount the sky or circuitry: those canvases subscribe to
+    // ticks (shimmer is 340ms) even when their paint is a no-op.
     let editor_view = Stack::new((
-        smithy_editor::celestial::sky_backdrop(
-            aesthetic,
-            sky_tick,
-            smithy_editor::celestial::current_location(),
+        dyn_container(
+            move || aesthetic.get(),
+            move |look| match look {
+                smithy_editor::Aesthetic::Forged => Stack::new((
+                    smithy_editor::celestial::sky_backdrop(
+                        aesthetic,
+                        sky_tick,
+                        smithy_editor::celestial::current_location(),
+                    ),
+                    smithy_editor::circuit_backdrop(aesthetic, diagnostics.by_file),
+                ))
+                .into_any(),
+                smithy_editor::Aesthetic::Flat => Empty::new()
+                    .style(|s| s.display(floem::taffy::Display::None))
+                    .into_any(),
+            },
         ),
-        smithy_editor::circuit_backdrop(aesthetic, diagnostics.by_file),
         editor_view,
     ))
     .style(|s| s.width_full().height_full());
@@ -1130,6 +1152,10 @@ fn app_view() -> impl IntoView {
                     || key_event
                         .modifiers
                         .contains(floem::prelude::Modifiers::CONTROL);
+                let ch = match &key_event.key {
+                    floem::prelude::Key::Character(c) => Some(c.as_str()),
+                    _ => None,
+                };
                 // Dictation. Configurable, and read once at startup rather than
                 // per keystroke — the file is a preference, not a live input.
                 if voice_hotkey.matches(key_event) {
@@ -1138,7 +1164,7 @@ fn app_view() -> impl IntoView {
                 }
                 // Save. Cmd on macOS, Ctrl elsewhere — accept either rather than
                 // making the shortcut platform-dependent in a cross-platform app.
-                if key_event.key == floem::prelude::Key::Character("s".into()) && cmd {
+                if ch == Some("s") && cmd {
                     handled = true;
                     if let Some(handle) = open_editor.get_untracked() {
                         match handle.save() {
@@ -1153,12 +1179,12 @@ fn app_view() -> impl IntoView {
                 }
                 // Open a project. The menu has advertised this shortcut since the
                 // first commit without anything ever being bound to it.
-                if key_event.key == floem::prelude::Key::Character("o".into()) && cmd {
+                if ch == Some("o") && cmd {
                     handled = true;
                     request_open_project(project_pick_tx.clone());
                 }
                 // Hover at the caret.
-                if key_event.key == floem::prelude::Key::Character("k".into())
+                if ch == Some("k")
                     && key_event
                         .modifiers
                         .contains(floem::prelude::Modifiers::CONTROL)
@@ -1180,7 +1206,7 @@ fn app_view() -> impl IntoView {
                 // the first commit with nothing bound to it — the same defect
                 // Open Project had, found by listing every bound character and
                 // diffing it against the shortcuts the menus claim.
-                if key_event.key == floem::prelude::Key::Character("b".into())
+                if ch == Some("b")
                     && cmd
                     && !key_event
                         .modifiers
@@ -1190,7 +1216,7 @@ fn app_view() -> impl IntoView {
                     handled = true;
                 }
                 // Check for Ctrl+L to toggle chat panel
-                if key_event.key == floem::prelude::Key::Character("l".into())
+                if ch == Some("l")
                     && cmd
                     && !key_event
                         .modifiers
@@ -1200,8 +1226,7 @@ fn app_view() -> impl IntoView {
                     handled = true;
                 }
                 // Check for Ctrl+` or Ctrl+' to toggle terminal
-                if (key_event.key == floem::prelude::Key::Character("`".into())
-                    || key_event.key == floem::prelude::Key::Character("'".into()))
+                if matches!(ch, Some("`") | Some("'"))
                     && cmd
                     && !key_event
                         .modifiers
@@ -1379,14 +1404,25 @@ fn app_view() -> impl IntoView {
     });
 
     Stack::new((
-        // Behind everything, and paints nothing at all when flat. The sky's
-        // minute clock is shared: the sun riding the top rail keeps time with
-        // the sky behind the editor.
-        smithy_editor::forged_frame(aesthetic, sky_tick),
-        // The mascot, on the frame's bottom rail. Over the frame rather than
-        // inside it, because he animates several times a second and the frame
-        // repaints only when the look changes.
-        smithy_editor::fisherman::fisherman_view(aesthetic, smithy_editor::tick::animation()),
+        // Frame and fisherman exist only in Forged. The fisherman's clock is
+        // 200ms; constructing that view on Flat starts it for a canvas that
+        // never paints.
+        dyn_container(
+            move || aesthetic.get(),
+            move |look| match look {
+                smithy_editor::Aesthetic::Forged => Stack::new((
+                    smithy_editor::forged_frame(aesthetic, sky_tick),
+                    smithy_editor::fisherman::fisherman_view(
+                        aesthetic,
+                        smithy_editor::tick::animation(),
+                    ),
+                ))
+                .into_any(),
+                smithy_editor::Aesthetic::Flat => Empty::new()
+                    .style(|s| s.display(floem::taffy::Display::None))
+                    .into_any(),
+            },
+        ),
         shell,
         smithy_editor::hover_popup(hover_state.clone()),
         // Above the shell so dropdowns paint over the editor, below the modals

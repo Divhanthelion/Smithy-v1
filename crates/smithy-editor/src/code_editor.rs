@@ -11,8 +11,9 @@
 //! because the label consumes the event before any ancestor sees it.
 //!
 //! floem ships a real editor (`floem::views::text_editor`) backed by a `Rope`,
-//! with a caret, selection, key handling, undo, and a gutter. Our `Buffer` is
-//! already `ropey`-based, so the content moves across without conversion.
+//! with a caret, selection, key handling, undo, and a gutter. `Buffer` holds
+//! the file as a `String` until this view takes it; the document rope is
+//! built once, at load.
 //!
 //! Syntax colouring and inline diagnostics are supplied by
 //! [`crate::syntax_styling::SyntaxStyling`], which implements floem's `Styling`
@@ -71,11 +72,12 @@ impl EditorHandle {
 
     /// Whether the buffer differs from what is on disk.
     ///
-    /// Compared against the last-saved text rather than tracked with a flag:
-    /// typing a character and undoing it leaves a flag set but the file
-    /// unchanged, and then you get a save prompt for a file you did not edit.
+    /// Length first: a keystroke almost always changes the byte count, so we
+    /// do not walk the rope. Same-length edits still compare chunks, never
+    /// `to_string` the whole file — that was the dirty-dot path on every
+    /// revision.
     pub fn is_dirty(&self) -> bool {
-        self.text() != self.saved.get()
+        !rope_eq_str(&self.doc.text(), &self.saved.get_untracked())
     }
 
     /// Write the buffer to its path.
@@ -100,7 +102,7 @@ impl EditorHandle {
     /// Replace the document in place. Used when re-clicking an inspection tab
     /// that is already focused — rebuilding the pane would throw away the caret.
     pub fn replace_content(&self, content: &str) {
-        if content == self.text() {
+        if rope_eq_str(&self.doc.text(), content) {
             return;
         }
         let len = self.doc.text().len();
@@ -260,6 +262,23 @@ impl EditorHandle {
             name
         }
     }
+}
+
+/// Byte-equal without `Rope::to_string`. Length first: a keystroke almost
+/// always changes the count, so we return without walking chunks.
+fn rope_eq_str(rope: &lapce_xi_rope::Rope, s: &str) -> bool {
+    if rope.len() != s.len() {
+        return false;
+    }
+    let mut offset = 0;
+    for chunk in rope.iter_chunks(..) {
+        let end = offset + chunk.len();
+        if s.as_bytes().get(offset..end) != Some(chunk.as_bytes()) {
+            return false;
+        }
+        offset = end;
+    }
+    true
 }
 
 /// Build an editor for `content`.
@@ -846,5 +865,14 @@ mod tests {
             OnExternalChange::Reload,
             "reloading over unsaved edits without asking loses them with no undo"
         );
+    }
+
+    #[test]
+    fn rope_eq_str_matches_length_then_bytes() {
+        let rope = lapce_xi_rope::Rope::from("hello");
+        assert!(rope_eq_str(&rope, "hello"));
+        assert!(!rope_eq_str(&rope, "hell"));
+        assert!(!rope_eq_str(&rope, "hallo"));
+        assert!(rope_eq_str(&lapce_xi_rope::Rope::from(""), ""));
     }
 }

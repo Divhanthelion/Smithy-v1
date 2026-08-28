@@ -37,22 +37,14 @@ impl EditorComponent {
             move || active_buffer.get(),
             move |id| match id {
                 Some(id) => {
-                    let loaded: Option<(std::path::PathBuf, String)> = buffer_manager
-                        .try_borrow()
-                        .ok()
-                        .and_then(|bm| bm.get_buffer(id))
-                        .and_then(|buffer| {
-                            let buffer = buffer.try_borrow().ok()?;
-                            Some((
-                                buffer.path().cloned().unwrap_or_default(),
-                                buffer.text().to_string(),
-                            ))
-                        });
-
-                    match loaded {
-                        Some((path, content)) => {
+                    let bm = buffer_manager.try_borrow().ok();
+                    let buf = bm.as_ref().and_then(|bm| bm.get_buffer(id));
+                    let borrowed = buf.as_ref().and_then(|b| b.try_borrow().ok());
+                    match borrowed.as_deref() {
+                        Some(buffer) => {
+                            let path = buffer.path().cloned().unwrap_or_default();
                             let (view, handle) =
-                                smithy_editor::code_editor(path, &content, aesthetic);
+                                smithy_editor::code_editor(path, buffer.text(), aesthetic);
                             open_editor.set(Some(handle));
                             Box::new(
                                 Container::new(view)
