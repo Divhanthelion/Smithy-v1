@@ -194,7 +194,7 @@ pub fn tab_bar_view(
             },
         )
         .style(|s| s.flex_row()),
-        Empty::new().style(|s| s.flex_grow(1.0)),
+        Empty::new().style(|s| s.flex_grow(1.0_f32)),
     ))
     // Collapse entirely when nothing is open. The strip previously held a
     // "Show Terminal" link that duplicated View → Terminal, so with no files
@@ -411,7 +411,7 @@ where
                 // Editor panel
                 Container::new(editor_view).style(move |s| {
                     s.width_full()
-                        .flex_grow(1.0)
+                        .flex_grow(1.0_f32)
                         .flex_basis(0.0)
                         .min_height(0.0)
                 }),
@@ -443,7 +443,7 @@ where
             ))
             .style(move |s| {
                 s.height_full()
-                    .flex_grow(1.0)
+                    .flex_grow(1.0_f32)
                     .flex_basis(0.0)
                     .flex_col()
                     .min_width(200.0)
@@ -482,7 +482,7 @@ where
         ))
         .style(|s| {
             s.width_full()
-                .flex_grow(1.0)
+                .flex_grow(1.0_f32)
                 .flex_basis(0.0)
                 .flex_row()
                 .min_height(0.0)

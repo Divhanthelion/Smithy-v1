@@ -133,7 +133,7 @@ impl MultiTerminalComponent {
         )
         .style(|s| {
             s.width_full()
-                .flex_grow(1.0)
+                .flex_grow(1.0_f32)
                 .min_height(0.0)
                 .background(Color::from_rgb8(30, 30, 30))
         })

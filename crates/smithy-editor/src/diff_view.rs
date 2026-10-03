@@ -380,7 +380,7 @@ fn diff_header(
                             .margin_left(8.0)
                     }),
             )))
-            .style(|s| s.flex_grow(1.0).justify_end()),
+            .style(|s| s.flex_grow(1.0_f32).justify_end()),
         ))
         .style(|s| s.width_full().items_center()),
         Label::derived(hint).style(move |s| {
@@ -454,7 +454,7 @@ pub fn diff_view_reviewable(
             .handle_background(Color::from_rgba8(150, 150, 150, 150))
             .handle_border_radius(4.0)
     })
-    .style(|s| s.width_full().flex_grow(1.0));
+    .style(|s| s.width_full().flex_grow(1.0_f32));
 
     let bg = colors.context_bg;
     Stack::vertical((header, content)).style(move |s| s.width_full().height_full().background(bg))
@@ -502,7 +502,7 @@ fn diff_view_hunk_reviewable(
             s.color(colors.gutter_fg)
                 .font_size(12.0)
                 .font_family(crate::design::SYMBOL.to_string())
-                .apply_if(!show_controls, |s| s.flex_grow(1.0))
+                .apply_if(!show_controls, |s| s.flex_grow(1.0_f32))
         }),
         // The decision in words. Colour alone would carry it for most people
         // and for nobody with a red-green deficiency, which is roughly one man
@@ -515,7 +515,7 @@ fn diff_view_hunk_reviewable(
         .style(move |s| {
             s.font_size(11.0)
                 .margin_left(12.0)
-                .flex_grow(1.0)
+                .flex_grow(1.0_f32)
                 .color(match hunk_status(statuses, hunk_idx) {
                     ChangeStatus::Accepted => colors.added_bg,
                     ChangeStatus::Rejected => colors.removed_bg,
@@ -588,7 +588,7 @@ fn diff_view_hunk_reviewable(
         // peripheral sense of what is still going to land.
         s.flex_col().width_full().apply_if(
             hunk_status(statuses, hunk_idx) == ChangeStatus::Rejected,
-            |s| s.opacity(0.45),
+            |s| s.opacity(0.45_f32),
         )
     });
 
@@ -629,7 +629,7 @@ fn diff_view_line(line: DiffLine, colors: DiffColors) -> impl IntoView {
                 .font_size(12.0)
                 .font_family(crate::design::MONO.to_string())
                 .background(bg_color)
-                .flex_grow(1.0)
+                .flex_grow(1.0_f32)
                 .padding_horiz(8.0)
         }),
     ))
@@ -716,7 +716,7 @@ pub fn diff_modal(
                                             .font_size(24.0)
                                     }),
                             )
-                            .style(|s| s.flex_grow(1.0).justify_end()),
+                            .style(|s| s.flex_grow(1.0_f32).justify_end()),
                         ))
                         .style(|s| s.width_full().padding(16.0)),
                         // Diff view

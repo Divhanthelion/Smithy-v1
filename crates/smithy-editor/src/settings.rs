@@ -365,7 +365,7 @@ fn panel(
         keychain_warning(state),
         status_line(state),
         Stack::horizontal((
-            Container::new(Empty::new()).style(|s| s.flex_grow(1.0)),
+            Container::new(Empty::new()).style(|s| s.flex_grow(1.0_f32)),
             Button::new("Cancel")
                 .on_event_stop(floem::event::listener::Click, move |_, _| state.close())
                 .style(|s| {
@@ -417,7 +417,7 @@ fn model_picker(
         Stack::horizontal((
             Label::derived(|| "Available models".to_string())
                 .style(|s| s.font_size(11.0).color(catppuccin::SUBTEXT0)),
-            Container::new(Empty::new()).style(|s| s.flex_grow(1.0)),
+            Container::new(Empty::new()).style(|s| s.flex_grow(1.0_f32)),
             // Counts, so the filters are legible as filters rather than as a
             // list that mysteriously has fourteen things in it.
             Label::derived(move || {
@@ -453,7 +453,7 @@ fn model_picker(
                 .placeholder("Filter by name…")
                 .style(|s| {
                     text_field_style(s)
-                        .flex_grow(1.0)
+                        .flex_grow(1.0_f32)
                         .font_size(11.0)
                         .padding_vert(5.0)
                 }),
@@ -572,7 +572,7 @@ fn model_row(
             Label::derived(move || label.clone())
                 .style(|s| s.font_size(9.0).color(catppuccin::SURFACE2)),
         ))
-        .style(|s| s.gap(1.0).flex_grow(1.0).min_width(0.0)),
+        .style(|s| s.gap(1.0).flex_grow(1.0_f32).min_width(0.0)),
         Label::derived(move || context.clone()).style(|s| {
             s.font_size(9.0)
                 .color(catppuccin::SURFACE2)
@@ -884,7 +884,7 @@ fn secret_field(
                 }
             })
             .style(|s| s.font_size(10.0).color(catppuccin::GREEN)),
-            Container::new(Empty::new()).style(|s| s.flex_grow(1.0)),
+            Container::new(Empty::new()).style(|s| s.flex_grow(1.0_f32)),
             Label::derived(|| "Remove".to_string())
                 .on_event_stop(floem::event::listener::Click, move |_, _| {
                     on_clear_key(account)

@@ -112,7 +112,7 @@ pub fn hover_popup(state: HoverState) -> impl IntoView {
                         .font_bold()
                         .color(design::FG_FAINT)
                 }),
-                Container::new(Empty::new()).style(|s| s.flex_grow(1.0)),
+                Container::new(Empty::new()).style(|s| s.flex_grow(1.0_f32)),
                 Label::derived(|| "✕".to_string())
                     .on_event_stop(floem::event::listener::Click, move |_, _| {
                         for_dismiss.dismiss()

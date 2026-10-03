@@ -500,7 +500,7 @@ pub fn terminal_grid_view(
             let mut span: Option<(usize, Color)> = None;
             for (col, cell) in row.cells.iter().enumerate() {
                 match span {
-                    Some((start, colour)) if colour == cell.bg => {}
+                    Some((_, colour)) if colour == cell.bg => {}
                     Some((start, colour)) => {
                         fill_cells(cx, start, col, y, char_width, line_height, colour, theme);
                         span = Some((col, cell.bg));
