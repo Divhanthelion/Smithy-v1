@@ -928,7 +928,7 @@ pub fn call_graph_view(
             },
         )
         .style(|s| {
-            s.flex_grow(1.0)
+            s.flex_grow(1.0_f32)
                 .width_full()
                 .min_height(0.0)
                 .background(design::BG_BASE)
@@ -981,7 +981,7 @@ fn toolbar(ui: CallGraphUi, on_build: impl Fn() + 'static) -> impl IntoView {
                     |s| s.display(floem::taffy::Display::None),
                 )
         }),
-        Container::new(Empty::new()).style(|s| s.flex_grow(1.0)),
+        Container::new(Empty::new()).style(|s| s.flex_grow(1.0_f32)),
         Label::derived(move || "Overview".to_string())
             .on_event_stop(floem::event::listener::Click, move |_, _| {
                 ui.mode.set(ViewMode::Overview);
@@ -1089,7 +1089,7 @@ fn nav_bar(ui: CallGraphUi) -> impl IntoView {
     let jump = TextInput::new(ui.query)
         .placeholder("Jump to symbol or file…")
         .style(|s| {
-            s.flex_grow(1.0)
+            s.flex_grow(1.0_f32)
                 .min_width(0.0)
                 .height(28.0)
                 .font_size(design::TEXT_SM)

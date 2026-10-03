@@ -74,7 +74,7 @@ pub fn session_history_view(
                 .handle_border_radius(4.0)
         })
         .style(move |s| {
-            s.flex_grow(1.0)
+            s.flex_grow(1.0_f32)
                 .width_full()
                 .min_height(0.0)
                 .background(theme.background)
@@ -129,7 +129,7 @@ fn history_row(
                     .width_full()
             }),
         ))
-        .style(|s| s.flex_grow(1.0).flex_col().min_width(0.0).gap(2.0)),
+        .style(|s| s.flex_grow(1.0_f32).flex_col().min_width(0.0).gap(2.0)),
         Label::new(crate::design::glyph::DOCUMENT.to_string())
             .style(move |s| {
                 s.font_size(11.0)
@@ -186,7 +186,7 @@ pub fn sidebar_mode_bar(
     Stack::horizontal((
         mode_chip(tab, SidebarTab::Files, "Files", theme),
         mode_chip(tab, SidebarTab::History, "History", theme),
-        Empty::new().style(|s| s.flex_grow(1.0)),
+        Empty::new().style(|s| s.flex_grow(1.0_f32)),
         Label::derived(|| design::glyph::HIDE.to_string())
             .style(move |s| {
                 s.width(22.0)

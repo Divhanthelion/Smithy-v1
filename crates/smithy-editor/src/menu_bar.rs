@@ -258,7 +258,7 @@ pub fn menu_bar(
             move |(index, menu)| menu_title(state, index, menu.title.clone()),
         )
         .style(|s| s.flex_row().items_center()),
-        Container::new(Empty::new()).style(|s| s.flex_grow(1.0)),
+        Container::new(Empty::new()).style(|s| s.flex_grow(1.0_f32)),
         meter(status.spend, status.spend_warn, catppuccin::PEACH),
         meter(status.memory, status.memory_warn, catppuccin::PEACH),
         clock_readout(clock, clock_tick),
@@ -431,7 +431,7 @@ fn menu_row(state: MenuBarState, item: MenuItem) -> impl IntoView {
                         .color(catppuccin::GREEN)
                 }),
                 Label::derived(move || text.clone()).style(move |s| {
-                    s.font_size(12.0).flex_grow(1.0).color(if checked() {
+                    s.font_size(12.0).flex_grow(1.0_f32).color(if checked() {
                         catppuccin::TEXT
                     } else {
                         catppuccin::SUBTEXT0
@@ -454,7 +454,7 @@ fn menu_row(state: MenuBarState, item: MenuItem) -> impl IntoView {
         } => Stack::horizontal((
             Container::new(Empty::new()).style(|s| s.width(18.0)),
             Label::derived(move || text.clone())
-                .style(|s| s.font_size(12.0).flex_grow(1.0).color(catppuccin::TEXT)),
+                .style(|s| s.font_size(12.0).flex_grow(1.0_f32).color(catppuccin::TEXT)),
             shortcut_label(shortcut),
         ))
         .on_event_stop(floem::event::listener::Click, move |_, _| {

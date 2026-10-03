@@ -162,7 +162,7 @@ fn file_entry_view(
             };
             s.font_size(font_size).color(text_color)
         }),
-        Container::new(Empty::new()).style(|s| s.flex_grow(1.0)),
+        Container::new(Empty::new()).style(|s| s.flex_grow(1.0_f32)),
         // Send this file to the agent.
         //
         // The Explorer already shows you the file you mean; before this the only
@@ -283,7 +283,7 @@ fn file_browser_header(
             Label::derived(|| "EXPLORER".to_string())
                 .style(move |s| s.font_size(10.0).color(theme.header_text)),
             // Spacer
-            Empty::new().style(|s| s.flex_grow(1.0)),
+            Empty::new().style(|s| s.flex_grow(1.0_f32)),
             // Home button
             Label::derived(|| "\u{2302}".to_string()) // ⌂
                 .style(move |s| {
@@ -448,7 +448,7 @@ pub fn file_browser_panel_view(
                 .handle_background(Color::from_rgba8(150, 150, 150, 150))
                 .handle_border_radius(4.0)
         })
-        .style(|s| s.flex_grow(1.0).width_full().min_height(0.0)),
+        .style(|s| s.flex_grow(1.0_f32).width_full().min_height(0.0)),
     ))
     .style(move |s| {
         s.width_full()
